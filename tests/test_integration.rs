@@ -1,6 +1,7 @@
 use geoprover::parser::parse_problem;
 use geoprover::deduction::saturate;
 use geoprover::construction::{generate_constructions, apply_construction};
+use geoprover::mcts::{mcts_search, MctsConfig};
 
 // ============================
 // Level 1 — saturate() alone
@@ -277,4 +278,109 @@ fn test_identify_jgex_parse_failures() {
     }
     // We know from memory that 228/231 parse, so at most 3 failures
     assert!(fail_names.len() <= 5, "Expected at most 5 parse failures, got {}", fail_names.len());
+}
+
+// ============================
+// MCTS tests
+// ============================
+
+#[test]
+fn test_mcts_solves_midpoint_congruence() {
+    // Triangle ABC, goal: |AM| = |MB| where M is aux point
+    // MCTS should find midpoint construction
+    use geoprover::proof_state::{ProofState, ObjectType, Relation};
+    let mut state = ProofState::new();
+    let a = state.add_object("a", ObjectType::Point);
+    let b = state.add_object("b", ObjectType::Point);
+    state.add_object("c", ObjectType::Point);
+    state.set_goal(Relation::congruent(a, 3, 3, b));
+
+    let config = MctsConfig {
+        num_iterations: 300,
+        max_children: 30,
+        c_puct: 1.4,
+        max_depth: 2,
+    };
+    let result = mcts_search(state, &config);
+    assert!(result.solved, "MCTS should solve midpoint congruence");
+    assert!(!result.proof_actions.is_empty());
+    println!("Midpoint solved in {} iterations with {} constructions",
+        result.iterations, result.proof_actions.len());
+}
+
+#[test]
+fn test_mcts_solves_circumcenter_equidistance() {
+    // Triangle ABC, goal: |OA| = |OC| where O = circumcenter
+    // MCTS should find circumcenter construction → transitive congruence
+    use geoprover::proof_state::{ProofState, ObjectType, Relation};
+    let mut state = ProofState::new();
+    let a = state.add_object("a", ObjectType::Point);
+    state.add_object("b", ObjectType::Point);
+    let c = state.add_object("c", ObjectType::Point);
+    let o = 3u16; // circumcenter will be aux_3
+    state.set_goal(Relation::congruent(o, a, o, c));
+
+    let config = MctsConfig {
+        num_iterations: 300,
+        max_children: 30,
+        c_puct: 1.4,
+        max_depth: 2,
+    };
+    let result = mcts_search(state, &config);
+    assert!(result.solved, "MCTS should solve circumcenter equidistance");
+    println!("Circumcenter solved in {} iterations with {} constructions",
+        result.iterations, result.proof_actions.len());
+}
+
+#[test]
+fn test_count_jgex_solvable_by_mcts() {
+    let content = std::fs::read_to_string("problems/jgex_ag_231.txt").unwrap();
+    let lines: Vec<&str> = content.lines().collect();
+    let mut total = 0;
+    let mut solved_deduction = 0;
+    let mut solved_mcts = 0;
+    let mut solved_names = Vec::new();
+
+    let config = MctsConfig {
+        num_iterations: 100,
+        max_children: 20,
+        c_puct: 1.4,
+        max_depth: 2,
+    };
+
+    for chunk in lines.chunks(2) {
+        if chunk.len() == 2 {
+            let problem = format!("{}\n{}", chunk[0], chunk[1]);
+            if let Ok(state) = parse_problem(&problem) {
+                total += 1;
+
+                // First try deduction alone
+                let mut deduction_state = state.clone();
+                if saturate(&mut deduction_state) {
+                    solved_deduction += 1;
+                    solved_mcts += 1;
+                    solved_names.push(format!("{} (deduction)", chunk[0]));
+                    continue;
+                }
+
+                // Then try MCTS
+                let result = mcts_search(state, &config);
+                if result.solved {
+                    solved_mcts += 1;
+                    solved_names.push(format!("{} (mcts, {} iters, {} steps)",
+                        chunk[0], result.iterations, result.proof_actions.len()));
+                }
+            }
+        }
+    }
+
+    println!("\n=== JGEX-AG-231 Results ===");
+    println!("Total parseable: {}", total);
+    println!("Solved by deduction: {}", solved_deduction);
+    println!("Solved by MCTS: {}", solved_mcts - solved_deduction);
+    println!("Total solved: {}", solved_mcts);
+    println!("\nSolved problems:");
+    for name in &solved_names {
+        println!("  {}", name);
+    }
 }
