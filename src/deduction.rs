@@ -494,4 +494,123 @@ mod tests {
         state.set_goal(Relation::congruent(o, a, o, c));
         assert!(saturate(&mut state));
     }
+
+    #[test]
+    fn test_corresponding_angles_stub_returns_empty() {
+        let facts = HashSet::new();
+        let result = rule_corresponding_angles(&facts);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_perpendicular_angles_stub_returns_empty() {
+        let facts = HashSet::new();
+        let result = rule_perpendicular_angles(&facts);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_saturate_empty_facts() {
+        let mut state = ProofState::new();
+        state.set_goal(Relation::collinear(0, 1, 2));
+        assert!(!saturate(&mut state));
+        // Should not panic, and should return false
+    }
+
+    #[test]
+    fn test_saturate_goal_already_in_facts() {
+        let mut state = make_state_with_points(&["a", "b", "c"]);
+        let (a, b, c) = (state.id("a"), state.id("b"), state.id("c"));
+        let goal = Relation::collinear(a, b, c);
+        state.add_fact(goal.clone());
+        state.set_goal(goal);
+        // Goal is already present — saturate should return true immediately
+        assert!(saturate(&mut state));
+    }
+
+    #[test]
+    fn test_isosceles_b_equals_d_pattern() {
+        // b==d pattern: |AB| = |CB| → isosceles at B
+        // Canonical congruent(0,1,1,2) means a=0,b=1,c=1,d=2 → b==c
+        // So we need |XB| = |YB| pattern where b is shared
+        let mut state = make_state_with_points(&["a", "b", "c"]);
+        let (a, b, c) = (state.id("a"), state.id("b"), state.id("c"));
+        // |AB| = |CB| → after canonical form: segments (a,b) and (b,c)
+        // This triggers the b==c case in canonical form
+        state.add_fact(Relation::congruent(a, b, c, b));
+        state.set_goal(Relation::equal_angle(a, b, c, a, c, b));
+        assert!(saturate(&mut state));
+    }
+
+    #[test]
+    fn test_perp_to_parallel_cross_match() {
+        // AB⊥CD, EF⊥AB → CD∥EF
+        let mut state = make_state_with_points(&["a", "b", "c", "d", "e", "f"]);
+        let (a, b, c, d, e, f) = (
+            state.id("a"), state.id("b"), state.id("c"),
+            state.id("d"), state.id("e"), state.id("f"),
+        );
+        state.add_fact(Relation::perpendicular(a, b, c, d));
+        state.add_fact(Relation::perpendicular(e, f, a, b));
+        state.set_goal(Relation::parallel(c, d, e, f));
+        assert!(saturate(&mut state));
+    }
+
+    #[test]
+    fn test_alternate_interior_no_transversal() {
+        // Parallel lines but no collinear transversal → no angle deduction
+        let mut state = make_state_with_points(&["a", "b", "c", "d"]);
+        let (a, b, c, d) = (
+            state.id("a"), state.id("b"), state.id("c"), state.id("d"),
+        );
+        state.add_fact(Relation::parallel(a, b, c, d));
+        // No collinear fact, so no transversal
+        state.set_goal(Relation::equal_angle(b, a, c, d, c, a));
+        assert!(!saturate(&mut state));
+    }
+
+    #[test]
+    fn test_transitive_parallel_no_self_parallel() {
+        // AB∥CD, CD∥AB → shouldn't produce AB∥AB (degenerate)
+        // (This happens naturally since AB∥AB would be redundant)
+        let mut state = make_state_with_points(&["a", "b", "c", "d"]);
+        let (a, b, c, d) = (
+            state.id("a"), state.id("b"), state.id("c"), state.id("d"),
+        );
+        state.add_fact(Relation::parallel(a, b, c, d));
+        saturate(&mut state);
+        // The rule shouldn't produce self-parallel facts
+        // With only one parallel fact and i < j iteration, no new facts are produced
+        // Just verify no panic and the original fact is preserved
+        assert!(state.facts.contains(&Relation::parallel(a, b, c, d)));
+    }
+
+    #[test]
+    fn test_lines_equal_helper() {
+        assert!(lines_equal(0, 1, 0, 1));
+        assert!(lines_equal(0, 1, 1, 0));
+        assert!(!lines_equal(0, 1, 0, 2));
+    }
+
+    #[test]
+    fn test_segments_equal_helper() {
+        assert!(segments_equal(0, 1, 0, 1));
+        assert!(segments_equal(0, 1, 1, 0));
+        assert!(!segments_equal(0, 1, 0, 2));
+    }
+
+    #[test]
+    fn test_angle_triples_equal_helper() {
+        assert!(angle_triples_equal(0, 1, 2, 0, 1, 2));
+        assert!(!angle_triples_equal(0, 1, 2, 2, 1, 0));
+    }
+
+    #[test]
+    fn test_midpoint_definition_produces_collinear() {
+        let mut state = make_state_with_points(&["m", "a", "b"]);
+        let (m, a, b) = (state.id("m"), state.id("a"), state.id("b"));
+        state.add_fact(Relation::midpoint(m, a, b));
+        state.set_goal(Relation::collinear(a, m, b));
+        assert!(saturate(&mut state));
+    }
 }

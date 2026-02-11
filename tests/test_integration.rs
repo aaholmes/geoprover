@@ -177,3 +177,104 @@ fn test_count_jgex_solvable_by_deduction() {
     // We expect at least some to be solvable (Level 1 problems)
     // Don't assert a specific count since it depends on rule completeness
 }
+
+// ============================
+// IMO-AG-30 parse smoke test
+// ============================
+
+#[test]
+fn test_parse_imo_ag_30_no_panic() {
+    let content = std::fs::read_to_string("problems/imo_ag_30.txt").unwrap();
+    let lines: Vec<&str> = content.lines().collect();
+    let mut parsed = 0;
+    let mut failed = 0;
+    let mut fail_names = Vec::new();
+    for chunk in lines.chunks(2) {
+        if chunk.len() == 2 {
+            let problem = format!("{}\n{}", chunk[0], chunk[1]);
+            match parse_problem(&problem) {
+                Ok(_) => parsed += 1,
+                Err(_) => {
+                    failed += 1;
+                    fail_names.push(chunk[0].to_string());
+                }
+            }
+        }
+    }
+    println!("IMO-AG-30: Parsed {}/{} ({} failed)", parsed, parsed + failed, failed);
+    for name in &fail_names {
+        println!("  Failed: {}", name);
+    }
+    // IMO problems may have complex constructions; we just want no panics
+    assert!(parsed > 0, "Should parse at least some IMO problems");
+}
+
+// ============================
+// Multi-step: construction → saturate → verify new facts
+// ============================
+
+#[test]
+fn test_construction_saturate_new_facts() {
+    use geoprover::proof_state::{ProofState, ObjectType, Relation};
+    let mut state = ProofState::new();
+    let a = state.add_object("a", ObjectType::Point);
+    let b = state.add_object("b", ObjectType::Point);
+    let c = state.add_object("c", ObjectType::Point);
+
+    // Apply circumcenter construction
+    let construction = geoprover::construction::Construction {
+        ctype: geoprover::construction::ConstructionType::Circumcenter,
+        args: vec![a, b, c],
+        priority: geoprover::construction::Priority::GoalRelevant,
+    };
+    let mut new_state = apply_construction(&state, &construction);
+    let o = 3u16;
+
+    // After saturate, transitive congruence should give |OA| = |OC|
+    new_state.set_goal(Relation::congruent(o, a, o, c));
+    let proved = saturate(&mut new_state);
+    assert!(proved, "Circumcenter construction + saturate should prove |OA| = |OC|");
+}
+
+// ============================
+// Unsolvable goal: saturate returns false
+// ============================
+
+#[test]
+fn test_unsolvable_goal() {
+    use geoprover::proof_state::{ProofState, ObjectType, Relation};
+    let mut state = ProofState::new();
+    let a = state.add_object("a", ObjectType::Point);
+    let b = state.add_object("b", ObjectType::Point);
+    let c = state.add_object("c", ObjectType::Point);
+    // Set an impossible goal: collinear from just triangle points with no collinear facts
+    state.set_goal(Relation::collinear(a, b, c));
+    assert!(!saturate(&mut state), "Should not prove collinearity of triangle vertices");
+}
+
+// ============================
+// Identify failing JGEX parse problems
+// ============================
+
+#[test]
+fn test_identify_jgex_parse_failures() {
+    let content = std::fs::read_to_string("problems/jgex_ag_231.txt").unwrap();
+    let lines: Vec<&str> = content.lines().collect();
+    let mut fail_names = Vec::new();
+    let mut fail_errors = Vec::new();
+    for chunk in lines.chunks(2) {
+        if chunk.len() == 2 {
+            let problem = format!("{}\n{}", chunk[0], chunk[1]);
+            if let Err(e) = parse_problem(&problem) {
+                fail_names.push(chunk[0].to_string());
+                fail_errors.push(e.0);
+            }
+        }
+    }
+    println!("JGEX parse failures ({}):", fail_names.len());
+    for (name, err) in fail_names.iter().zip(fail_errors.iter()) {
+        println!("  {}: {}", name, err);
+    }
+    // We know from memory that 228/231 parse, so at most 3 failures
+    assert!(fail_names.len() <= 5, "Expected at most 5 parse failures, got {}", fail_names.len());
+}

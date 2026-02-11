@@ -819,4 +819,428 @@ mod tests {
         let d = state.id("d");
         assert_eq!(state.goal, Some(Relation::cyclic(a, o, e, d)));
     }
+
+    // --- Construction predicate tests ---
+
+    #[test]
+    fn test_parse_r_triangle() {
+        let input = "test\na b c = r_triangle a b c ? perp a b a c";
+        let state = parse_problem(input).unwrap();
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        assert!(state.facts.contains(&Relation::perpendicular(a, b, a, c)));
+        assert_eq!(state.objects.len(), 3);
+    }
+
+    #[test]
+    fn test_parse_on_pline() {
+        let input = "test\na b c = triangle; x = on_pline a b c ? para a x b c";
+        let state = parse_problem(input).unwrap();
+        let a = state.id("a");
+        let x = state.id("x");
+        let b = state.id("b");
+        let c = state.id("c");
+        assert!(state.facts.contains(&Relation::parallel(a, x, b, c)));
+    }
+
+    #[test]
+    fn test_parse_on_line() {
+        let input = "test\na b = segment; x = on_line a b ? coll x a b";
+        let state = parse_problem(input).unwrap();
+        let x = state.id("x");
+        let a = state.id("a");
+        let b = state.id("b");
+        assert!(state.facts.contains(&Relation::collinear(x, a, b)));
+    }
+
+    #[test]
+    fn test_parse_on_circle() {
+        let input = "test\na b c = triangle; x = on_circle o a ? cong o x o a";
+        let state = parse_problem(input).unwrap();
+        let o = state.id("o");
+        let x = state.id("x");
+        let a = state.id("a");
+        assert!(state.facts.contains(&Relation::congruent(o, x, o, a)));
+    }
+
+    #[test]
+    fn test_parse_on_bline() {
+        let input = "test\na b = segment; x = on_bline a b ? cong x a x b";
+        let state = parse_problem(input).unwrap();
+        let x = state.id("x");
+        let a = state.id("a");
+        let b = state.id("b");
+        assert!(state.facts.contains(&Relation::congruent(x, a, x, b)));
+    }
+
+    #[test]
+    fn test_parse_on_dia() {
+        let input = "test\na b = segment; x = on_dia a b ? perp a x b x";
+        let state = parse_problem(input).unwrap();
+        let a = state.id("a");
+        let x = state.id("x");
+        let b = state.id("b");
+        assert!(state.facts.contains(&Relation::perpendicular(a, x, b, x)));
+    }
+
+    #[test]
+    fn test_parse_incenter() {
+        let input = "test\na b c = triangle; i = incenter a b c ? cong a b a c";
+        let state = parse_problem(input).unwrap();
+        let i = state.id("i");
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        // Check all 3 angle bisector facts
+        assert!(state.facts.contains(&Relation::equal_angle(b, a, i, i, a, c)));
+        assert!(state.facts.contains(&Relation::equal_angle(a, b, i, i, b, c)));
+        assert!(state.facts.contains(&Relation::equal_angle(a, c, i, i, c, b)));
+    }
+
+    #[test]
+    fn test_parse_centroid() {
+        let input = "test\na b c = triangle; g = centroid a b c ? coll a b c";
+        let state = parse_problem(input).unwrap();
+        // Centroid just creates the point, minimal facts
+        assert!(state.try_id("g").is_some());
+        assert_eq!(state.objects.len(), 4);
+    }
+
+    #[test]
+    fn test_parse_orthocenter_action() {
+        let input = "test\na b c = triangle; h = orthocenter a b c ? perp a h b c";
+        let state = parse_problem(input).unwrap();
+        let h = state.id("h");
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        assert!(state.facts.contains(&Relation::perpendicular(a, h, b, c)));
+        assert!(state.facts.contains(&Relation::perpendicular(b, h, a, c)));
+        assert!(state.facts.contains(&Relation::perpendicular(c, h, a, b)));
+    }
+
+    #[test]
+    fn test_parse_angle_bisector() {
+        let input = "test\na b c = triangle; x = angle_bisector b a c ? cong a b a c";
+        let state = parse_problem(input).unwrap();
+        let x = state.id("x");
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        assert!(state.facts.contains(&Relation::equal_angle(b, a, x, x, a, c)));
+    }
+
+    #[test]
+    fn test_parse_mirror() {
+        let input = "test\na b = segment; x = mirror a b ? midp b a x";
+        let state = parse_problem(input).unwrap();
+        let x = state.id("x");
+        let a = state.id("a");
+        let b = state.id("b");
+        assert!(state.facts.contains(&Relation::midpoint(b, a, x)));
+        assert!(state.facts.contains(&Relation::collinear(a, b, x)));
+        assert!(state.facts.contains(&Relation::congruent(a, b, b, x)));
+    }
+
+    #[test]
+    fn test_parse_reflect() {
+        // "reflect" is an alias for "mirror"
+        let input = "test\na b = segment; x = reflect a b ? midp b a x";
+        let state = parse_problem(input).unwrap();
+        let x = state.id("x");
+        let a = state.id("a");
+        let b = state.id("b");
+        assert!(state.facts.contains(&Relation::midpoint(b, a, x)));
+    }
+
+    #[test]
+    fn test_parse_eq_triangle() {
+        let input = "test\na b c = eq_triangle a b c ? cong a b b c";
+        let state = parse_problem(input).unwrap();
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        assert!(state.facts.contains(&Relation::congruent(a, b, b, c)));
+        assert!(state.facts.contains(&Relation::congruent(b, c, a, c)));
+    }
+
+    #[test]
+    fn test_parse_parallelogram() {
+        let input = "test\na b c d = parallelogram a b c d ? para a b c d";
+        let state = parse_problem(input).unwrap();
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        let d = state.id("d");
+        assert!(state.facts.contains(&Relation::parallel(a, b, c, d)));
+        assert!(state.facts.contains(&Relation::parallel(a, d, b, c)));
+        assert!(state.facts.contains(&Relation::congruent(a, b, c, d)));
+        assert!(state.facts.contains(&Relation::congruent(a, d, b, c)));
+    }
+
+    #[test]
+    fn test_parse_rectangle() {
+        let input = "test\na b c d = rectangle a b c d ? perp a b a d";
+        let state = parse_problem(input).unwrap();
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        let d = state.id("d");
+        assert!(state.facts.contains(&Relation::parallel(a, b, c, d)));
+        assert!(state.facts.contains(&Relation::parallel(a, d, b, c)));
+        assert!(state.facts.contains(&Relation::congruent(a, b, c, d)));
+        assert!(state.facts.contains(&Relation::congruent(a, d, b, c)));
+        assert!(state.facts.contains(&Relation::perpendicular(a, b, a, d)));
+    }
+
+    #[test]
+    fn test_parse_square() {
+        let input = "test\na b c d = square a b c d ? cong a b c d";
+        let state = parse_problem(input).unwrap();
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        let d = state.id("d");
+        assert!(state.facts.contains(&Relation::congruent(a, b, b, c)));
+        assert!(state.facts.contains(&Relation::congruent(b, c, c, d)));
+        assert!(state.facts.contains(&Relation::congruent(c, d, d, a)));
+        assert!(state.facts.contains(&Relation::perpendicular(a, b, a, d)));
+        assert!(state.facts.contains(&Relation::parallel(a, b, c, d)));
+        assert!(state.facts.contains(&Relation::parallel(a, d, b, c)));
+    }
+
+    #[test]
+    fn test_parse_trapezoid() {
+        let input = "test\na b c d = trapezoid a b c d ? para a b c d";
+        let state = parse_problem(input).unwrap();
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        let d = state.id("d");
+        assert!(state.facts.contains(&Relation::parallel(a, b, c, d)));
+    }
+
+    #[test]
+    fn test_parse_iso_trapezoid() {
+        let input = "test\na b c d = iso_trapezoid a b c d ? cong a d b c";
+        let state = parse_problem(input).unwrap();
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        let d = state.id("d");
+        assert!(state.facts.contains(&Relation::parallel(a, b, c, d)));
+        assert!(state.facts.contains(&Relation::congruent(a, d, b, c)));
+    }
+
+    #[test]
+    fn test_parse_r_trapezoid() {
+        let input = "test\na b c d = r_trapezoid a b c d ? perp a d a b";
+        let state = parse_problem(input).unwrap();
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        let d = state.id("d");
+        assert!(state.facts.contains(&Relation::parallel(a, b, c, d)));
+        assert!(state.facts.contains(&Relation::perpendicular(a, d, a, b)));
+    }
+
+    #[test]
+    fn test_parse_circle_circumcenter() {
+        let input = "test\na b c = triangle; o = circle o a b c ? cong o a o c";
+        let state = parse_problem(input).unwrap();
+        let o = state.id("o");
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        assert!(state.facts.contains(&Relation::congruent(o, a, o, b)));
+        assert!(state.facts.contains(&Relation::congruent(o, b, o, c)));
+    }
+
+    #[test]
+    fn test_parse_circle_3args() {
+        // circle with only 3 args (no repeated output name)
+        let input = "test\na b c = triangle; o = circle a b c ? cong o a o b";
+        let state = parse_problem(input).unwrap();
+        let o = state.id("o");
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        assert!(state.facts.contains(&Relation::congruent(o, a, o, b)));
+        assert!(state.facts.contains(&Relation::congruent(o, b, o, c)));
+    }
+
+    #[test]
+    fn test_parse_shift() {
+        let input = "test\na b c = triangle; x = shift a b c ? para a b c x";
+        let state = parse_problem(input).unwrap();
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        let x = state.id("x");
+        assert!(state.facts.contains(&Relation::parallel(a, b, c, x)));
+        assert!(state.facts.contains(&Relation::congruent(a, b, c, x)));
+    }
+
+    #[test]
+    fn test_parse_intersection_ll() {
+        let input = "test\na b c d = triangle; x = intersection_ll a b c d ? coll x a b";
+        let state = parse_problem(input).unwrap();
+        let x = state.id("x");
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        let d = state.id("d");
+        assert!(state.facts.contains(&Relation::collinear(x, a, b)));
+        assert!(state.facts.contains(&Relation::collinear(x, c, d)));
+    }
+
+    // --- Goal predicate tests ---
+
+    #[test]
+    fn test_parse_goal_perp() {
+        let input = "test\na b c d = triangle ? perp a b c d";
+        let state = parse_problem(input).unwrap();
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        let d = state.id("d");
+        assert_eq!(state.goal, Some(Relation::perpendicular(a, b, c, d)));
+    }
+
+    #[test]
+    fn test_parse_goal_midp() {
+        let input = "test\na b c = triangle; m = midpoint a b ? midp m a b";
+        let state = parse_problem(input).unwrap();
+        let m = state.id("m");
+        let a = state.id("a");
+        let b = state.id("b");
+        assert_eq!(state.goal, Some(Relation::midpoint(m, a, b)));
+    }
+
+    #[test]
+    fn test_parse_goal_para() {
+        let input = "test\na b c d = triangle ? para a b c d";
+        let state = parse_problem(input).unwrap();
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        let d = state.id("d");
+        assert_eq!(state.goal, Some(Relation::parallel(a, b, c, d)));
+    }
+
+    // --- Negative / error tests ---
+
+    #[test]
+    fn test_error_missing_question_separator() {
+        let input = "test\na b c = triangle coll a b c";
+        let result = parse_problem(input);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().0.contains("separator"));
+    }
+
+    #[test]
+    fn test_error_single_line() {
+        let input = "only_one_line";
+        let result = parse_problem(input);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().0.contains("at least 2 lines"));
+    }
+
+    #[test]
+    fn test_error_empty_input() {
+        let input = "";
+        let result = parse_problem(input);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_error_too_few_goal_args() {
+        let input = "test\na b c = triangle ? cong a b";
+        let result = parse_problem(input);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().0.contains("requires"));
+    }
+
+    #[test]
+    fn test_error_unknown_goal_predicate() {
+        let input = "test\na b c = triangle ? frobnicate a b c";
+        let result = parse_problem(input);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().0.contains("Unknown goal"));
+    }
+
+    #[test]
+    fn test_parse_error_display() {
+        let e = ParseError("test error".into());
+        assert_eq!(format!("{}", e), "ParseError: test error");
+    }
+
+    #[test]
+    fn test_parse_unknown_action_creates_points() {
+        // Unknown predicates should still create output points
+        let input = "test\na b = unknown_pred x y ? coll a b a";
+        let state = parse_problem(input).unwrap();
+        assert!(state.try_id("a").is_some());
+        assert!(state.try_id("b").is_some());
+    }
+
+    #[test]
+    fn test_parse_s_angle_creates_point() {
+        let input = "test\na b = segment; x = s_angle a b 90 ? coll x a b";
+        let state = parse_problem(input).unwrap();
+        assert!(state.try_id("x").is_some());
+    }
+
+    #[test]
+    fn test_parse_free_point() {
+        let input = "test\na = free ? coll a a a";
+        let state = parse_problem(input).unwrap();
+        assert!(state.try_id("a").is_some());
+    }
+
+    #[test]
+    fn test_parse_eqangle_vertex_form() {
+        // When b==c and f==g, eqangle maps to vertex-angle form
+        let input = "test\na b c d = triangle ? eqangle a b b d c d d a";
+        let state = parse_problem(input).unwrap();
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        let d = state.id("d");
+        // b==c (args[1]==args[2]) and f==g (args[5]==args[6])
+        // Should be equal_angle(a, b, d, c, d, a)
+        assert_eq!(state.goal, Some(Relation::equal_angle(a, b, d, c, d, a)));
+    }
+
+    #[test]
+    fn test_parse_eqangle_general_form() {
+        // When b!=c or f!=g, general directed angle form
+        let input = "test\na b c d e f g h = triangle ? eqangle a b c d e f g h";
+        let state = parse_problem(input).unwrap();
+        // Uses the fallback: equal_angle(a, b, d, e, f, h)
+        let a = state.id("a");
+        let b = state.id("b");
+        let d = state.id("d");
+        let e = state.id("e");
+        let f = state.id("f");
+        let h = state.id("h");
+        assert_eq!(state.goal, Some(Relation::equal_angle(a, b, d, e, f, h)));
+    }
+
+    #[test]
+    fn test_parse_contri_goal_unsupported() {
+        let input = "test\na b c d e f = triangle ? contri a b c d e f";
+        let result = parse_problem(input);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().0.contains("not yet supported"));
+    }
+
+    #[test]
+    fn test_parse_simtri_goal_unsupported() {
+        let input = "test\na b c d e f = triangle ? simtri a b c d e f";
+        let result = parse_problem(input);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().0.contains("not yet supported"));
+    }
 }

@@ -105,6 +105,7 @@ impl Relation {
     }
 }
 
+#[derive(Debug)]
 pub struct ProofState {
     pub objects: Vec<GeoObject>,
     pub name_to_id: HashMap<String, u16>,
@@ -345,5 +346,72 @@ mod tests {
         let a2 = state.add_object("a", ObjectType::Point);
         assert_eq!(a1, a2);
         assert_eq!(state.objects.len(), 1);
+    }
+
+    #[test]
+    fn test_on_circle_relation() {
+        let r = Relation::on_circle(5, 10);
+        assert_eq!(r, Relation::OnCircle(5, 10));
+        // on_circle is not symmetric
+        assert_ne!(Relation::on_circle(5, 10), Relation::on_circle(10, 5));
+    }
+
+    #[test]
+    fn test_cyclic_canonical_sorting() {
+        // Cyclic should sort the 4 points
+        let r1 = Relation::cyclic(3, 1, 4, 2);
+        let r2 = Relation::cyclic(1, 2, 3, 4);
+        assert_eq!(r1, r2);
+        // All permutations should produce the same result
+        let r3 = Relation::cyclic(4, 3, 2, 1);
+        assert_eq!(r1, r3);
+    }
+
+    #[test]
+    fn test_try_id_returns_none() {
+        let state = ProofState::new();
+        assert_eq!(state.try_id("nonexistent"), None);
+    }
+
+    #[test]
+    fn test_default_trait() {
+        let state = ProofState::default();
+        assert_eq!(state.objects.len(), 0);
+        assert_eq!(state.facts.len(), 0);
+        assert!(state.goal.is_none());
+        assert_eq!(state.hash, 0);
+    }
+
+    #[test]
+    fn test_line_and_circle_object_types() {
+        let mut state = ProofState::new();
+        let l = state.add_object("line1", ObjectType::Line);
+        let c = state.add_object("circ1", ObjectType::Circle);
+        let p = state.add_object("p", ObjectType::Point);
+        assert_eq!(state.objects[l as usize].otype, ObjectType::Line);
+        assert_eq!(state.objects[c as usize].otype, ObjectType::Circle);
+        assert_eq!(state.objects[p as usize].otype, ObjectType::Point);
+        assert_eq!(state.objects.len(), 3);
+    }
+
+    #[test]
+    fn test_midpoint_reversed_args() {
+        // midpoint(m, b, a) should canonicalize to same as midpoint(m, a, b)
+        let r1 = Relation::midpoint(0, 1, 2);
+        let r2 = Relation::midpoint(0, 2, 1);
+        assert_eq!(r1, r2);
+    }
+
+    #[test]
+    fn test_is_proved_no_goal() {
+        let state = ProofState::new();
+        assert!(!state.is_proved());
+    }
+
+    #[test]
+    fn test_perpendicular_canonical() {
+        let r1 = Relation::perpendicular(3, 2, 1, 0);
+        let r2 = Relation::perpendicular(0, 1, 2, 3);
+        assert_eq!(r1, r2);
     }
 }

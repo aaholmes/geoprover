@@ -418,4 +418,224 @@ mod tests {
         assert!(new_state.facts.contains(&Relation::perpendicular(a, f, b, c)));
         assert!(new_state.facts.contains(&Relation::collinear(b, f, c)));
     }
+
+    #[test]
+    fn test_apply_circumcenter_construction() {
+        let state = make_triangle();
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        let construction = Construction {
+            ctype: ConstructionType::Circumcenter,
+            args: vec![a, b, c],
+            priority: Priority::GoalRelevant,
+        };
+        let new_state = apply_construction(&state, &construction);
+        let o = 3u16;
+        assert_eq!(new_state.objects.len(), 4);
+        assert!(new_state.facts.contains(&Relation::congruent(o, a, o, b)));
+        assert!(new_state.facts.contains(&Relation::congruent(o, b, o, c)));
+    }
+
+    #[test]
+    fn test_apply_orthocenter_construction() {
+        let state = make_triangle();
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        let construction = Construction {
+            ctype: ConstructionType::Orthocenter,
+            args: vec![a, b, c],
+            priority: Priority::GoalRelevant,
+        };
+        let new_state = apply_construction(&state, &construction);
+        let h = 3u16;
+        assert!(new_state.facts.contains(&Relation::perpendicular(a, h, b, c)));
+        assert!(new_state.facts.contains(&Relation::perpendicular(b, h, a, c)));
+        assert!(new_state.facts.contains(&Relation::perpendicular(c, h, a, b)));
+    }
+
+    #[test]
+    fn test_apply_incenter_construction() {
+        let state = make_triangle();
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        let construction = Construction {
+            ctype: ConstructionType::Incenter,
+            args: vec![a, b, c],
+            priority: Priority::GoalRelevant,
+        };
+        let new_state = apply_construction(&state, &construction);
+        let i = 3u16;
+        assert!(new_state.facts.contains(&Relation::equal_angle(b, a, i, i, a, c)));
+        assert!(new_state.facts.contains(&Relation::equal_angle(a, b, i, i, b, c)));
+        assert!(new_state.facts.contains(&Relation::equal_angle(a, c, i, i, c, b)));
+    }
+
+    #[test]
+    fn test_apply_parallel_through_construction() {
+        let state = make_triangle();
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        let construction = Construction {
+            ctype: ConstructionType::ParallelThrough,
+            args: vec![c, a, b], // line through c parallel to AB
+            priority: Priority::GoalRelevant,
+        };
+        let new_state = apply_construction(&state, &construction);
+        let x = 3u16;
+        assert!(new_state.facts.contains(&Relation::parallel(c, x, a, b)));
+    }
+
+    #[test]
+    fn test_apply_perpendicular_through_construction() {
+        let state = make_triangle();
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        let construction = Construction {
+            ctype: ConstructionType::PerpendicularThrough,
+            args: vec![c, a, b], // line through c perpendicular to AB
+            priority: Priority::GoalRelevant,
+        };
+        let new_state = apply_construction(&state, &construction);
+        let x = 3u16;
+        assert!(new_state.facts.contains(&Relation::perpendicular(c, x, a, b)));
+    }
+
+    #[test]
+    fn test_apply_default_fallback_construction() {
+        // Construction types that hit the default `_` arm
+        let state = make_triangle();
+        let a = state.id("a");
+        let b = state.id("b");
+        let construction = Construction {
+            ctype: ConstructionType::AngleBisector,
+            args: vec![a, b],
+            priority: Priority::Exploratory,
+        };
+        let new_state = apply_construction(&state, &construction);
+        // Should add a generic point but no specific facts
+        assert_eq!(new_state.objects.len(), 4);
+        assert_eq!(new_state.facts.len(), 0);
+    }
+
+    #[test]
+    fn test_has_foot_positive_skips_altitude() {
+        let mut state = make_triangle();
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        // Add a foot fact: perp(a, foot, b, c)
+        let foot = state.add_object("foot", ObjectType::Point);
+        state.add_fact(Relation::perpendicular(a, foot, b, c));
+        let constructions = generate_constructions(&state);
+        // Should not generate Altitude(a, b, c) since foot already exists
+        let args_target = vec![a, b, c];
+        let altitudes_abc: Vec<_> = constructions
+            .iter()
+            .filter(|con| con.ctype == ConstructionType::Altitude && con.args == args_target)
+            .collect();
+        assert!(altitudes_abc.is_empty(), "Altitude(a,b,c) should be skipped when foot exists");
+    }
+
+    #[test]
+    fn test_has_circumcenter_positive_skips() {
+        let mut state = make_triangle();
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        // Add circumcenter facts: |OA| = |OB|
+        let o = state.add_object("o", ObjectType::Point);
+        state.add_fact(Relation::congruent(o, a, o, b));
+        let constructions = generate_constructions(&state);
+        // Circumcenter for (a,b,c) should be skipped since we already have equidistant point
+        let args_target = vec![a, b, c];
+        let circumcenters: Vec<_> = constructions
+            .iter()
+            .filter(|con| con.ctype == ConstructionType::Circumcenter && con.args == args_target)
+            .collect();
+        assert!(circumcenters.is_empty(), "Circumcenter(a,b,c) should be skipped");
+    }
+
+    #[test]
+    fn test_priority_exploratory() {
+        // When goal doesn't involve construction points → Exploratory
+        let mut state = make_triangle();
+        let d = state.add_object("d", ObjectType::Point);
+        let e = state.add_object("e", ObjectType::Point);
+        // Goal only involves d and e, not a,b,c
+        state.set_goal(Relation::congruent(d, e, d, e));
+        let constructions = generate_constructions(&state);
+        // Constructions involving only a,b,c should be Exploratory
+        let abc_midpoints: Vec<_> = constructions
+            .iter()
+            .filter(|c| {
+                c.ctype == ConstructionType::Midpoint
+                    && !c.args.contains(&d)
+                    && !c.args.contains(&e)
+            })
+            .collect();
+        assert!(!abc_midpoints.is_empty());
+        for c in abc_midpoints {
+            assert_eq!(c.priority, Priority::Exploratory);
+        }
+    }
+
+    #[test]
+    fn test_generation_skips_existing_midpoints() {
+        let mut state = make_triangle();
+        let a = state.id("a");
+        let b = state.id("b");
+        // Add midpoint of AB
+        let m = state.add_object("m", ObjectType::Point);
+        state.add_fact(Relation::midpoint(m, a, b));
+        let constructions = generate_constructions(&state);
+        // Should NOT generate Midpoint(a,b) since it already exists
+        let midpoints_ab: Vec<_> = constructions
+            .iter()
+            .filter(|c| {
+                c.ctype == ConstructionType::Midpoint
+                    && ((c.args[0] == a && c.args[1] == b) || (c.args[0] == b && c.args[1] == a))
+            })
+            .collect();
+        assert!(midpoints_ab.is_empty(), "Midpoint(a,b) should be skipped");
+    }
+
+    #[test]
+    fn test_get_relation_points_all_variants() {
+        // Test that get_relation_points works for all relation types
+        assert_eq!(get_relation_points(&Relation::Collinear(0, 1, 2)), vec![0, 1, 2]);
+        assert_eq!(get_relation_points(&Relation::Parallel(0, 1, 2, 3)), vec![0, 1, 2, 3]);
+        assert_eq!(get_relation_points(&Relation::Perpendicular(0, 1, 2, 3)), vec![0, 1, 2, 3]);
+        assert_eq!(get_relation_points(&Relation::Congruent(0, 1, 2, 3)), vec![0, 1, 2, 3]);
+        assert_eq!(get_relation_points(&Relation::EqualAngle(0, 1, 2, 3, 4, 5)), vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(get_relation_points(&Relation::Midpoint(0, 1, 2)), vec![0, 1, 2]);
+        assert_eq!(get_relation_points(&Relation::OnCircle(0, 1)), vec![0, 1]);
+        assert_eq!(get_relation_points(&Relation::Cyclic(0, 1, 2, 3)), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn test_sorted_by_priority() {
+        let mut state = ProofState::new();
+        state.add_object("a", ObjectType::Point);
+        state.add_object("b", ObjectType::Point);
+        let c = state.add_object("c", ObjectType::Point);
+        let d = state.add_object("d", ObjectType::Point);
+        // Goal involves only c,d — so constructions involving a,b only should be Exploratory
+        state.set_goal(Relation::congruent(c, d, c, d));
+        let constructions = generate_constructions(&state);
+        // Verify sorted: GoalRelevant first, then Exploratory
+        let mut seen_exploratory = false;
+        for c in &constructions {
+            if c.priority == Priority::Exploratory {
+                seen_exploratory = true;
+            }
+            if c.priority == Priority::GoalRelevant && seen_exploratory {
+                panic!("GoalRelevant construction found after Exploratory — not sorted");
+            }
+        }
+    }
 }
