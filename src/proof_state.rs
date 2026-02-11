@@ -414,4 +414,67 @@ mod tests {
         let r2 = Relation::perpendicular(0, 1, 2, 3);
         assert_eq!(r1, r2);
     }
+
+    #[test]
+    fn test_congruent_degenerate_same_segment() {
+        // |AB| = |AB| (same segment on both sides)
+        let r = Relation::congruent(0, 1, 0, 1);
+        assert_eq!(r, Relation::Congruent(0, 1, 0, 1));
+    }
+
+    #[test]
+    fn test_equal_angle_same_triple() {
+        // angle(A,B,C) = angle(A,B,C) — same angle on both sides
+        let r = Relation::equal_angle(0, 1, 2, 0, 1, 2);
+        assert_eq!(r, Relation::EqualAngle(0, 1, 2, 0, 1, 2));
+    }
+
+    #[test]
+    fn test_multiple_facts_hash_unique() {
+        let mut state = ProofState::new();
+        state.add_object("a", ObjectType::Point);
+        state.add_object("b", ObjectType::Point);
+        state.add_object("c", ObjectType::Point);
+        state.add_object("d", ObjectType::Point);
+        let h1 = state.hash;
+        state.add_fact(Relation::collinear(0, 1, 2));
+        let h2 = state.hash;
+        state.add_fact(Relation::congruent(0, 1, 2, 3));
+        let h3 = state.hash;
+        // All hashes should be different
+        assert_ne!(h1, h2);
+        assert_ne!(h2, h3);
+        assert_ne!(h1, h3);
+    }
+
+    #[test]
+    fn test_set_goal_replaces_previous() {
+        let mut state = ProofState::new();
+        let a = state.add_object("a", ObjectType::Point);
+        let b = state.add_object("b", ObjectType::Point);
+        let c = state.add_object("c", ObjectType::Point);
+        state.set_goal(Relation::collinear(a, b, c));
+        assert_eq!(state.goal, Some(Relation::collinear(a, b, c)));
+        state.set_goal(Relation::congruent(a, b, b, c));
+        assert_eq!(state.goal, Some(Relation::congruent(a, b, b, c)));
+    }
+
+    #[test]
+    fn test_id_returns_correct_values() {
+        let mut state = ProofState::new();
+        let a = state.add_object("a", ObjectType::Point);
+        let b = state.add_object("b", ObjectType::Point);
+        assert_eq!(state.id("a"), a);
+        assert_eq!(state.id("b"), b);
+    }
+
+    #[test]
+    fn test_add_many_objects() {
+        let mut state = ProofState::new();
+        for i in 0..100 {
+            let id = state.add_object(&format!("p{}", i), ObjectType::Point);
+            assert_eq!(id, i as u16);
+        }
+        assert_eq!(state.objects.len(), 100);
+    }
 }

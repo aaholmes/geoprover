@@ -323,4 +323,122 @@ mod tests {
         let leaf = select_leaf(&root, &config);
         assert!(Rc::ptr_eq(&leaf, &root));
     }
+
+    #[test]
+    fn test_select_leaf_returns_child_when_expanded() {
+        let mut state = ProofState::new();
+        state.add_object("a", ObjectType::Point);
+        state.add_object("b", ObjectType::Point);
+        state.add_object("c", ObjectType::Point);
+        let root = MctsNode::new_root(state);
+        MctsNode::expand(&root, 5);
+        let config = MctsConfig::default();
+        let leaf = select_leaf(&root, &config);
+        // Should select one of the children (an unvisited one)
+        assert!(!Rc::ptr_eq(&leaf, &root));
+        assert_eq!(leaf.borrow().visits, 0);
+    }
+
+    #[test]
+    fn test_select_leaf_terminal_node_stops() {
+        let state = ProofState::new();
+        let root = MctsNode::new_root(state);
+        root.borrow_mut().terminal_value = Some(1.0);
+        root.borrow_mut().expanded = true;
+        let config = MctsConfig::default();
+        let leaf = select_leaf(&root, &config);
+        assert!(Rc::ptr_eq(&leaf, &root));
+    }
+
+    #[test]
+    fn test_mcts_zero_iterations() {
+        let mut state = ProofState::new();
+        let a = state.add_object("a", ObjectType::Point);
+        let b = state.add_object("b", ObjectType::Point);
+        let c = state.add_object("c", ObjectType::Point);
+        state.set_goal(Relation::collinear(a, b, c));
+
+        let config = MctsConfig {
+            num_iterations: 0,
+            max_children: 5,
+            c_puct: 1.4,
+            max_depth: 2,
+        };
+        let result = mcts_search(state, &config);
+        assert!(!result.solved);
+        assert_eq!(result.iterations, 0);
+    }
+
+    #[test]
+    fn test_mcts_depth_one() {
+        // With max_depth=1, MCTS should still be able to solve single-step problems
+        let mut state = ProofState::new();
+        let a = state.add_object("a", ObjectType::Point);
+        let b = state.add_object("b", ObjectType::Point);
+        state.add_object("c", ObjectType::Point);
+        state.set_goal(Relation::congruent(a, 3, 3, b));
+
+        let config = MctsConfig {
+            num_iterations: 200,
+            max_children: 30,
+            c_puct: 1.4,
+            max_depth: 1,
+        };
+        let result = mcts_search(state, &config);
+        assert!(result.solved, "Should solve at depth 1");
+    }
+
+    #[test]
+    fn test_extract_proof_path_root_is_empty() {
+        let state = ProofState::new();
+        let root = MctsNode::new_root(state);
+        let path = extract_proof_path(&root);
+        assert!(path.is_empty());
+    }
+
+    #[test]
+    fn test_mcts_result_iterations_count() {
+        let mut state = ProofState::new();
+        let a = state.add_object("a", ObjectType::Point);
+        let b = state.add_object("b", ObjectType::Point);
+        state.add_object("c", ObjectType::Point);
+        state.set_goal(Relation::congruent(a, 3, 3, b));
+
+        let config = MctsConfig {
+            num_iterations: 500,
+            max_children: 30,
+            c_puct: 1.4,
+            max_depth: 2,
+        };
+        let result = mcts_search(state, &config);
+        assert!(result.solved);
+        // Should solve in fewer iterations than the max
+        assert!(result.iterations < 500);
+        assert!(result.iterations > 0);
+    }
+
+    #[test]
+    fn test_node_depth_two_levels() {
+        let state = ProofState::new();
+        let root = MctsNode::new_root(state);
+        let child = MctsNode::new_child(
+            &root,
+            crate::construction::Construction {
+                ctype: crate::construction::ConstructionType::Midpoint,
+                args: vec![0, 1],
+                priority: crate::construction::Priority::Exploratory,
+            },
+            ProofState::new(),
+        );
+        let grandchild = MctsNode::new_child(
+            &child,
+            crate::construction::Construction {
+                ctype: crate::construction::ConstructionType::Altitude,
+                args: vec![0, 1, 2],
+                priority: crate::construction::Priority::Exploratory,
+            },
+            ProofState::new(),
+        );
+        assert_eq!(node_depth(&grandchild), 2);
+    }
 }

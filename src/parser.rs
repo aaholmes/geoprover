@@ -1243,4 +1243,117 @@ mod tests {
         assert!(result.is_err());
         assert!(result.unwrap_err().0.contains("not yet supported"));
     }
+
+    // --- Stub predicates that create points but no facts ---
+
+    #[test]
+    fn test_parse_eqdistance_creates_point() {
+        let input = "test\na b c = triangle; x = eqdistance a b c ? coll x a b";
+        let state = parse_problem(input).unwrap();
+        assert!(state.try_id("x").is_some());
+    }
+
+    #[test]
+    fn test_parse_eqangle2_creates_point() {
+        let input = "test\na b c = triangle; x = eqangle2 a b c ? coll x a b";
+        let state = parse_problem(input).unwrap();
+        assert!(state.try_id("x").is_some());
+    }
+
+    #[test]
+    fn test_parse_lc_tangent_creates_point() {
+        let input = "test\na b = segment; x = lc_tangent a b ? coll x a b";
+        let state = parse_problem(input).unwrap();
+        assert!(state.try_id("x").is_some());
+    }
+
+    #[test]
+    fn test_parse_cc_tangent_creates_point() {
+        let input = "test\na b = segment; x = cc_tangent a b ? coll x a b";
+        let state = parse_problem(input).unwrap();
+        assert!(state.try_id("x").is_some());
+    }
+
+    #[test]
+    fn test_parse_intersection_cc_creates_point() {
+        let input = "test\na b c = triangle; x = intersection_cc a b c ? coll x a b";
+        let state = parse_problem(input).unwrap();
+        assert!(state.try_id("x").is_some());
+    }
+
+    #[test]
+    fn test_parse_intersection_lc_creates_point() {
+        let input = "test\na b c = triangle; x = intersection_lc a b c ? coll x a b";
+        let state = parse_problem(input).unwrap();
+        assert!(state.try_id("x").is_some());
+    }
+
+    #[test]
+    fn test_parse_inter_cc_alias() {
+        let input = "test\na b c = triangle; x = inter_cc a b c ? coll x a b";
+        let state = parse_problem(input).unwrap();
+        assert!(state.try_id("x").is_some());
+    }
+
+    #[test]
+    fn test_parse_inter_lc_alias() {
+        let input = "test\na b c = triangle; x = inter_lc a b c ? coll x a b";
+        let state = parse_problem(input).unwrap();
+        assert!(state.try_id("x").is_some());
+    }
+
+    #[test]
+    fn test_parse_inter_ll_alias() {
+        let input = "test\na b c d = triangle; x = inter_ll a b c d ? coll x a b";
+        let state = parse_problem(input).unwrap();
+        let x = state.id("x");
+        let a = state.id("a");
+        let b = state.id("b");
+        assert!(state.facts.contains(&Relation::collinear(x, a, b)));
+    }
+
+    // --- Edge case: on_tline and on_pline with fewer args ---
+
+    #[test]
+    fn test_parse_on_tline_fewer_args() {
+        // If on_tline has fewer than 3 args, should still create the output point
+        let input = "test\na b = segment; x = on_tline a b ? coll x a b";
+        let state = parse_problem(input).unwrap();
+        assert!(state.try_id("x").is_some());
+        // No perpendicular fact should be added (too few args)
+    }
+
+    // --- Multi-output point clause ---
+
+    #[test]
+    fn test_parse_multiple_output_points() {
+        // segment creates two output points
+        let input = "test\na b = segment ? coll a b a";
+        let state = parse_problem(input).unwrap();
+        assert!(state.try_id("a").is_some());
+        assert!(state.try_id("b").is_some());
+    }
+
+    // --- Circle with 4 args (output name repeated) ---
+
+    #[test]
+    fn test_parse_circle_4args_with_repeat() {
+        let input = "test\na b c = triangle; o = circle o a b c ? cong o a o c";
+        let state = parse_problem(input).unwrap();
+        let o = state.id("o");
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        assert!(state.facts.contains(&Relation::congruent(o, a, o, b)));
+        assert!(state.facts.contains(&Relation::congruent(o, b, o, c)));
+    }
+
+    // --- Whitespace and formatting edge cases ---
+
+    #[test]
+    fn test_parse_trailing_whitespace() {
+        let input = "test  \n  a b c = triangle ? coll a b c  ";
+        let state = parse_problem(input).unwrap();
+        assert_eq!(state.objects.len(), 3);
+    }
 }

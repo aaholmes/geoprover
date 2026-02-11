@@ -1,58 +1,106 @@
 # Geoprover
 
-MCTS + small neural network for Euclidean geometry theorem proving, adapted from the Caissawary chess engine's three-tier architecture. `saturate()` (forward-chaining deduction to fixed point) replaces `mate_search` as the Tier 1 symbolic gate. The NN only suggests auxiliary constructions — the creative step deduction can't do. Benchmarks against AlphaGeometry's JGEX-AG-231 (231 problems) and IMO-AG-30 (30 formalized IMO geometry problems).
+Neurosymbolic geometry theorem prover using a three-tier MCTS architecture adapted from the Caissawary chess engine. `saturate()` (forward-chaining deduction to fixed point) runs as the Tier 1 symbolic gate before every MCTS expansion. The NN (Phase 4, not yet implemented) will only suggest auxiliary constructions — the creative step deduction can't do. Benchmarks against AlphaGeometry's JGEX-AG-231 (231 problems) and IMO-AG-30 (30 formalized IMO problems).
+
+## Current Status
+
+| Phase | Status | Details |
+|-------|--------|---------|
+| 1. Rust core | **Done** | ProofState, parser (228/231 JGEX), deduction (9 rules), construction (8/16 types) |
+| 2. MCTS | **Done** | MctsNode tree, UCB/PUCT selection, expand/evaluate/backprop, classical fallback |
+| 3. PyO3 bridge | Boilerplate | `lib.rs` has module init, no exposed functions yet |
+| 4. NN + training | Not started | `encoding.rs` is a stub, no Python code |
+| 5. Evaluation | Not started | No benchmark harness beyond integration tests |
+
+**206 tests passing** (189 unit + 17 integration), clippy clean, ~3,800 LOC Rust.
+
+MCTS solves synthetic problems (midpoint congruence, circumcenter equidistance) in 1-2 iterations. JGEX-AG-231 problems require additional deduction rules (inscribed angle theorem, Thales' theorem, cyclic quadrilateral properties) before MCTS search becomes effective.
+
+## Architecture
+
+Hybrid Rust/Python via PyO3 (in-process, no subprocess overhead):
+
+```
+Python (orchestration, NN training, evaluation)
+  |  PyO3 calls
+  v
+Rust extension module (MCTS, deduction engine, state encoding)
+```
+
+**Three-tier search (adapted from chess engine):**
+
+| Tier | Role | Geometry equivalent |
+|------|------|-------------------|
+| 1 | Symbolic deduction | `saturate()` — 9 rules to fixed point (21 planned) |
+| 2 | MCTS tree search | Search over auxiliary constructions (~30-50 candidates/step) |
+| 3 | Neural oracle | SE-ResNet (~2M params), dual-head: policy + value (Phase 4) |
+
+## Source Layout
+
+```
+src/
+  proof_state.rs    ProofState, GeoObject, Relation (Zobrist hashing)
+  deduction.rs      9 forward-chaining rules (transitive parallel/congruent, isosceles, etc.)
+  construction.rs   8 construction types with priority classification
+  parser.rs         JGEX DSL parser (30+ predicates, 228/231 coverage)
+  mcts/
+    mod.rs          Module re-exports
+    node.rs         MctsNode (Rc<RefCell> tree), expand, evaluate, backprop, UCB/PUCT
+    search.rs       mcts_search() loop, select_leaf, proof path extraction
+  encoding.rs       Stub for state-to-tensor encoding
+  lib.rs            PyO3 module init
+```
 
 ## The Geometry Domain
 
-### ProofState — the state representation
+### ProofState
 
 - **Objects**: points, lines, circles — each with a `u16` ID
-- **Facts**: a `HashSet<Relation>` of known truths — `Parallel(A,B,C,D)`, `Congruent(A,B,C,D)`, `Collinear(A,B,C)`, `EqualAngle(...)`, `Midpoint(M,A,B)`, `Cyclic(A,B,C,D)`, etc.
+- **Facts**: `HashSet<Relation>` — `Parallel`, `Congruent`, `Collinear`, `EqualAngle`, `Midpoint`, `Perpendicular`, `OnCircle`, `Cyclic`
 - **Goal**: a single `Relation` to prove
-- **Proved** when `goal in facts`. Binary — no partial credit, no depth optimization. Any construction sequence that gets the goal into the fact set is a valid proof.
-- **Zobrist hash** on facts (same XOR pattern as board positions) for transposition detection
+- **Proved** when `goal in facts`. Any construction sequence that gets the goal into the fact set is a valid proof.
+- **Zobrist hash** on facts for transposition detection
 
-### Auxiliary constructions — the action space (replaces chess moves)
+### Auxiliary Constructions (Action Space)
 
-16 types: Midpoint, AngleBisector, PerpendicularBisector, Altitude, ParallelThrough, PerpendicularThrough, Circumcenter, Incenter, Centroid, Orthocenter, CircumscribedCircle, IntersectLines, IntersectLineCircle, ReflectPoint, ExtendSegment, TangentLine.
+16 types defined, 8 implemented: Midpoint, Altitude, Circumcenter, Orthocenter, Incenter, ParallelThrough, PerpendicularThrough, + fallback. Priority: GoalRelevant > RecentlyActive > Exploratory.
 
-Each construction adds new objects and seed facts to the state. ~30-50 candidates per step. Priority: GoalRelevant > RecentlyActive > Exploratory (maps directly to Check > Capture > Quiet in chess).
+### MCTS Search
 
-### saturate() — the Tier 1 gate (replaces mate_search)
+- **Select**: Two-phase — visit unvisited children first (by priority), then UCB/PUCT
+- **Expand**: Generate constructions, create child nodes (capped branching factor)
+- **Evaluate**: Run `saturate()`. If proved, value=1.0. Otherwise classical fallback: `value = tanh(0.5 * delta_D)`
+- **Backprop**: Single-player — `total_value += value` at every ancestor (no sign flip)
+- **UCB**: `Q + c_puct * prior * sqrt(parent_visits) / (1 + child_visits)`, uniform priors in Phase 2
 
-Forward-chaining rule engine. Applies 21 deduction rules to the fact set until fixed point. Runs after every construction. If the goal appears in facts, the node is terminal (value = 1.0). The 21 rules:
+### Deduction Rules (9/21 implemented)
 
-- **Angle (8)**: vertical, supplementary, triangle sum, isosceles base, inscribed, alternate interior, corresponding, exterior
-- **Congruence (4)**: SAS, ASA, SSS, CPCTC
-- **Length (4)**: midpoint definition, transitive equality, midpoint theorem, angle bisector
-- **Circle (3)**: equal radii, tangent perpendicular to radius, cyclic opposite angles
-- **Parallel/perp (2)**: transitive parallel, perp-to-parallel
+- Transitive parallel, perp-to-parallel
+- Midpoint definition (collinear + congruent)
+- Transitive congruent
+- Isosceles base angles
+- Alternate interior angles
+- Transitive equal angle
+- Stubs: corresponding angles, perpendicular angles
 
-## AlphaGeometry DSL Format (Problem Input)
-
-Problems come from AlphaGeometry's open-source datasets. Format:
+## Problem Format (AlphaGeometry JGEX DSL)
 
 ```
 problem_name
 premises ? goal_predicate
 ```
 
-Premises are `;`-separated construction clauses: `output_points = action1, action2`
-
 Example — orthocenter concurrence:
-
 ```
 orthocenter
 a b c = triangle; h = on_tline b a c, on_tline c a b ? perp a h b c
 ```
 
-Parses to: 4 points, initial facts from constructions (`on_tline` -> perpendicularity), goal = `Perpendicular(A,H,B,C)`.
+## Build & Test
 
-This is a Level 1 problem — `saturate()` alone resolves it (no MCTS needed). Level 2 problems require 1 auxiliary construction + deduction. Level 3 require 2+.
-
-## Domain Simplifications vs Chess
-
-- **Single-player**: backprop is `total_value += value` at every ancestor (no sign flip)
-- **Value range** is [0, 1] not [-1, 1] — "proof progress" from one perspective
-- **Tree is shallow** (0-3 constructions for MVP problems) but correct construction choice is critical
-- **delta_D** (proof distance heuristic for the value function) = fraction of goal sub-conditions satisfied
+```bash
+cargo test                                          # all 206 tests
+cargo clippy                                        # lint
+cargo test --test test_integration -- --nocapture   # integration tests with output
+maturin develop                                     # build PyO3 extension (Phase 3+)
+```

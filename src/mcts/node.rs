@@ -248,6 +248,7 @@ fn lines_match(a1: u16, b1: u16, a2: u16, b2: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::construction::{Construction, ConstructionType, Priority};
     use crate::proof_state::{ObjectType, ProofState, Relation};
 
     fn make_triangle_state() -> ProofState {
@@ -428,5 +429,181 @@ mod tests {
         let child = Rc::clone(&root.borrow().children[0]);
         let parent = child.borrow().parent.as_ref().unwrap().upgrade().unwrap();
         assert!(Rc::ptr_eq(&parent, &root));
+    }
+
+    #[test]
+    fn test_expand_terminal_node_noop() {
+        let state = make_triangle_state();
+        let root = MctsNode::new_root(state);
+        root.borrow_mut().terminal_value = Some(1.0);
+        let count = MctsNode::expand(&root, 50);
+        assert_eq!(count, 0);
+        assert!(root.borrow().children.is_empty());
+    }
+
+    #[test]
+    fn test_evaluate_returns_cached_terminal() {
+        let state = make_triangle_state();
+        let root = MctsNode::new_root(state);
+        root.borrow_mut().terminal_value = Some(0.5);
+        let value = MctsNode::evaluate(&root);
+        assert_eq!(value, 0.5);
+    }
+
+    #[test]
+    fn test_is_terminal_false_for_none() {
+        let node = MctsNode {
+            state: ProofState::new(),
+            action: None,
+            visits: 0,
+            total_value: 0.0,
+            terminal_value: None,
+            children: Vec::new(),
+            parent: None,
+            expanded: false,
+        };
+        assert!(!node.is_terminal());
+    }
+
+    #[test]
+    fn test_is_terminal_false_for_zero() {
+        let node = MctsNode {
+            state: ProofState::new(),
+            action: None,
+            visits: 0,
+            total_value: 0.0,
+            terminal_value: Some(0.0),
+            children: Vec::new(),
+            parent: None,
+            expanded: false,
+        };
+        assert!(!node.is_terminal());
+    }
+
+    #[test]
+    fn test_delta_d_parallel() {
+        let mut state = ProofState::new();
+        state.add_object("a", ObjectType::Point);
+        state.add_object("b", ObjectType::Point);
+        state.add_object("c", ObjectType::Point);
+        state.add_object("d", ObjectType::Point);
+        let (a, b, c, d) = (0, 1, 2, 3);
+        // Goal: AB || CD, we have some parallel fact involving AB
+        state.add_fact(Relation::parallel(a, b, 10, 11));
+        state.set_goal(Relation::parallel(a, b, c, d));
+        let delta = compute_delta_d(&state);
+        assert!(delta > 0.0);
+        assert!(delta <= 0.9);
+    }
+
+    #[test]
+    fn test_delta_d_perpendicular() {
+        let mut state = ProofState::new();
+        state.add_object("a", ObjectType::Point);
+        state.add_object("b", ObjectType::Point);
+        state.add_object("c", ObjectType::Point);
+        state.add_object("d", ObjectType::Point);
+        let (a, b, c, d) = (0, 1, 2, 3);
+        state.add_fact(Relation::perpendicular(a, b, 10, 11));
+        state.set_goal(Relation::perpendicular(a, b, c, d));
+        let delta = compute_delta_d(&state);
+        assert!(delta > 0.0);
+        assert!(delta <= 0.9);
+    }
+
+    #[test]
+    fn test_delta_d_equal_angle() {
+        let mut state = ProofState::new();
+        for i in 0..6 {
+            state.add_object(&format!("p{}", i), ObjectType::Point);
+        }
+        // Goal: angle(0,1,2) = angle(3,4,5)
+        // Have a fact matching first triple
+        state.add_fact(Relation::equal_angle(0, 1, 2, 10, 11, 12));
+        state.set_goal(Relation::equal_angle(0, 1, 2, 3, 4, 5));
+        let delta = compute_delta_d(&state);
+        assert!(delta > 0.0);
+        assert!(delta <= 0.9);
+    }
+
+    #[test]
+    fn test_delta_d_collinear() {
+        let mut state = ProofState::new();
+        state.add_object("a", ObjectType::Point);
+        state.add_object("b", ObjectType::Point);
+        state.add_object("c", ObjectType::Point);
+        let (a, b, c) = (0, 1, 2);
+        // Have collinear(a, b, x) — shares 2 points with goal collinear(a, b, c)
+        state.add_object("x", ObjectType::Point);
+        state.add_fact(Relation::collinear(a, b, 3));
+        state.set_goal(Relation::collinear(a, b, c));
+        let delta = compute_delta_d(&state);
+        assert!(delta > 0.0);
+        assert!(delta <= 0.9);
+    }
+
+    #[test]
+    fn test_delta_d_cyclic_returns_zero() {
+        let mut state = ProofState::new();
+        for i in 0..4 {
+            state.add_object(&format!("p{}", i), ObjectType::Point);
+        }
+        state.set_goal(Relation::cyclic(0, 1, 2, 3));
+        let delta = compute_delta_d(&state);
+        assert_eq!(delta, 0.0); // Cyclic hits the `_ => 0.0` branch
+    }
+
+    #[test]
+    fn test_delta_d_proved_returns_one() {
+        let mut state = ProofState::new();
+        state.add_object("a", ObjectType::Point);
+        state.add_object("b", ObjectType::Point);
+        state.add_object("c", ObjectType::Point);
+        let goal = Relation::collinear(0, 1, 2);
+        state.add_fact(goal.clone());
+        state.set_goal(goal);
+        let delta = compute_delta_d(&state);
+        assert_eq!(delta, 1.0);
+    }
+
+    #[test]
+    fn test_backprop_three_levels() {
+        let state = ProofState::new();
+        let root = MctsNode::new_root(state);
+        let child = MctsNode::new_child(
+            &root,
+            Construction { ctype: ConstructionType::Midpoint, args: vec![0, 1], priority: Priority::Exploratory },
+            ProofState::new(),
+        );
+        let grandchild = MctsNode::new_child(
+            &child,
+            Construction { ctype: ConstructionType::Altitude, args: vec![0, 1, 2], priority: Priority::Exploratory },
+            ProofState::new(),
+        );
+        MctsNode::backprop(&grandchild, 0.7);
+
+        assert_eq!(grandchild.borrow().visits, 1);
+        assert!((grandchild.borrow().total_value - 0.7).abs() < 1e-10);
+        assert_eq!(child.borrow().visits, 1);
+        assert!((child.borrow().total_value - 0.7).abs() < 1e-10);
+        assert_eq!(root.borrow().visits, 1);
+        assert!((root.borrow().total_value - 0.7).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_ucb_high_q_wins() {
+        let state = make_triangle_state();
+        let root = MctsNode::new_root(state);
+        MctsNode::expand(&root, 10);
+
+        let child0 = Rc::clone(&root.borrow().children[0]);
+        let child1 = Rc::clone(&root.borrow().children[1]);
+        // Give child0 high value, child1 low value
+        MctsNode::backprop(&child0, 0.9);
+        MctsNode::backprop(&child1, 0.1);
+        let n = root.borrow().children.len();
+        let score0 = MctsNode::ucb_score(&child0, 2, 1.4, n);
+        let score1 = MctsNode::ucb_score(&child1, 2, 1.4, n);
+        assert!(score0 > score1, "Higher Q child should have higher UCB score");
     }
 }

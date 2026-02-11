@@ -638,4 +638,114 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn test_apply_centroid_construction() {
+        // Centroid hits the default `_` arm (like AngleBisector)
+        let state = make_triangle();
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        let construction = Construction {
+            ctype: ConstructionType::Centroid,
+            args: vec![a, b, c],
+            priority: Priority::Exploratory,
+        };
+        let new_state = apply_construction(&state, &construction);
+        assert_eq!(new_state.objects.len(), 4);
+    }
+
+    #[test]
+    fn test_generates_parallel_through() {
+        let state = make_triangle();
+        let constructions = generate_constructions(&state);
+        let parallels: Vec<_> = constructions
+            .iter()
+            .filter(|c| c.ctype == ConstructionType::ParallelThrough)
+            .collect();
+        // 3 points × 3 lines (C(3,2)=3), but P can't be on its own line → 3 choices per line × 3 lines... minus overlap
+        assert!(!parallels.is_empty());
+        // Each parallel construction has 3 args: (point, lineA, lineB)
+        for p in &parallels {
+            assert_eq!(p.args.len(), 3);
+            assert_ne!(p.args[0], p.args[1]);
+            assert_ne!(p.args[0], p.args[2]);
+        }
+    }
+
+    #[test]
+    fn test_generates_perpendicular_through() {
+        let state = make_triangle();
+        let constructions = generate_constructions(&state);
+        let perps: Vec<_> = constructions
+            .iter()
+            .filter(|c| c.ctype == ConstructionType::PerpendicularThrough)
+            .collect();
+        assert!(!perps.is_empty());
+        for p in &perps {
+            assert_eq!(p.args.len(), 3);
+            assert_ne!(p.args[0], p.args[1]);
+            assert_ne!(p.args[0], p.args[2]);
+        }
+    }
+
+    #[test]
+    fn test_generates_altitude() {
+        let state = make_triangle();
+        let constructions = generate_constructions(&state);
+        let altitudes: Vec<_> = constructions
+            .iter()
+            .filter(|c| c.ctype == ConstructionType::Altitude)
+            .collect();
+        // 3 points, each dropped to the opposite side: 3 altitudes
+        assert_eq!(altitudes.len(), 3);
+    }
+
+    #[test]
+    fn test_classify_priority_no_goal() {
+        let state = make_triangle();
+        // No goal set → everything is Exploratory
+        let constructions = generate_constructions(&state);
+        assert!(constructions.iter().all(|c| c.priority == Priority::Exploratory));
+    }
+
+    #[test]
+    fn test_classify_priority_equal_angle_goal() {
+        let mut state = make_triangle();
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        // EqualAngle goal involves all 3 points → all constructions should be GoalRelevant
+        state.set_goal(Relation::equal_angle(a, b, c, c, b, a));
+        let constructions = generate_constructions(&state);
+        assert!(constructions.iter().all(|c| c.priority == Priority::GoalRelevant));
+    }
+
+    #[test]
+    fn test_four_points_more_constructions() {
+        let mut state = make_triangle();
+        state.add_object("d", ObjectType::Point);
+        let constructions = generate_constructions(&state);
+        // With 4 points, we should have more constructions than with 3
+        let state3 = make_triangle();
+        let constructions3 = generate_constructions(&state3);
+        assert!(constructions.len() > constructions3.len());
+    }
+
+    #[test]
+    fn test_apply_construction_preserves_goal() {
+        let mut state = make_triangle();
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        state.set_goal(Relation::congruent(a, b, a, c));
+        let construction = Construction {
+            ctype: ConstructionType::Midpoint,
+            args: vec![a, b],
+            priority: Priority::GoalRelevant,
+        };
+        let new_state = apply_construction(&state, &construction);
+        // Goal should be preserved in the new state
+        assert_eq!(new_state.goal, Some(Relation::congruent(a, b, a, c)));
+    }
 }
