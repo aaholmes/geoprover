@@ -6,15 +6,15 @@ Neurosymbolic geometry theorem prover using a three-tier MCTS architecture adapt
 
 | Phase | Status | Details |
 |-------|--------|---------|
-| 1. Rust core | **Done** | ProofState, parser (231/231 JGEX), deduction (41 rules), construction (16 types) |
+| 1. Rust core | **Done** | ProofState, parser (231/231 JGEX), deduction (45 rules), construction (16 types) |
 | 2. MCTS | **Done** | MctsNode tree, UCB/PUCT selection, expand/evaluate/backprop, classical fallback |
 | 3. PyO3 bridge | Boilerplate | `lib.rs` has module init, no exposed functions yet |
 | 4. NN + training | Not started | `encoding.rs` is a stub, no Python code |
 | 5. Evaluation | Not started | No benchmark harness beyond integration tests |
 
-**JGEX-AG-231: 160/231 solved (69%)** — all by deduction alone, with MCTS available for harder problems.
+**JGEX-AG-231: 169/231 solved (73%)** — all by deduction alone, with MCTS available for harder problems.
 
-**330 tests passing** (313 unit + 17 integration), clippy clean, ~8,500 LOC Rust.
+**339 tests passing** (322 unit + 17 integration), clippy clean.
 
 ## Architecture
 
@@ -31,7 +31,7 @@ Rust extension module (MCTS, deduction engine, state encoding)
 
 | Tier | Role | Geometry equivalent |
 |------|------|-------------------|
-| 1 | Symbolic deduction | `saturate()` — 41 rules to fixed point |
+| 1 | Symbolic deduction | `saturate()` — 45 rules to fixed point |
 | 2 | MCTS tree search | Search over auxiliary constructions (~30-50 candidates/step) |
 | 3 | Neural oracle | SE-ResNet (~2M params), dual-head: policy + value (Phase 4) |
 
@@ -40,7 +40,7 @@ Rust extension module (MCTS, deduction engine, state encoding)
 ```
 src/
   proof_state.rs    ProofState, GeoObject, Relation (Zobrist hashing)
-  deduction.rs      41 forward-chaining rules + degenerate-fact filtering
+  deduction.rs      45 forward-chaining rules + degenerate-fact filtering
   construction.rs   16 construction types with priority classification
   parser.rs         JGEX DSL parser (40+ predicates, 231/231 coverage)
   mcts/
@@ -73,7 +73,7 @@ src/
 - **Backprop**: Single-player — `total_value += value` at every ancestor (no sign flip)
 - **UCB**: `Q + c_puct * prior * sqrt(parent_visits) / (1 + child_visits)`, uniform priors in Phase 2
 
-### Deduction Rules (41 active)
+### Deduction Rules (45 active)
 
 **Parallel/perpendicular**: transitive parallel, perp-to-parallel, perp+parallel transfer, parallel+collinear extension, perp+collinear extension, parallel shared point collinear, two equidistant points perpendicular, equidistant+cyclic perpendicular (AG25), eqangle+perp transfer (AG31)
 
@@ -83,7 +83,9 @@ src/
 
 **Angles**: isosceles base angles, alternate interior angles, corresponding angles (AG9, two perps), transitive equal angle, perpendicular right angles, equal angles to parallel, cyclic inscribed angles, inscribed angle converse, cyclic+parallel base angles (AG22)
 
-**Ratios**: transitive ratio, ratio=1 to congruence, midpoint to ratio, Thales (parallel+collinear to ratio), congruent to ratio, converse Thales (ratio+collinear to parallel)
+**Ratios**: transitive ratio, ratio=1 to congruence, midpoint to ratio, Thales (parallel+collinear to ratio), congruent to ratio, converse Thales (ratio+collinear to parallel), parallel base ratio (|AB|/|CD| from transversals)
+
+**Quadrilaterals**: parallelogram opposite angles, isosceles trapezoid base angles, trapezoid midsegment
 
 **Circles**: circle-point equidistance, congruent to OnCircle, cyclic from OnCircle, Thales' theorem
 
@@ -105,7 +107,7 @@ a b c = triangle; h = on_tline b a c, on_tline c a b ? perp a h b c
 ## Build & Test
 
 ```bash
-cargo test                                          # all 330 tests
+cargo test                                          # all 339 tests
 cargo clippy                                        # lint
 cargo test --test test_integration -- --nocapture   # integration tests with output
 maturin develop                                     # build PyO3 extension (Phase 3+)
