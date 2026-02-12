@@ -74,10 +74,12 @@ impl Relation {
     }
 
     /// Create an EqualAngle relation: angle(a,b,c) = angle(d,e,f)
-    /// b and e are the vertices. Canonical: first triple <= second triple lexicographically
+    /// b and e are the vertices. Each triple is normalized so first ray < last ray,
+    /// then the two triples are sorted lexicographically.
     pub fn equal_angle(a: u16, b: u16, c: u16, d: u16, e: u16, f: u16) -> Self {
-        let t1 = (a, b, c);
-        let t2 = (d, e, f);
+        // Normalize each triple: angle(a,b,c) = angle(c,b,a), so ensure first < last
+        let t1 = if a <= c { (a, b, c) } else { (c, b, a) };
+        let t2 = if d <= f { (d, e, f) } else { (f, e, d) };
         if t1 <= t2 {
             Relation::EqualAngle(t1.0, t1.1, t1.2, t2.0, t2.1, t2.2)
         } else {

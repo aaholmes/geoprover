@@ -89,7 +89,19 @@ fn parse_action(
     }
 
     let predicate = tokens[0];
-    let args: Vec<&str> = tokens[1..].to_vec();
+    // JGEX format repeats the single output name as the first arg for construction predicates
+    // (e.g., `c = on_bline c a b` → args should be [a, b], not [c, a, b]).
+    // Only strip for single-output predicates to avoid breaking shape predicates
+    // (e.g., `a b c = triangle a b c` uses all args).
+    let raw_args: Vec<&str> = tokens[1..].to_vec();
+    let args: Vec<&str> = if !raw_args.is_empty()
+        && output_names.len() == 1
+        && raw_args[0] == output_names[0]
+    {
+        raw_args[1..].to_vec()
+    } else {
+        raw_args
+    };
 
     match predicate {
         "triangle" => {
@@ -183,7 +195,7 @@ fn parse_action(
         }
         "circumcenter" => {
             // `o = circumcenter a b c` — circumcenter of triangle ABC
-            // Creates: |OA| = |OB|, |OB| = |OC|
+            // Creates: |OA| = |OB|, |OB| = |OC|, OnCircle(a,o), OnCircle(b,o), OnCircle(c,o)
             for name in output_names {
                 state.add_object(name, ObjectType::Point);
             }
@@ -194,6 +206,9 @@ fn parse_action(
                 let c = ensure_point(args[2], state)?;
                 state.add_fact(Relation::congruent(o, a, o, b));
                 state.add_fact(Relation::congruent(o, b, o, c));
+                state.add_fact(Relation::on_circle(a, o));
+                state.add_fact(Relation::on_circle(b, o));
+                state.add_fact(Relation::on_circle(c, o));
             }
         }
         "incenter" => {
@@ -260,7 +275,7 @@ fn parse_action(
         }
         "on_circle" => {
             // `x = on_circle x o a` — point x on circle centered at o through a
-            // Creates: |OX| = |OA|
+            // Creates: |OX| = |OA| and OnCircle(x, o), OnCircle(a, o)
             for name in output_names {
                 state.add_object(name, ObjectType::Point);
             }
@@ -269,6 +284,8 @@ fn parse_action(
                 let o = ensure_point(args[0], state)?;
                 let a = ensure_point(args[1], state)?;
                 state.add_fact(Relation::congruent(o, x, o, a));
+                state.add_fact(Relation::on_circle(x, o));
+                state.add_fact(Relation::on_circle(a, o));
             }
         }
         "angle_bisector" => {
@@ -300,24 +317,39 @@ fn parse_action(
             }
         }
         "eq_triangle" => {
-            // Equilateral triangle
+            // Equilateral triangle: either `x = eq_triangle x a b` (1 output)
+            // or `a b c = eq_triangle a b c` (3 outputs)
+            for name in output_names {
+                state.add_object(name, ObjectType::Point);
+            }
+            if output_names.len() == 1 && args.len() >= 2 {
+                // Single output: x is new vertex on base (args[0], args[1])
+                let x = state.id(output_names[0]);
+                let a = ensure_point(args[0], state)?;
+                let b = ensure_point(args[1], state)?;
+                state.add_fact(Relation::congruent(x, a, x, b));
+                state.add_fact(Relation::congruent(x, a, a, b));
+            } else if args.len() >= 3 {
+                // Three outputs: all three vertices given
+                let a = state.id(args[0]);
+                let b = state.id(args[1]);
+                let c = state.id(args[2]);
+                state.add_fact(Relation::congruent(a, b, a, c));
+                state.add_fact(Relation::congruent(a, b, b, c));
+            }
+        }
+        "eqdistance" => {
+            // `x = eqdistance a b c` — |XA| = |BC|
             for name in output_names {
                 state.add_object(name, ObjectType::Point);
             }
             if args.len() >= 3 {
-                let a = state.id(args[0]);
-                let b = state.id(args[1]);
-                let c = state.id(args[2]);
-                state.add_fact(Relation::congruent(a, b, b, c));
-                state.add_fact(Relation::congruent(b, c, a, c));
+                let x = state.id(output_names[0]);
+                let a = ensure_point(args[0], state)?;
+                let b = ensure_point(args[1], state)?;
+                let c = ensure_point(args[2], state)?;
+                state.add_fact(Relation::congruent(x, a, b, c));
             }
-        }
-        "eqdistance" => {
-            // `x = eqdistance a b c` — |XA| = |BC| or similar
-            for name in output_names {
-                state.add_object(name, ObjectType::Point);
-            }
-            // depends on exact semantics
         }
         "on_bline" => {
             // `x = on_bline a b` — x on perpendicular bisector of AB
@@ -348,6 +380,9 @@ fn parse_action(
                 };
                 state.add_fact(Relation::congruent(o, a, o, b));
                 state.add_fact(Relation::congruent(o, b, o, c));
+                state.add_fact(Relation::on_circle(a, o));
+                state.add_fact(Relation::on_circle(b, o));
+                state.add_fact(Relation::on_circle(c, o));
             }
         }
         "s_angle" => {
@@ -402,7 +437,7 @@ fn parse_action(
                 state.add_fact(Relation::perpendicular(a, b, a, d));
             }
         }
-        "square" => {
+        "square" | "isquare" => {
             for name in output_names {
                 state.add_object(name, ObjectType::Point);
             }
@@ -431,7 +466,7 @@ fn parse_action(
                 state.add_fact(Relation::parallel(a, b, c, d));
             }
         }
-        "iso_trapezoid" => {
+        "iso_trapezoid" | "eq_trapezoid" => {
             for name in output_names {
                 state.add_object(name, ObjectType::Point);
             }
@@ -442,6 +477,61 @@ fn parse_action(
                 let d = state.id(args[3]);
                 state.add_fact(Relation::parallel(a, b, c, d));
                 state.add_fact(Relation::congruent(a, d, b, c));
+            }
+        }
+        "quadrangle" => {
+            // Four free points, no constraints
+            for name in output_names {
+                state.add_object(name, ObjectType::Point);
+            }
+        }
+        "on_aline" => {
+            // `x = on_aline A B C D E` — angle(B,A,X) = angle(D,C,E)
+            for name in output_names {
+                state.add_object(name, ObjectType::Point);
+            }
+            if args.len() >= 5 {
+                let x = state.id(output_names[0]);
+                let anchor = ensure_point(args[0], state)?;
+                let b = ensure_point(args[1], state)?;
+                let c = ensure_point(args[2], state)?;
+                let d = ensure_point(args[3], state)?;
+                let e = ensure_point(args[4], state)?;
+                // angle(B, A, X) = angle(D, C, E)
+                state.add_fact(Relation::equal_angle(b, anchor, x, d, c, e));
+            }
+        }
+        "intersection_pp" => {
+            // Intersection of two perpendicular lines
+            // `x = intersection_pp p1 l1a l1b p2 l2a l2b`
+            // x on line through p1 perp to l1a-l1b AND on line through p2 perp to l2a-l2b
+            for name in output_names {
+                state.add_object(name, ObjectType::Point);
+            }
+            if args.len() >= 6 {
+                let x = state.id(output_names[0]);
+                let p1 = ensure_point(args[0], state)?;
+                let l1a = ensure_point(args[1], state)?;
+                let l1b = ensure_point(args[2], state)?;
+                let p2 = ensure_point(args[3], state)?;
+                let l2a = ensure_point(args[4], state)?;
+                let l2b = ensure_point(args[5], state)?;
+                state.add_fact(Relation::perpendicular(p1, x, l1a, l1b));
+                state.add_fact(Relation::perpendicular(p2, x, l2a, l2b));
+            }
+        }
+        "nsquare" | "psquare" => {
+            // `c = nsquare b a` or `d = psquare a b`
+            // Construct a square vertex: |pivot-output| = |pivot-other|, perpendicular
+            for name in output_names {
+                state.add_object(name, ObjectType::Point);
+            }
+            if args.len() >= 2 {
+                let x = state.id(output_names[0]);
+                let pivot = ensure_point(args[0], state)?;
+                let other = ensure_point(args[1], state)?;
+                state.add_fact(Relation::congruent(pivot, x, pivot, other));
+                state.add_fact(Relation::perpendicular(pivot, x, pivot, other));
             }
         }
         "eqangle2" => {
@@ -956,13 +1046,28 @@ mod tests {
 
     #[test]
     fn test_parse_eq_triangle() {
+        // 3-output form: a b c = eq_triangle a b c
         let input = "test\na b c = eq_triangle a b c ? cong a b b c";
         let state = parse_problem(input).unwrap();
         let a = state.id("a");
         let b = state.id("b");
         let c = state.id("c");
+        // x=a, base=(b,c): |ab|=|ac| and |ab|=|bc|
+        assert!(state.facts.contains(&Relation::congruent(a, b, a, c)));
         assert!(state.facts.contains(&Relation::congruent(a, b, b, c)));
-        assert!(state.facts.contains(&Relation::congruent(b, c, a, c)));
+    }
+
+    #[test]
+    fn test_parse_eq_triangle_single_output() {
+        // 1-output form: d = eq_triangle d a b (construct vertex d on base ab)
+        let input = "test\na b c = triangle a b c; d = eq_triangle d a b ? cong d a d b";
+        let state = parse_problem(input).unwrap();
+        let a = state.id("a");
+        let b = state.id("b");
+        let d = state.id("d");
+        // |da| = |db| and |da| = |ab|
+        assert!(state.facts.contains(&Relation::congruent(d, a, d, b)));
+        assert!(state.facts.contains(&Relation::congruent(a, b, a, d)));
     }
 
     #[test]
@@ -1355,5 +1460,109 @@ mod tests {
         let input = "test  \n  a b c = triangle ? coll a b c  ";
         let state = parse_problem(input).unwrap();
         assert_eq!(state.objects.len(), 3);
+    }
+
+    // --- Missing constructors (TDD: write tests first) ---
+
+    #[test]
+    fn test_parse_eq_trapezoid() {
+        // eq_trapezoid = isosceles trapezoid: AB || CD, |AD| = |BC|
+        let input = "test\na b c d = eq_trapezoid a b c d ? para a b c d";
+        let state = parse_problem(input).unwrap();
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        let d = state.id("d");
+        assert!(state.facts.contains(&Relation::parallel(a, b, c, d)));
+        assert!(state.facts.contains(&Relation::congruent(a, d, b, c)));
+    }
+
+    #[test]
+    fn test_parse_quadrangle() {
+        // quadrangle = 4 free points, no constraints
+        let input = "test\na b c d = quadrangle a b c d ? coll a b c";
+        let state = parse_problem(input).unwrap();
+        assert_eq!(state.objects.len(), 4);
+        assert!(state.try_id("a").is_some());
+        assert!(state.try_id("d").is_some());
+        // No facts should be added
+        assert!(state.facts.is_empty());
+    }
+
+    #[test]
+    fn test_parse_isquare() {
+        // isquare = same as square
+        let input = "test\na b c d = isquare a b c d ? cong a b b c";
+        let state = parse_problem(input).unwrap();
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        let d = state.id("d");
+        assert!(state.facts.contains(&Relation::congruent(a, b, b, c)));
+        assert!(state.facts.contains(&Relation::perpendicular(a, b, a, d)));
+        assert!(state.facts.contains(&Relation::parallel(a, b, c, d)));
+    }
+
+    #[test]
+    fn test_parse_eqdistance() {
+        // eqdistance x a b c → |XA| = |BC|
+        let input = "test\na b c = triangle; g = on_line a b, eqdistance a b c ? cong g a b c";
+        let state = parse_problem(input).unwrap();
+        let g = state.id("g");
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        assert!(state.facts.contains(&Relation::congruent(g, a, b, c)));
+    }
+
+    #[test]
+    fn test_parse_on_aline() {
+        // on_aline x A B C D E → angle(B,A,X) = angle(D,C,E)
+        let input = "test\na b c = triangle; s = on_aline a b c b a ? cong a b a c";
+        let state = parse_problem(input).unwrap();
+        let s = state.id("s");
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        // on_aline with args [a, b, c, b, a] after stripping s
+        // A=a, B=b, C=c, D=b, E=a → angle(b, a, s) = angle(b, c, a)
+        assert!(state.facts.contains(&Relation::equal_angle(b, a, s, b, c, a)));
+    }
+
+    #[test]
+    fn test_parse_intersection_pp() {
+        // intersection_pp d a b c c a b → orthocenter: Perp(a,d,b,c) + Perp(c,d,a,b)
+        let input = "test\na b c = triangle; d = intersection_pp a b c c a b ? perp a d b c";
+        let state = parse_problem(input).unwrap();
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        let d = state.id("d");
+        assert!(state.facts.contains(&Relation::perpendicular(a, d, b, c)));
+        assert!(state.facts.contains(&Relation::perpendicular(c, d, a, b)));
+    }
+
+    #[test]
+    fn test_parse_nsquare() {
+        // nsquare c b a → |BC| = |BA|, BC ⊥ BA
+        let input = "test\na b = segment; c = nsquare b a ? cong b c b a";
+        let state = parse_problem(input).unwrap();
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        assert!(state.facts.contains(&Relation::congruent(b, c, b, a)));
+        assert!(state.facts.contains(&Relation::perpendicular(b, c, b, a)));
+    }
+
+    #[test]
+    fn test_parse_psquare() {
+        // psquare d a b → |AD| = |AB|, AD ⊥ AB
+        let input = "test\na b = segment; d = psquare a b ? cong a d a b";
+        let state = parse_problem(input).unwrap();
+        let a = state.id("a");
+        let b = state.id("b");
+        let d = state.id("d");
+        assert!(state.facts.contains(&Relation::congruent(a, d, a, b)));
+        assert!(state.facts.contains(&Relation::perpendicular(a, d, a, b)));
     }
 }

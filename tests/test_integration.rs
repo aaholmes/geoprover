@@ -162,21 +162,33 @@ fn test_count_jgex_solvable_by_deduction() {
     let lines: Vec<&str> = content.lines().collect();
     let mut total = 0;
     let mut solved = 0;
+    let mut solved_names = Vec::new();
 
     for chunk in lines.chunks(2) {
         if chunk.len() == 2 {
             let problem = format!("{}\n{}", chunk[0], chunk[1]);
             if let Ok(mut state) = parse_problem(&problem) {
                 total += 1;
+                let facts_before = state.facts.len();
                 if saturate(&mut state) {
                     solved += 1;
+                    solved_names.push(chunk[0].to_string());
+                } else {
+                    let facts_after = state.facts.len();
+                    let new_facts = facts_after - facts_before;
+                    if new_facts >= 3 {
+                        let goal_str = chunk[1].split("? ").nth(1).unwrap_or("?");
+                        let goal_pred = goal_str.split_whitespace().next().unwrap_or("?");
+                        println!("PROGRESS: {} goal={} (+{} facts)", chunk[0], goal_pred, new_facts);
+                    }
                 }
             }
         }
     }
-    println!("Solved {}/{} parseable JGEX problems by deduction alone", solved, total);
-    // We expect at least some to be solvable (Level 1 problems)
-    // Don't assert a specific count since it depends on rule completeness
+    println!("\nSolved {}/{} parseable JGEX problems by deduction alone", solved, total);
+    for name in &solved_names {
+        println!("  SOLVED: {}", name);
+    }
 }
 
 // ============================
@@ -342,10 +354,10 @@ fn test_count_jgex_solvable_by_mcts() {
     let mut solved_names = Vec::new();
 
     let config = MctsConfig {
-        num_iterations: 100,
-        max_children: 20,
+        num_iterations: 10,
+        max_children: 5,
         c_puct: 1.4,
-        max_depth: 2,
+        max_depth: 1,
     };
 
     for chunk in lines.chunks(2) {
@@ -363,7 +375,7 @@ fn test_count_jgex_solvable_by_mcts() {
                     continue;
                 }
 
-                // Then try MCTS
+                // Then try MCTS (lightweight config for benchmark speed)
                 let result = mcts_search(state, &config);
                 if result.solved {
                     solved_mcts += 1;
