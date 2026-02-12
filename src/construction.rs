@@ -298,6 +298,7 @@ fn get_relation_points(relation: &Relation) -> Vec<u16> {
         Relation::Midpoint(m, a, b) => vec![*m, *a, *b],
         Relation::OnCircle(a, b) => vec![*a, *b],
         Relation::Cyclic(a, b, c, d) => vec![*a, *b, *c, *d],
+        Relation::EqualRatio(a, b, c, d, e, f, g, h) => vec![*a, *b, *c, *d, *e, *f, *g, *h],
     }
 }
 

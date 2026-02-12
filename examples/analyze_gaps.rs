@@ -14,6 +14,7 @@ fn goal_type(goal: &Relation) -> &'static str {
         Relation::Cyclic(..) => "cyclic",
         Relation::Midpoint(..) => "midp",
         Relation::OnCircle(..) => "oncircle",
+        Relation::EqualRatio(..) => "eqratio",
     }
 }
 
@@ -285,6 +286,7 @@ fn detailed_analysis(name: &str, def: &str, state: &geoprover::proof_state::Proo
             Relation::Cyclic(..) => "cyclic",
             Relation::Midpoint(..) => "midp",
             Relation::OnCircle(..) => "oncircle",
+            Relation::EqualRatio(..) => "eqratio",
         };
         *fact_counts.entry(t).or_insert(0) += 1;
     }
@@ -501,6 +503,7 @@ fn format_relation(r: &Relation, id_to_name: &HashMap<u16, String>) -> String {
         Relation::Cyclic(a, b, c, d) => format!("cyclic({},{},{},{})", n(*a), n(*b), n(*c), n(*d)),
         Relation::Midpoint(m, a, b) => format!("midp({},{},{})", n(*m), n(*a), n(*b)),
         Relation::OnCircle(p, c) => format!("oncircle({},{})", n(*p), n(*c)),
+        Relation::EqualRatio(a, b, c, d, e, f, g, h) => format!("eqratio({},{},{},{},{},{},{},{})", n(*a), n(*b), n(*c), n(*d), n(*e), n(*f), n(*g), n(*h)),
     }
 }
 

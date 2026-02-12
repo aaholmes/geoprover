@@ -12,6 +12,7 @@ fn goal_type(r: &Relation) -> &'static str {
         Relation::Cyclic(..) => "cyclic",
         Relation::Midpoint(..) => "midp",
         Relation::OnCircle(..) => "oncircle",
+        Relation::EqualRatio(..) => "eqratio",
     }
 }
 

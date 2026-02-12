@@ -879,6 +879,18 @@ fn parse_goal(goal_str: &str, state: &ProofState) -> Result<Relation, ParseError
             let _r = lookup(args[5], state)?;
             Ok(Relation::congruent(a, b, p, q))
         }
+        "eqratio" => {
+            require_args(predicate, args, 8)?;
+            let a = lookup(args[0], state)?;
+            let b = lookup(args[1], state)?;
+            let c = lookup(args[2], state)?;
+            let d = lookup(args[3], state)?;
+            let e = lookup(args[4], state)?;
+            let f = lookup(args[5], state)?;
+            let g = lookup(args[6], state)?;
+            let h = lookup(args[7], state)?;
+            Ok(Relation::equal_ratio(a, b, c, d, e, f, g, h))
+        }
         _ => Err(ParseError(format!("Unknown goal predicate: '{}'", predicate))),
     }
 }

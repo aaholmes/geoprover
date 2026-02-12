@@ -36,6 +36,8 @@ pub enum Relation {
     OnCircle(u16, u16),
     /// Four concyclic points (sorted)
     Cyclic(u16, u16, u16, u16),
+    /// |AB|/|CD| = |EF|/|GH| — equal segment ratios
+    EqualRatio(u16, u16, u16, u16, u16, u16, u16, u16),
 }
 
 impl Relation {
@@ -104,6 +106,26 @@ impl Relation {
         let mut pts = [a, b, c, d];
         pts.sort();
         Relation::Cyclic(pts[0], pts[1], pts[2], pts[3])
+    }
+
+    /// Create an EqualRatio relation: |AB|/|CD| = |EF|/|GH|
+    /// Each segment pair is sorted, then the two ratio sides are sorted.
+    #[allow(clippy::too_many_arguments)]
+    pub fn equal_ratio(
+        a: u16, b: u16, c: u16, d: u16,
+        e: u16, f: u16, g: u16, h: u16,
+    ) -> Self {
+        let s1 = if a <= b { (a, b) } else { (b, a) };
+        let s2 = if c <= d { (c, d) } else { (d, c) };
+        let s3 = if e <= f { (e, f) } else { (f, e) };
+        let s4 = if g <= h { (g, h) } else { (h, g) };
+        let left = (s1, s2);
+        let right = (s3, s4);
+        let (left, right) = if left <= right { (left, right) } else { (right, left) };
+        Relation::EqualRatio(
+            left.0 .0, left.0 .1, left.1 .0, left.1 .1,
+            right.0 .0, right.0 .1, right.1 .0, right.1 .1,
+        )
     }
 }
 
@@ -537,5 +559,21 @@ mod tests {
         assert!(state.add_fact(Relation::collinear(0, 1, 2)));
         assert!(!state.add_fact(Relation::collinear(0, 1, 2)));
         assert!(!state.add_fact(Relation::collinear(2, 1, 0))); // same canonical form
+    }
+
+    #[test]
+    fn test_equal_ratio_canonical_symmetry() {
+        // |AB|/|CD| = |EF|/|GH| should equal |EF|/|GH| = |AB|/|CD|
+        let r1 = Relation::equal_ratio(0, 1, 2, 3, 4, 5, 6, 7);
+        let r2 = Relation::equal_ratio(4, 5, 6, 7, 0, 1, 2, 3);
+        assert_eq!(r1, r2);
+    }
+
+    #[test]
+    fn test_equal_ratio_segment_endpoint_sorting() {
+        // Segment endpoints should be sorted within each pair
+        let r1 = Relation::equal_ratio(1, 0, 3, 2, 5, 4, 7, 6);
+        let r2 = Relation::equal_ratio(0, 1, 2, 3, 4, 5, 6, 7);
+        assert_eq!(r1, r2);
     }
 }

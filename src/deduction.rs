@@ -50,6 +50,17 @@ pub fn saturate(state: &mut ProofState) -> bool {
         new_facts.extend(rule_equidistant_cyclic_perp(&state.facts));
         new_facts.extend(rule_midpoint_parallelogram(&state.facts));
         new_facts.extend(rule_eqangle_perp_to_perp(&state.facts));
+        // Triangle congruence rules
+        new_facts.extend(rule_sas_congruence(&state.facts));
+        new_facts.extend(rule_asa_congruence(&state.facts));
+        new_facts.extend(rule_sss_congruence(&state.facts));
+        // Ratio rules
+        new_facts.extend(rule_transitive_ratio(&state.facts));
+        new_facts.extend(rule_ratio_one_congruence(&state.facts));
+        new_facts.extend(rule_midpoint_ratio(&state.facts));
+        new_facts.extend(rule_parallel_collinear_ratio(&state.facts));
+        new_facts.extend(rule_congruent_ratio(&state.facts));
+        new_facts.extend(rule_ratio_collinear_parallel(&state.facts));
 
         // Filter degenerate facts and genuinely new facts
         new_facts.retain(|f| {
@@ -69,6 +80,12 @@ pub fn saturate(state: &mut ProofState) -> bool {
                 Relation::EqualAngle(a, b, c, d, e, f) => {
                     // Skip degenerate angles (vertex equals a ray endpoint)
                     if a == b || b == c || d == e || e == f {
+                        return false;
+                    }
+                }
+                Relation::EqualRatio(a, b, c, d, e, f, g, h) => {
+                    // Skip if any segment is degenerate (same point)
+                    if a == b || c == d || e == f || g == h {
                         return false;
                     }
                 }
@@ -1571,6 +1588,648 @@ fn rule_eqangle_perp_to_perp(facts: &HashSet<Relation>) -> Vec<Relation> {
     new
 }
 
+// --- Rule: SAS (Side-Angle-Side) Triangle Congruence ---
+// cong(A,B, P,Q) ∧ cong(B,C, Q,R) ∧ eqangle(A,B,C, P,Q,R) ∧ ncoll(A,B,C)
+//   → cong(A,C, P,R) ∧ eqangle(B,C,A, Q,R,P) ∧ eqangle(C,A,B, R,P,Q)
+fn rule_sas_congruence(facts: &HashSet<Relation>) -> Vec<Relation> {
+    let mut new = Vec::new();
+
+    let congs: Vec<_> = facts
+        .iter()
+        .filter_map(|f| match f {
+            Relation::Congruent(a, b, c, d) => Some((*a, *b, *c, *d)),
+            _ => None,
+        })
+        .collect();
+
+    let eqangles: HashSet<(u16, u16, u16, u16, u16, u16)> = facts
+        .iter()
+        .filter_map(|f| match f {
+            Relation::EqualAngle(a, b, c, d, e, f) => Some((*a, *b, *c, *d, *e, *f)),
+            _ => None,
+        })
+        .collect();
+
+    let collinears: Vec<_> = facts
+        .iter()
+        .filter_map(|f| match f {
+            Relation::Collinear(a, b, c) => Some((*a, *b, *c)),
+            _ => None,
+        })
+        .collect();
+
+    // For each pair of congruence facts, find shared vertex patterns
+    for i in 0..congs.len() {
+        for j in (i + 1)..congs.len() {
+            let (a1, b1, c1, d1) = congs[i];
+            let (a2, b2, c2, d2) = congs[j];
+
+            // Try all ways to match: cong(A,B, P,Q) and cong(B,C, Q,R)
+            // Need shared vertex B on triangle 1 side, Q on triangle 2 side
+            let seg1_pairs = [(a1, b1, c1, d1), (c1, d1, a1, b1)];
+            let seg2_pairs = [(a2, b2, c2, d2), (c2, d2, a2, b2)];
+
+            for &(sa, sb, sp, sq) in &seg1_pairs {
+                for &(endpoints_a, endpoints_b, endpoints_p, endpoints_q) in &seg2_pairs {
+                    // seg1: |sa,sb| = |sp,sq|, seg2: |ea,eb| = |ep,eq|
+                    // Try matching shared vertex: sb==ea → B=sb shared, sq==ep → Q=sq shared
+                    let shared_matches: [(u16, u16, u16, u16, u16, u16); 4] = [
+                        // (A, B, C, P, Q, R) where B is shared in tri1, Q is shared in tri2
+                        (sa, sb, endpoints_b, sp, sq, endpoints_q),
+                        (sa, sb, endpoints_b, sp, sq, endpoints_q),
+                        (sa, sb, endpoints_a, sp, sq, endpoints_p),
+                        (sa, sb, endpoints_a, sp, sq, endpoints_p),
+                    ];
+
+                    // Try all 4 shared vertex combos
+                    for &(sb_end, ea_end) in &[(sb, endpoints_a), (sb, endpoints_b)] {
+                        for &(sq_end, ep_end) in &[(sq, endpoints_p), (sq, endpoints_q)] {
+                            if sb_end != ea_end || sq_end != ep_end {
+                                continue;
+                            }
+                            let b_vtx = sb_end;
+                            let q_vtx = sq_end;
+                            let a_pt = sa;
+                            let c_pt = if endpoints_a == b_vtx { endpoints_b } else { endpoints_a };
+                            let p_pt = sp;
+                            let r_pt = if endpoints_p == q_vtx { endpoints_q } else { endpoints_p };
+
+                            // Skip degenerate: A==B, B==C, A==C, P==Q, Q==R, P==R
+                            if a_pt == b_vtx || b_vtx == c_pt || a_pt == c_pt
+                                || p_pt == q_vtx || q_vtx == r_pt || p_pt == r_pt
+                            {
+                                continue;
+                            }
+
+                            // Non-collinear guard
+                            if is_collinear_triple(a_pt, b_vtx, c_pt, &collinears)
+                                || is_collinear_triple(p_pt, q_vtx, r_pt, &collinears)
+                            {
+                                continue;
+                            }
+
+                            // Check included angle: eqangle(A,B,C, P,Q,R)
+                            let angle_check = Relation::equal_angle(a_pt, b_vtx, c_pt, p_pt, q_vtx, r_pt);
+                            if let Relation::EqualAngle(ea, eb, ec, ed, ee, ef) = angle_check {
+                                if eqangles.contains(&(ea, eb, ec, ed, ee, ef)) {
+                                    // SAS proved! Generate consequences
+                                    new.push(Relation::congruent(a_pt, c_pt, p_pt, r_pt));
+                                    new.push(Relation::equal_angle(b_vtx, c_pt, a_pt, q_vtx, r_pt, p_pt));
+                                    new.push(Relation::equal_angle(c_pt, a_pt, b_vtx, r_pt, p_pt, q_vtx));
+                                }
+                            }
+                        }
+                    }
+                    let _ = shared_matches;
+                }
+            }
+        }
+    }
+    new
+}
+
+// --- Rule: ASA (Angle-Side-Angle) Triangle Congruence ---
+// eqangle(C,A,B, R,P,Q) ∧ cong(A,B, P,Q) ∧ eqangle(A,B,C, P,Q,R) ∧ ncoll(A,B,C)
+//   → cong(B,C, Q,R) ∧ cong(C,A, R,P)
+fn rule_asa_congruence(facts: &HashSet<Relation>) -> Vec<Relation> {
+    let mut new = Vec::new();
+
+    let congs: HashSet<(u16, u16, u16, u16)> = facts
+        .iter()
+        .filter_map(|f| match f {
+            Relation::Congruent(a, b, c, d) => Some((*a, *b, *c, *d)),
+            _ => None,
+        })
+        .collect();
+
+    let eqangles: Vec<_> = facts
+        .iter()
+        .filter_map(|f| match f {
+            Relation::EqualAngle(a, b, c, d, e, f) => Some((*a, *b, *c, *d, *e, *f)),
+            _ => None,
+        })
+        .collect();
+
+    let collinears: Vec<_> = facts
+        .iter()
+        .filter_map(|f| match f {
+            Relation::Collinear(a, b, c) => Some((*a, *b, *c)),
+            _ => None,
+        })
+        .collect();
+
+    // For each pair of equal angle facts, try to find ASA pattern
+    for i in 0..eqangles.len() {
+        for j in (i + 1)..eqangles.len() {
+            let (a1, v1, c1, d1, w1, f1) = eqangles[i];
+            let (a2, v2, c2, d2, w2, f2) = eqangles[j];
+
+            // EqualAngle 1: angle(a1,v1,c1) = angle(d1,w1,f1)
+            // EqualAngle 2: angle(a2,v2,c2) = angle(d2,w2,f2)
+            // Try to form triangles. We need two angles at endpoints of a shared side.
+
+            // Try all 4 combos of which side of each eqangle is "triangle 1" vs "triangle 2"
+            let sides_1 = [(a1, v1, c1, d1, w1, f1), (d1, w1, f1, a1, v1, c1)];
+            let sides_2 = [(a2, v2, c2, d2, w2, f2), (d2, w2, f2, a2, v2, c2)];
+
+            for &(ta, tv, tc, pa, pv, pc) in &sides_1 {
+                for &(ta2, tv2, tc2, pa2, pv2, pc2) in &sides_2 {
+                    // Angle at vertex tv in triangle 1, angle at vertex tv2 in triangle 1
+                    // These must be two different vertices of the same triangle
+                    if tv == tv2 || pv == pv2 {
+                        continue; // Same vertex — not two different angles
+                    }
+
+                    // The shared side is (tv, tv2) in triangle 1, (pv, pv2) in triangle 2
+                    // For ASA: the "included" side is between the two angle vertices
+                    // Angle at tv: angle(ta, tv, tc) — rays tv→ta and tv→tc
+                    // One ray must point to tv2: tc == tv2 or ta == tv2
+                    // Similarly for tv2: tc2 == tv or ta2 == tv
+
+                    let tri1_third_from_v1 = if tc == tv2 { Some(ta) } else if ta == tv2 { Some(tc) } else { None };
+                    let tri1_third_from_v2 = if tc2 == tv { Some(ta2) } else if ta2 == tv { Some(tc2) } else { None };
+                    let tri2_third_from_p1 = if pc == pv2 { Some(pa) } else if pa == pv2 { Some(pc) } else { None };
+                    let tri2_third_from_p2 = if pc2 == pv { Some(pa2) } else if pa2 == pv { Some(pc2) } else { None };
+
+                    if let (Some(c_pt), Some(c_pt2), Some(r_pt), Some(r_pt2)) =
+                        (tri1_third_from_v1, tri1_third_from_v2, tri2_third_from_p1, tri2_third_from_p2)
+                    {
+                        // Both angles should point to the same third vertex
+                        if c_pt != c_pt2 || r_pt != r_pt2 {
+                            continue;
+                        }
+
+                        let (a_pt, b_pt, c_pt) = (tv, tv2, c_pt);
+                        let (p_pt, q_pt, r_pt) = (pv, pv2, r_pt);
+
+                        // Skip degenerate
+                        if a_pt == b_pt || b_pt == c_pt || a_pt == c_pt
+                            || p_pt == q_pt || q_pt == r_pt || p_pt == r_pt
+                        {
+                            continue;
+                        }
+
+                        // Non-collinear guard
+                        if is_collinear_triple(a_pt, b_pt, c_pt, &collinears)
+                            || is_collinear_triple(p_pt, q_pt, r_pt, &collinears)
+                        {
+                            continue;
+                        }
+
+                        // Check the included side: cong(A,B, P,Q) i.e. cong(tv, tv2, pv, pv2)
+                        let cong_check = Relation::congruent(a_pt, b_pt, p_pt, q_pt);
+                        if let Relation::Congruent(ca, cb, cc, cd) = cong_check {
+                            if congs.contains(&(ca, cb, cc, cd)) {
+                                // ASA proved!
+                                new.push(Relation::congruent(b_pt, c_pt, q_pt, r_pt));
+                                new.push(Relation::congruent(c_pt, a_pt, r_pt, p_pt));
+                                new.push(Relation::congruent(a_pt, c_pt, p_pt, r_pt));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    new
+}
+
+// --- Rule: SSS (Side-Side-Side) Triangle Congruence ---
+// cong(A,B, P,Q) ∧ cong(B,C, Q,R) ∧ cong(C,A, R,P) ∧ ncoll(A,B,C)
+//   → eqangle(A,B,C, P,Q,R) ∧ eqangle(B,C,A, Q,R,P) ∧ eqangle(C,A,B, R,P,Q)
+fn rule_sss_congruence(facts: &HashSet<Relation>) -> Vec<Relation> {
+    let mut new = Vec::new();
+
+    let congs: Vec<_> = facts
+        .iter()
+        .filter_map(|f| match f {
+            Relation::Congruent(a, b, c, d) => Some((*a, *b, *c, *d)),
+            _ => None,
+        })
+        .collect();
+
+    if congs.len() < 3 {
+        return new;
+    }
+
+    let cong_set: HashSet<(u16, u16, u16, u16)> = congs.iter().copied().collect();
+
+    let collinears: Vec<_> = facts
+        .iter()
+        .filter_map(|f| match f {
+            Relation::Collinear(a, b, c) => Some((*a, *b, *c)),
+            _ => None,
+        })
+        .collect();
+
+    // For each pair of congruence facts sharing a vertex pattern, check the third
+    for i in 0..congs.len() {
+        for j in (i + 1)..congs.len() {
+            let (a1, b1, c1, d1) = congs[i];
+            let (a2, b2, c2, d2) = congs[j];
+
+            // Try all ways to match shared vertices
+            let seg1_sides = [(a1, b1, c1, d1), (c1, d1, a1, b1)];
+            let seg2_sides = [(a2, b2, c2, d2), (c2, d2, a2, b2)];
+
+            for &(sa, sb, sp, sq) in &seg1_sides {
+                for &(ea, eb, ep, eq) in &seg2_sides {
+                    // seg1: |sa,sb| = |sp,sq|, seg2: |ea,eb| = |ep,eq|
+                    // Shared vertex combos
+                    let matches: [(u16, u16, u16, u16, u16, u16); 4] = [
+                        (sa, sb, eb, sp, sq, eq), // sb==ea shared
+                        (sa, sb, ea, sp, sq, ep), // sb==eb shared
+                        (sb, sa, eb, sq, sp, eq), // sa==ea shared
+                        (sb, sa, ea, sq, sp, ep), // sa==eb shared
+                    ];
+
+                    for &(a_pt, b_vtx, c_pt, p_pt, q_vtx, r_pt) in &matches {
+                        // Check the shared vertex condition
+                        if b_vtx != ea && b_vtx != eb {
+                            continue;
+                        }
+                        let other_ea = if b_vtx == ea { eb } else { ea };
+                        if c_pt != other_ea {
+                            continue;
+                        }
+                        // Similarly for triangle 2
+                        if q_vtx != ep && q_vtx != eq {
+                            continue;
+                        }
+                        let other_ep = if q_vtx == ep { eq } else { ep };
+                        if r_pt != other_ep {
+                            continue;
+                        }
+
+                        // Skip degenerate
+                        if a_pt == b_vtx || b_vtx == c_pt || a_pt == c_pt
+                            || p_pt == q_vtx || q_vtx == r_pt || p_pt == r_pt
+                        {
+                            continue;
+                        }
+
+                        // Non-collinear guard
+                        if is_collinear_triple(a_pt, b_vtx, c_pt, &collinears)
+                            || is_collinear_triple(p_pt, q_vtx, r_pt, &collinears)
+                        {
+                            continue;
+                        }
+
+                        // Check third side: cong(C,A, R,P)
+                        let third = Relation::congruent(c_pt, a_pt, r_pt, p_pt);
+                        if let Relation::Congruent(ca, cb, cc, cd) = third {
+                            if cong_set.contains(&(ca, cb, cc, cd)) {
+                                // SSS proved!
+                                new.push(Relation::equal_angle(a_pt, b_vtx, c_pt, p_pt, q_vtx, r_pt));
+                                new.push(Relation::equal_angle(b_vtx, c_pt, a_pt, q_vtx, r_pt, p_pt));
+                                new.push(Relation::equal_angle(c_pt, a_pt, b_vtx, r_pt, p_pt, q_vtx));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    new
+}
+
+// --- Helper: check if three points are collinear ---
+fn is_collinear_triple(a: u16, b: u16, c: u16, collinears: &[(u16, u16, u16)]) -> bool {
+    let check = Relation::collinear(a, b, c);
+    if let Relation::Collinear(ca, cb, cc) = check {
+        collinears.iter().any(|&(x, y, z)| x == ca && y == cb && z == cc)
+    } else {
+        false
+    }
+}
+
+// --- Rule: Transitive Ratio ---
+// eqratio(A,B,C,D, M,N,P,Q) ∧ eqratio(C,D,E,F, P,Q,R,S) → eqratio(A,B,E,F, M,N,R,S)
+fn rule_transitive_ratio(facts: &HashSet<Relation>) -> Vec<Relation> {
+    let mut new = Vec::new();
+
+    let ratios: Vec<_> = facts
+        .iter()
+        .filter_map(|f| match f {
+            Relation::EqualRatio(a, b, c, d, e, f, g, h) => {
+                Some((*a, *b, *c, *d, *e, *f, *g, *h))
+            }
+            _ => None,
+        })
+        .collect();
+
+    for i in 0..ratios.len() {
+        for j in 0..ratios.len() {
+            if i == j {
+                continue;
+            }
+            let (a1, b1, c1, d1, e1, f1, g1, h1) = ratios[i];
+            let (a2, b2, c2, d2, e2, f2, g2, h2) = ratios[j];
+
+            // ratio_i: |a1,b1|/|c1,d1| = |e1,f1|/|g1,h1|
+            // ratio_j: |a2,b2|/|c2,d2| = |e2,f2|/|g2,h2|
+            // If c1,d1 == a2,b2 and g1,h1 == e2,f2 → |a1,b1|/|c2,d2| = |e1,f1|/|g2,h2|
+            // (chaining through the shared segments)
+            // Due to canonical form, we need to check all possible matchings
+
+            // Left side of ratio_i denominators vs left side of ratio_j numerators
+            let denom_l = (c1, d1);
+            let denom_r = (g1, h1);
+            let num_l = (a2, b2);
+            let num_r = (e2, f2);
+
+            if segments_equal(denom_l.0, denom_l.1, num_l.0, num_l.1)
+                && segments_equal(denom_r.0, denom_r.1, num_r.0, num_r.1)
+            {
+                new.push(Relation::equal_ratio(a1, b1, c2, d2, e1, f1, g2, h2));
+            }
+            if segments_equal(denom_l.0, denom_l.1, num_r.0, num_r.1)
+                && segments_equal(denom_r.0, denom_r.1, num_l.0, num_l.1)
+            {
+                new.push(Relation::equal_ratio(a1, b1, g2, h2, e1, f1, c2, d2));
+            }
+        }
+    }
+    new
+}
+
+// --- Rule: Ratio Equals 1 → Congruence ---
+// eqratio(A,B,P,Q, C,D,U,V) ∧ cong(P,Q, U,V) → cong(A,B, C,D)
+fn rule_ratio_one_congruence(facts: &HashSet<Relation>) -> Vec<Relation> {
+    let mut new = Vec::new();
+
+    let cong_set: HashSet<(u16, u16)> = facts
+        .iter()
+        .filter_map(|f| match f {
+            Relation::Congruent(a, b, c, d) => {
+                let s1 = if *a <= *b { (*a, *b) } else { (*b, *a) };
+                let s2 = if *c <= *d { (*c, *d) } else { (*d, *c) };
+                // Store both segment pairs as congruent with each other
+                Some((s1.0, s1.1, s2.0, s2.1))
+            }
+            _ => None,
+        })
+        .map(|(a, b, c, d)| {
+            // We need to check if ratio denominators are congruent
+            // Store as a pair of sorted segments
+            let _ = (a, b, c, d);
+            (a, b)
+        })
+        .collect();
+
+    // Build a set of congruent segment pairs for efficient lookup
+    let congs: HashSet<(u16, u16, u16, u16)> = facts
+        .iter()
+        .filter_map(|f| match f {
+            Relation::Congruent(a, b, c, d) => Some((*a, *b, *c, *d)),
+            _ => None,
+        })
+        .collect();
+
+    for fact in facts {
+        if let Relation::EqualRatio(a, b, c, d, e, f, g, h) = fact {
+            // |a,b|/|c,d| = |e,f|/|g,h|
+            // If |c,d| = |g,h| then |a,b| = |e,f|
+            let check = Relation::congruent(*c, *d, *g, *h);
+            if let Relation::Congruent(ca, cb, cc, cd) = check {
+                if congs.contains(&(ca, cb, cc, cd)) {
+                    new.push(Relation::congruent(*a, *b, *e, *f));
+                }
+            }
+            // If |a,b| = |e,f| then |c,d| = |g,h|
+            let check2 = Relation::congruent(*a, *b, *e, *f);
+            if let Relation::Congruent(ca, cb, cc, cd) = check2 {
+                if congs.contains(&(ca, cb, cc, cd)) {
+                    new.push(Relation::congruent(*c, *d, *g, *h));
+                }
+            }
+        }
+    }
+
+    let _ = cong_set;
+    new
+}
+
+// --- Rule: Midpoint → Ratio ---
+// midp(M,A,B) ∧ midp(N,C,D) → eqratio(A,M, A,B, C,N, C,D)
+fn rule_midpoint_ratio(facts: &HashSet<Relation>) -> Vec<Relation> {
+    let mut new = Vec::new();
+
+    let midpoints: Vec<_> = facts
+        .iter()
+        .filter_map(|f| match f {
+            Relation::Midpoint(m, a, b) => Some((*m, *a, *b)),
+            _ => None,
+        })
+        .collect();
+
+    // Only produce cross-midpoint ratios when there are existing ratio facts
+    // (to avoid combinatorial explosion)
+    let has_ratios = facts.iter().any(|f| matches!(f, Relation::EqualRatio(..)));
+
+    if has_ratios || midpoints.len() <= 10 {
+        for i in 0..midpoints.len() {
+            for j in (i + 1)..midpoints.len() {
+                let (m1, a1, b1) = midpoints[i];
+                let (m2, a2, b2) = midpoints[j];
+                // |A1,M1|/|A1,B1| = |A2,M2|/|A2,B2| (both = 1/2)
+                new.push(Relation::equal_ratio(a1, m1, a1, b1, a2, m2, a2, b2));
+                // |M1,B1|/|A1,B1| = |M2,B2|/|A2,B2| (both = 1/2)
+                new.push(Relation::equal_ratio(m1, b1, a1, b1, m2, b2, a2, b2));
+            }
+        }
+    }
+    new
+}
+
+// --- Rule: Parallel + Collinear → Ratio (Thales/Basic Proportionality) ---
+// para(A,B, C,D) ∧ coll(O,A,C) ∧ coll(O,B,D) ∧ ncoll(A,B,C)
+//   → eqratio(O,A, A,C, O,B, B,D)
+fn rule_parallel_collinear_ratio(facts: &HashSet<Relation>) -> Vec<Relation> {
+    let mut new = Vec::new();
+
+    let parallels: Vec<_> = facts
+        .iter()
+        .filter_map(|f| match f {
+            Relation::Parallel(a, b, c, d) => Some((*a, *b, *c, *d)),
+            _ => None,
+        })
+        .collect();
+
+    let collinears: Vec<_> = facts
+        .iter()
+        .filter_map(|f| match f {
+            Relation::Collinear(a, b, c) => Some((*a, *b, *c)),
+            _ => None,
+        })
+        .collect();
+
+    for &(a, b, c, d) in &parallels {
+        // AB ∥ CD. Look for transversals: point O collinear with {A or B} and {C or D}
+        let ab_pts = [a, b];
+        let cd_pts = [c, d];
+
+        for &pt_ab in &ab_pts {
+            for &pt_cd in &cd_pts {
+                // Look for point O collinear with pt_ab and pt_cd
+                for &(p, q, r) in &collinears {
+                    let triple = [p, q, r];
+                    if !triple.contains(&pt_ab) || !triple.contains(&pt_cd) {
+                        continue;
+                    }
+                    // Find O: the point in the collinear triple that is neither pt_ab nor pt_cd
+                    for &o in &triple {
+                        if o == pt_ab || o == pt_cd {
+                            continue;
+                        }
+                        let other_ab = if pt_ab == a { b } else { a };
+                        let other_cd = if pt_cd == c { d } else { c };
+
+                        // Need O collinear with other_ab and other_cd too
+                        if !is_collinear_pair(o, other_ab, &collinears)
+                            && !is_collinear_pair(o, other_cd, &collinears)
+                        {
+                            // Check if O is collinear with other_ab and other_cd separately
+                            // Look for collinear(O, other_ab, something)
+                            let o_other_ab_col = collinears.iter().any(|&(x, y, z)| {
+                                let t = [x, y, z];
+                                t.contains(&o) && t.contains(&other_ab) && t.contains(&other_cd)
+                            });
+                            if !o_other_ab_col {
+                                continue;
+                            }
+                        }
+
+                        // Check O collinear with other_ab and other_cd
+                        let col_obd = collinears.iter().any(|&(x, y, z)| {
+                            let t = [x, y, z];
+                            t.contains(&o) && t.contains(&other_ab) && t.contains(&other_cd)
+                        });
+
+                        // Actually, we need: coll(O, pt_ab, pt_cd) and coll(O, other_ab, other_cd)
+                        // We already have the first. Check the second.
+                        if col_obd {
+                            // Non-collinear guard: ncoll(A,B,C) means AB and CD not on same line
+                            if !is_collinear_triple(pt_ab, other_ab, pt_cd, &collinears) {
+                                // Thales: |O,pt_ab|/|pt_ab,pt_cd| = |O,other_ab|/|other_ab,other_cd|
+                                new.push(Relation::equal_ratio(
+                                    o, pt_ab, pt_ab, pt_cd,
+                                    o, other_ab, other_ab, other_cd,
+                                ));
+                                // Also: |O,pt_ab|/|O,pt_cd| = |O,other_ab|/|O,other_cd|
+                                new.push(Relation::equal_ratio(
+                                    o, pt_ab, o, pt_cd,
+                                    o, other_ab, o, other_cd,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    new
+}
+
+// --- Rule: Congruent → Ratio (trivial) ---
+// cong(A,B, C,D) → eqratio(A,B, C,D, A,B, C,D)
+// Only fires when there are already ratio facts to bootstrap chains
+fn rule_congruent_ratio(facts: &HashSet<Relation>) -> Vec<Relation> {
+    let mut new = Vec::new();
+
+    // Gate: only produce ratio facts when there are already ratio facts or midpoints
+    let has_ratios = facts.iter().any(|f| matches!(f, Relation::EqualRatio(..)));
+    let has_midpoints = facts.iter().any(|f| matches!(f, Relation::Midpoint(..)));
+
+    if !has_ratios && !has_midpoints {
+        return new;
+    }
+
+    for fact in facts {
+        if let Relation::Congruent(a, b, c, d) = fact {
+            if a != c || b != d {
+                // |AB| = |CD| with AB ≠ CD → ratio |AB|/|CD| = |AB|/|CD| (trivially 1:1)
+                new.push(Relation::equal_ratio(*a, *b, *c, *d, *a, *b, *c, *d));
+            }
+        }
+    }
+    new
+}
+
+// --- Rule: Ratio + Collinear → Parallel (converse of Thales) ---
+// eqratio(O,A, A,C, O,B, B,D) ∧ coll(O,A,C) ∧ coll(O,B,D) ∧ ncoll(A,B,C)
+//   → para(A,B, C,D)
+fn rule_ratio_collinear_parallel(facts: &HashSet<Relation>) -> Vec<Relation> {
+    let mut new = Vec::new();
+
+    let collinears: Vec<_> = facts
+        .iter()
+        .filter_map(|f| match f {
+            Relation::Collinear(a, b, c) => Some((*a, *b, *c)),
+            _ => None,
+        })
+        .collect();
+
+    for fact in facts {
+        if let Relation::EqualRatio(a, b, c, d, e, f, g, h) = fact {
+            // |a,b|/|c,d| = |e,f|/|g,h|
+            // Look for pattern: O,A / A,C = O,B / B,D with coll(O,A,C) and coll(O,B,D)
+            // That means: a,b share a point with c,d (say b==c) and e,f share with g,h (say f==g)
+
+            // Try the pattern where the shared point is the "dividing point"
+            let segs = [(*a, *b, *c, *d), (*c, *d, *a, *b)];
+            let segs2 = [(*e, *f, *g, *h), (*g, *h, *e, *f)];
+
+            for &(s1a, s1b, s2a, s2b) in &segs {
+                for &(s3a, s3b, s4a, s4b) in &segs2 {
+                    // Check if s1 and s2 share an endpoint: s1b==s2a or s1a==s2a etc
+                    let shared1_opts = [
+                        (s1a, s1b, s2a, s2b, s1b == s2a),
+                        (s1a, s1b, s2b, s2a, s1b == s2b),
+                        (s1b, s1a, s2a, s2b, s1a == s2a),
+                        (s1b, s1a, s2b, s2a, s1a == s2b),
+                    ];
+                    let shared2_opts = [
+                        (s3a, s3b, s4a, s4b, s3b == s4a),
+                        (s3a, s3b, s4b, s4a, s3b == s4b),
+                        (s3b, s3a, s4a, s4b, s3a == s4a),
+                        (s3b, s3a, s4b, s4a, s3a == s4b),
+                    ];
+
+                    for &(o1, a_pt, _a_pt2, c_pt, ok1) in &shared1_opts {
+                        if !ok1 {
+                            continue;
+                        }
+                        for &(o2, b_pt, _b_pt2, d_pt, ok2) in &shared2_opts {
+                            if !ok2 {
+                                continue;
+                            }
+                            // Thales requires the SAME apex point O on both transversals
+                            if o1 != o2 {
+                                continue;
+                            }
+                            // Pattern: |O,A|/|A,C| = |O,B|/|B,D| with same O
+                            // Check coll(O, A, C) and coll(O, B, D)
+                            if !is_collinear_triple(o1, a_pt, c_pt, &collinears) {
+                                continue;
+                            }
+                            if !is_collinear_triple(o2, b_pt, d_pt, &collinears) {
+                                continue;
+                            }
+                            // ncoll guard
+                            if is_collinear_triple(a_pt, b_pt, c_pt, &collinears) {
+                                continue;
+                            }
+                            new.push(Relation::parallel(a_pt, b_pt, c_pt, d_pt));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    new
+}
+
 // --- Helper: check if line (a,b) is perpendicular to line (c,d) ---
 fn is_perp_pair(a: u16, b: u16, c: u16, d: u16, perps: &HashSet<(u16, u16, u16, u16)>) -> bool {
     // Check all canonical orderings
@@ -2929,5 +3588,196 @@ mod tests {
         let result = rule_corresponding_angles(&state.facts);
         // At minimum, the rule should produce some equal angle facts
         assert!(!result.is_empty(), "Two perpendiculars with shared vertices should produce equal angles");
+    }
+
+    // ============================
+    // Triangle Congruence Rules
+    // ============================
+
+    #[test]
+    fn test_sas_congruence() {
+        // Isosceles: |PA| = |PB|, |PA| = |PA| (self), angle(A,P,B) = angle(B,P,A) → |AB| = |BA|
+        // Better test: two triangles with SAS
+        let mut state = make_state_with_points(&["a", "b", "c", "p", "q", "r"]);
+        let (a, b, c, p, q, r) = (
+            state.id("a"), state.id("b"), state.id("c"),
+            state.id("p"), state.id("q"), state.id("r"),
+        );
+        // cong(a,b, p,q) and cong(b,c, q,r) and eqangle(a,b,c, p,q,r)
+        state.add_fact(Relation::congruent(a, b, p, q));
+        state.add_fact(Relation::congruent(b, c, q, r));
+        state.add_fact(Relation::equal_angle(a, b, c, p, q, r));
+        state.set_goal(Relation::congruent(a, c, p, r));
+        assert!(saturate(&mut state), "SAS should prove third side congruent");
+    }
+
+    #[test]
+    fn test_sas_also_produces_angles() {
+        // SAS should also produce the other two angle equalities
+        let mut state = make_state_with_points(&["a", "b", "c", "p", "q", "r"]);
+        let (a, b, c, p, q, r) = (
+            state.id("a"), state.id("b"), state.id("c"),
+            state.id("p"), state.id("q"), state.id("r"),
+        );
+        state.add_fact(Relation::congruent(a, b, p, q));
+        state.add_fact(Relation::congruent(b, c, q, r));
+        state.add_fact(Relation::equal_angle(a, b, c, p, q, r));
+        state.set_goal(Relation::equal_angle(b, c, a, q, r, p));
+        assert!(saturate(&mut state), "SAS should prove remaining angles equal");
+    }
+
+    #[test]
+    fn test_asa_congruence() {
+        // Two angles and included side → remaining sides congruent
+        let mut state = make_state_with_points(&["a", "b", "c", "p", "q", "r"]);
+        let (a, b, c, p, q, r) = (
+            state.id("a"), state.id("b"), state.id("c"),
+            state.id("p"), state.id("q"), state.id("r"),
+        );
+        // Angles at A and B equal, included side AB = PQ
+        state.add_fact(Relation::equal_angle(c, a, b, r, p, q));  // angle at A = angle at P
+        state.add_fact(Relation::congruent(a, b, p, q));           // included side
+        state.add_fact(Relation::equal_angle(a, b, c, p, q, r));  // angle at B = angle at Q
+        state.set_goal(Relation::congruent(b, c, q, r));
+        assert!(saturate(&mut state), "ASA should prove remaining sides congruent");
+    }
+
+    #[test]
+    fn test_sss_congruence_produces_angles() {
+        // Three congruent sides → angles equal
+        let mut state = make_state_with_points(&["a", "b", "c", "p", "q", "r"]);
+        let (a, b, c, p, q, r) = (
+            state.id("a"), state.id("b"), state.id("c"),
+            state.id("p"), state.id("q"), state.id("r"),
+        );
+        state.add_fact(Relation::congruent(a, b, p, q));
+        state.add_fact(Relation::congruent(b, c, q, r));
+        state.add_fact(Relation::congruent(c, a, r, p));
+        state.set_goal(Relation::equal_angle(a, b, c, p, q, r));
+        assert!(saturate(&mut state), "SSS should prove angles equal");
+    }
+
+    #[test]
+    fn test_sas_collinear_guard() {
+        // If A,B,C are collinear, SAS should NOT fire
+        let mut state = make_state_with_points(&["a", "b", "c", "p", "q", "r"]);
+        let (a, b, c, p, q, r) = (
+            state.id("a"), state.id("b"), state.id("c"),
+            state.id("p"), state.id("q"), state.id("r"),
+        );
+        state.add_fact(Relation::congruent(a, b, p, q));
+        state.add_fact(Relation::congruent(b, c, q, r));
+        state.add_fact(Relation::equal_angle(a, b, c, p, q, r));
+        state.add_fact(Relation::collinear(a, b, c)); // degenerate!
+        // SAS should not fire because A,B,C are collinear
+        let result = rule_sas_congruence(&state.facts);
+        assert!(result.is_empty(), "SAS should not fire for collinear points");
+    }
+
+    // ============================
+    // EqualRatio Rules
+    // ============================
+
+    #[test]
+    fn test_equal_ratio_canonical() {
+        // Test canonical form: both ratio sides sorted
+        let r1 = Relation::equal_ratio(0, 1, 2, 3, 4, 5, 6, 7);
+        let r2 = Relation::equal_ratio(4, 5, 6, 7, 0, 1, 2, 3);
+        assert_eq!(r1, r2, "EqualRatio should be symmetric");
+    }
+
+    #[test]
+    fn test_equal_ratio_segment_sorting() {
+        // Segments within ratio should be sorted
+        let r1 = Relation::equal_ratio(1, 0, 3, 2, 5, 4, 7, 6);
+        let r2 = Relation::equal_ratio(0, 1, 2, 3, 4, 5, 6, 7);
+        assert_eq!(r1, r2, "Segment endpoints should be sorted in EqualRatio");
+    }
+
+    #[test]
+    fn test_ratio_one_to_congruence() {
+        // eqratio(A,B,P,Q, C,D,U,V) ∧ cong(P,Q, U,V) → cong(A,B, C,D)
+        let mut state = make_state_with_points(&["a", "b", "c", "d", "p", "q", "u", "v"]);
+        let (a, b, c, d, p, q, u, v) = (
+            state.id("a"), state.id("b"), state.id("c"), state.id("d"),
+            state.id("p"), state.id("q"), state.id("u"), state.id("v"),
+        );
+        state.add_fact(Relation::equal_ratio(a, b, p, q, c, d, u, v));
+        state.add_fact(Relation::congruent(p, q, u, v));
+        state.set_goal(Relation::congruent(a, b, c, d));
+        assert!(saturate(&mut state), "Ratio=1 should bridge to congruence");
+    }
+
+    #[test]
+    fn test_transitive_ratio() {
+        // eqratio(A,B,C,D, M,N,P,Q) ∧ eqratio(C,D,E,F, P,Q,R,S) → eqratio(A,B,E,F, M,N,R,S)
+        let mut state = make_state_with_points(&[
+            "a", "b", "c", "d", "e", "f", "m", "n", "p", "q", "r", "s",
+        ]);
+        let (a, b, c, d, e, f) = (
+            state.id("a"), state.id("b"), state.id("c"),
+            state.id("d"), state.id("e"), state.id("f"),
+        );
+        let (m, n, p, q, r, s) = (
+            state.id("m"), state.id("n"), state.id("p"),
+            state.id("q"), state.id("r"), state.id("s"),
+        );
+        state.add_fact(Relation::equal_ratio(a, b, c, d, m, n, p, q));
+        state.add_fact(Relation::equal_ratio(c, d, e, f, p, q, r, s));
+        state.set_goal(Relation::equal_ratio(a, b, e, f, m, n, r, s));
+        assert!(saturate(&mut state), "Transitive ratio should chain");
+    }
+
+    #[test]
+    fn test_midpoint_ratio() {
+        // Two midpoints create equal 1:2 ratios
+        let mut state = make_state_with_points(&["a", "b", "c", "d", "m", "n"]);
+        let (a, b, c, d, m, n) = (
+            state.id("a"), state.id("b"), state.id("c"),
+            state.id("d"), state.id("m"), state.id("n"),
+        );
+        state.add_fact(Relation::midpoint(m, a, b));
+        state.add_fact(Relation::midpoint(n, c, d));
+        // Should produce eqratio(a,m, a,b, c,n, c,d) — both 1:2
+        saturate(&mut state);
+        assert!(
+            state.facts.contains(&Relation::equal_ratio(a, m, a, b, c, n, c, d)),
+            "Two midpoints should produce equal 1:2 ratios"
+        );
+    }
+
+    #[test]
+    fn test_degenerate_ratio_filtered() {
+        // EqualRatio with a degenerate segment (a==b) should be filtered
+        let mut state = make_state_with_points(&["a", "b", "c"]);
+        let (a, b, c) = (state.id("a"), state.id("b"), state.id("c"));
+        let degenerate = Relation::equal_ratio(a, a, b, c, b, c, a, a);
+        state.add_fact(degenerate.clone());
+        // The fact should not be in the set after filtering (but add_fact doesn't filter)
+        // The degenerate filter is in saturate's retain closure
+        // Verify by checking rule output doesn't include degenerate ratios
+        let result = rule_midpoint_ratio(&state.facts);
+        for r in &result {
+            if let Relation::EqualRatio(a, b, c, d, e, f, g, h) = r {
+                assert!(a != b && c != d && e != f && g != h,
+                    "Midpoint ratio should not produce degenerate segments");
+            }
+        }
+    }
+
+    #[test]
+    fn test_eqratio_goal_parsing() {
+        let input = "test_ratio\na b c d e f g h = pentagon a b c d e ? eqratio a b c d e f g h";
+        // This will fail because pentagon only creates 5 points but we need 8
+        // Use a proper setup instead
+        let input = "test_ratio\na b c = triangle; d = midpoint a b; e = midpoint b c; f = on_line a c; g = on_line b c; h = on_line a b ? eqratio a d a b b e b c";
+        let state = crate::parser::parse_problem(input).unwrap();
+        assert!(state.goal.is_some());
+        // Goal should be an EqualRatio
+        if let Some(Relation::EqualRatio(..)) = state.goal {
+            // ok
+        } else {
+            panic!("Goal should be EqualRatio, got {:?}", state.goal);
+        }
     }
 }

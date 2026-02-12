@@ -13,6 +13,7 @@ fn goal_type(r: &Relation) -> &'static str {
         Relation::Cyclic(..) => "cyclic",
         Relation::Midpoint(..) => "midp",
         Relation::OnCircle(..) => "oncircle",
+        Relation::EqualRatio(..) => "eqratio",
     }
 }
 
@@ -24,6 +25,7 @@ fn goal_points(r: &Relation) -> Vec<u16> {
         Relation::Collinear(a, b, c) | Relation::Midpoint(a, b, c) => vec![*a, *b, *c],
         Relation::Cyclic(a, b, c, d) => vec![*a, *b, *c, *d],
         Relation::OnCircle(a, b) => vec![*a, *b],
+        Relation::EqualRatio(a, b, c, d, e, f, g, h) => vec![*a, *b, *c, *d, *e, *f, *g, *h],
     }
 }
 
