@@ -535,15 +535,30 @@ fn parse_action(
             }
         }
         "eqangle2" => {
-            // `x = eqangle2 a b c` — sets up equal angle
+            // `x = eqangle2 d a b` → angle(x,d,a) = angle(a,d,b)
             for name in output_names {
                 state.add_object(name, ObjectType::Point);
             }
+            if args.len() >= 3 {
+                let x = state.id(output_names[0]);
+                let d = ensure_point(args[0], state)?;
+                let a = ensure_point(args[1], state)?;
+                let b = ensure_point(args[2], state)?;
+                state.add_fact(Relation::equal_angle(x, d, a, a, d, b));
+            }
         }
         "lc_tangent" => {
-            // Line-circle tangent
+            // `x = lc_tangent x p o` — tangent from external point p to circle(o)
+            // x is the tangent point: x on circle(o), radius ox ⊥ tangent line px
             for name in output_names {
                 state.add_object(name, ObjectType::Point);
+            }
+            if args.len() >= 2 {
+                let x = state.id(output_names[0]);
+                let p = ensure_point(args[0], state)?;
+                let o = ensure_point(args[1], state)?;
+                state.add_fact(Relation::on_circle(x, o));
+                state.add_fact(Relation::perpendicular(o, x, p, x));
             }
         }
         "cc_tangent" => {
@@ -578,6 +593,7 @@ fn parse_action(
         }
         "shift" => {
             // `x = shift a b c` — x = c + (b - a), i.e., translation
+            // Forms parallelogram: AB || CX, AC || BX, |AB|=|CX|, |AC|=|BX|
             for name in output_names {
                 state.add_object(name, ObjectType::Point);
             }
@@ -586,21 +602,44 @@ fn parse_action(
                 let a = ensure_point(args[0], state)?;
                 let b = ensure_point(args[1], state)?;
                 let c = ensure_point(args[2], state)?;
-                // Parallelogram ABXC: AB || CX and AC || BX
                 state.add_fact(Relation::parallel(a, b, c, x));
                 state.add_fact(Relation::congruent(a, b, c, x));
+                state.add_fact(Relation::parallel(a, c, b, x));
+                state.add_fact(Relation::congruent(a, c, b, x));
             }
         }
         "intersection_cc" | "inter_cc" => {
-            // Intersection of two circles
+            // `x = intersection_cc x c1 c2 rp` — intersection of two circles
+            // x on circle(c1) and circle(c2), with |c2,x| = |c2,rp|
             for name in output_names {
                 state.add_object(name, ObjectType::Point);
             }
+            if args.len() >= 2 {
+                let x = state.id(output_names[0]);
+                let c1 = ensure_point(args[0], state)?;
+                let c2 = ensure_point(args[1], state)?;
+                state.add_fact(Relation::on_circle(x, c1));
+                state.add_fact(Relation::on_circle(x, c2));
+                if args.len() >= 3 {
+                    let rp = ensure_point(args[2], state)?;
+                    state.add_fact(Relation::congruent(c2, x, c2, rp));
+                }
+            }
         }
         "intersection_lc" | "inter_lc" => {
-            // Intersection of line and circle
+            // `x = intersection_lc x lp center rp` — intersection of line and circle
+            // x on circle(center) with |center,x| = |center,rp|
+            // Line defined by x and lp (or additional on_line constraints)
             for name in output_names {
                 state.add_object(name, ObjectType::Point);
+            }
+            if args.len() >= 3 {
+                let x = state.id(output_names[0]);
+                let _lp = ensure_point(args[0], state)?;
+                let center = ensure_point(args[1], state)?;
+                let rp = ensure_point(args[2], state)?;
+                state.add_fact(Relation::on_circle(x, center));
+                state.add_fact(Relation::congruent(center, x, center, rp));
             }
         }
         "intersection_ll" | "inter_ll" => {
@@ -616,6 +655,113 @@ fn parse_action(
                 let d = ensure_point(args[3], state)?;
                 state.add_fact(Relation::collinear(x, a, b));
                 state.add_fact(Relation::collinear(x, c, d));
+            }
+        }
+        "risos" => {
+            // Right isosceles triangle: right angle at first vertex, equal legs
+            // `c a b = risos c a b` → right angle at c, |CA|=|CB|
+            for name in output_names {
+                state.add_object(name, ObjectType::Point);
+            }
+            if args.len() >= 3 {
+                let c = state.id(args[0]);
+                let a = state.id(args[1]);
+                let b = state.id(args[2]);
+                state.add_fact(Relation::perpendicular(c, a, c, b));
+                state.add_fact(Relation::congruent(c, a, c, b));
+            }
+        }
+        "angle_mirror" => {
+            // `x = angle_mirror x a b c` → angle(c,a,b) = angle(b,a,x)
+            // Mirror ray AC across ray AB at vertex a
+            for name in output_names {
+                state.add_object(name, ObjectType::Point);
+            }
+            if args.len() >= 3 {
+                let x = state.id(output_names[0]);
+                let a = ensure_point(args[0], state)?;
+                let b = ensure_point(args[1], state)?;
+                let c = ensure_point(args[2], state)?;
+                state.add_fact(Relation::equal_angle(c, a, b, b, a, x));
+            }
+        }
+        "pentagon" => {
+            // 5 free points, no constraints (like quadrangle)
+            for name in output_names {
+                state.add_object(name, ObjectType::Point);
+            }
+        }
+        "trisegment" => {
+            // `d x = trisegment d x c b` → d and x trisect segment CB
+            // c-d-x-b collinear, |cd|=|dx|=|xb|
+            for name in output_names {
+                state.add_object(name, ObjectType::Point);
+            }
+            if output_names.len() >= 2 && args.len() >= 2 {
+                let d = state.id(output_names[0]);
+                let x = state.id(output_names[1]);
+                let c = ensure_point(args[0], state)?;
+                let b = ensure_point(args[1], state)?;
+                state.add_fact(Relation::collinear(c, d, b));
+                state.add_fact(Relation::collinear(c, x, b));
+                state.add_fact(Relation::collinear(d, x, b));
+                state.add_fact(Relation::congruent(c, d, d, x));
+                state.add_fact(Relation::congruent(d, x, x, b));
+            }
+        }
+        "intersection_lt" | "inter_lt" => {
+            // Intersection of line and tline (perpendicular line)
+            // `x = intersection_lt x p1 p2 through la lb`
+            // x on line(p1,p2) and on tline through `through` perp to (la,lb)
+            for name in output_names {
+                state.add_object(name, ObjectType::Point);
+            }
+            if args.len() >= 5 {
+                let x = state.id(output_names[0]);
+                let p1 = ensure_point(args[0], state)?;
+                let p2 = ensure_point(args[1], state)?;
+                let through = ensure_point(args[2], state)?;
+                let la = ensure_point(args[3], state)?;
+                let lb = ensure_point(args[4], state)?;
+                state.add_fact(Relation::collinear(x, p1, p2));
+                state.add_fact(Relation::perpendicular(through, x, la, lb));
+            }
+        }
+        "intersection_tt" | "inter_tt" => {
+            // Intersection of two tlines (perpendicular lines)
+            // `x = intersection_tt x t1 la1 lb1 t2 la2 lb2`
+            // x on tline through t1 perp to (la1,lb1) and tline through t2 perp to (la2,lb2)
+            for name in output_names {
+                state.add_object(name, ObjectType::Point);
+            }
+            if args.len() >= 6 {
+                let x = state.id(output_names[0]);
+                let t1 = ensure_point(args[0], state)?;
+                let la1 = ensure_point(args[1], state)?;
+                let lb1 = ensure_point(args[2], state)?;
+                let t2 = ensure_point(args[3], state)?;
+                let la2 = ensure_point(args[4], state)?;
+                let lb2 = ensure_point(args[5], state)?;
+                state.add_fact(Relation::perpendicular(t1, x, la1, lb1));
+                state.add_fact(Relation::perpendicular(t2, x, la2, lb2));
+            }
+        }
+        "intersection_lp" | "inter_lp" => {
+            // Intersection of line and pline (parallel line)
+            // `x = intersection_lp x p1 p2 through pa pb`
+            // x on line(p1,p2) and on pline through `through` parallel to (pa,pb)
+            for name in output_names {
+                state.add_object(name, ObjectType::Point);
+            }
+            if args.len() >= 5 {
+                let x = state.id(output_names[0]);
+                let p1 = ensure_point(args[0], state)?;
+                let p2 = ensure_point(args[1], state)?;
+                let through = ensure_point(args[2], state)?;
+                let pa = ensure_point(args[3], state)?;
+                let pb = ensure_point(args[4], state)?;
+                state.add_fact(Relation::collinear(x, p1, p2));
+                state.add_fact(Relation::parallel(through, x, pa, pb));
             }
         }
         _ => {
@@ -1681,5 +1827,165 @@ mod tests {
         let b = state.id("b");
         let x = state.id("x");
         assert!(state.facts.contains(&Relation::perpendicular(a, x, b, x)));
+    }
+
+    // --- Tests for newly fixed parser stubs ---
+
+    #[test]
+    fn test_parse_eqangle2_facts() {
+        // eqangle2 x d a b → angle(x,d,a) = angle(a,d,b)
+        let input = "test\na b c = triangle; e = eqangle2 c a b ? coll e a b";
+        let state = parse_problem(input).unwrap();
+        let e = state.id("e");
+        let c = state.id("c");
+        let a = state.id("a");
+        let b = state.id("b");
+        assert!(state.facts.contains(&Relation::equal_angle(e, c, a, a, c, b)));
+    }
+
+    #[test]
+    fn test_parse_lc_tangent_facts() {
+        // lc_tangent x p o → on_circle(x, o), perp(o, x, p, x)
+        let input = "test\na b = segment; x = lc_tangent a b ? perp b x a x";
+        let state = parse_problem(input).unwrap();
+        let x = state.id("x");
+        let a = state.id("a");
+        let b = state.id("b");
+        assert!(state.facts.contains(&Relation::on_circle(x, b)));
+        assert!(state.facts.contains(&Relation::perpendicular(b, x, a, x)));
+    }
+
+    #[test]
+    fn test_parse_intersection_cc_facts() {
+        // intersection_cc x c1 c2 rp → on_circle(x,c1), on_circle(x,c2), cong(c2,x,c2,rp)
+        let input = "test\na b c = triangle; x = intersection_cc a b c ? coll x a b";
+        let state = parse_problem(input).unwrap();
+        let x = state.id("x");
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        assert!(state.facts.contains(&Relation::on_circle(x, a)));
+        assert!(state.facts.contains(&Relation::on_circle(x, b)));
+        assert!(state.facts.contains(&Relation::congruent(b, x, b, c)));
+    }
+
+    #[test]
+    fn test_parse_intersection_lc_facts() {
+        // intersection_lc x lp center rp → on_circle(x, center), cong(center,x,center,rp)
+        let input = "test\na b c = triangle; x = intersection_lc a b c ? coll x a b";
+        let state = parse_problem(input).unwrap();
+        let x = state.id("x");
+        let b = state.id("b");
+        let c = state.id("c");
+        assert!(state.facts.contains(&Relation::on_circle(x, b)));
+        assert!(state.facts.contains(&Relation::congruent(b, x, b, c)));
+    }
+
+    #[test]
+    fn test_parse_shift_full_parallelogram() {
+        // shift x a b c → both parallel pairs and both congruent pairs
+        let input = "test\na b c = triangle; x = shift a b c ? para a c b x";
+        let state = parse_problem(input).unwrap();
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        let x = state.id("x");
+        assert!(state.facts.contains(&Relation::parallel(a, b, c, x)));
+        assert!(state.facts.contains(&Relation::parallel(a, c, b, x)));
+        assert!(state.facts.contains(&Relation::congruent(a, b, c, x)));
+        assert!(state.facts.contains(&Relation::congruent(a, c, b, x)));
+    }
+
+    #[test]
+    fn test_parse_risos() {
+        // risos c a b → right angle at c, |ca|=|cb|
+        let input = "test\nc a b = risos c a b ? perp c a c b";
+        let state = parse_problem(input).unwrap();
+        let c = state.id("c");
+        let a = state.id("a");
+        let b = state.id("b");
+        assert!(state.facts.contains(&Relation::perpendicular(c, a, c, b)));
+        assert!(state.facts.contains(&Relation::congruent(c, a, c, b)));
+    }
+
+    #[test]
+    fn test_parse_angle_mirror() {
+        // angle_mirror x a b c → angle(c,a,b) = angle(b,a,x)
+        let input = "test\na b c = triangle; x = angle_mirror a b c ? coll x a b";
+        let state = parse_problem(input).unwrap();
+        let x = state.id("x");
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        assert!(state.facts.contains(&Relation::equal_angle(c, a, b, b, a, x)));
+    }
+
+    #[test]
+    fn test_parse_pentagon() {
+        let input = "test\na b c d e = pentagon a b c d e ? coll a b c";
+        let state = parse_problem(input).unwrap();
+        assert_eq!(state.objects.len(), 5);
+        assert!(state.facts.is_empty());
+    }
+
+    #[test]
+    fn test_parse_trisegment() {
+        // trisegment d x c b → c-d-x-b collinear, |cd|=|dx|=|xb|
+        let input = "test\nc b = segment; d x = trisegment c b ? cong c d d x";
+        let state = parse_problem(input).unwrap();
+        let c = state.id("c");
+        let b = state.id("b");
+        let d = state.id("d");
+        let x = state.id("x");
+        assert!(state.facts.contains(&Relation::collinear(c, d, b)));
+        assert!(state.facts.contains(&Relation::collinear(c, x, b)));
+        assert!(state.facts.contains(&Relation::congruent(c, d, d, x)));
+        assert!(state.facts.contains(&Relation::congruent(d, x, x, b)));
+    }
+
+    #[test]
+    fn test_parse_intersection_lt() {
+        // intersection_lt x p1 p2 through la lb → collinear(x,p1,p2) + perp(through,x,la,lb)
+        let input = "test\na b c d e = triangle; x = intersection_lt a b c d e ? coll x a b";
+        let state = parse_problem(input).unwrap();
+        let x = state.id("x");
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        let d = state.id("d");
+        let e = state.id("e");
+        assert!(state.facts.contains(&Relation::collinear(x, a, b)));
+        assert!(state.facts.contains(&Relation::perpendicular(c, x, d, e)));
+    }
+
+    #[test]
+    fn test_parse_intersection_tt() {
+        // intersection_tt x t1 la1 lb1 t2 la2 lb2 → two perp facts
+        let input = "test\na b c d e f = triangle; x = intersection_tt a b c d e f ? coll x a b";
+        let state = parse_problem(input).unwrap();
+        let x = state.id("x");
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        let d = state.id("d");
+        let e = state.id("e");
+        let f = state.id("f");
+        assert!(state.facts.contains(&Relation::perpendicular(a, x, b, c)));
+        assert!(state.facts.contains(&Relation::perpendicular(d, x, e, f)));
+    }
+
+    #[test]
+    fn test_parse_intersection_lp() {
+        // intersection_lp x p1 p2 through pa pb → collinear(x,p1,p2) + parallel(through,x,pa,pb)
+        let input = "test\na b c d e = triangle; x = intersection_lp a b c d e ? coll x a b";
+        let state = parse_problem(input).unwrap();
+        let x = state.id("x");
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        let d = state.id("d");
+        let e = state.id("e");
+        assert!(state.facts.contains(&Relation::collinear(x, a, b)));
+        assert!(state.facts.contains(&Relation::parallel(c, x, d, e)));
     }
 }
