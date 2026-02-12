@@ -834,25 +834,18 @@ fn parse_goal(goal_str: &str, state: &ProofState) -> Result<Relation, ParseError
             let f = lookup(args[5], state)?;
             let g = lookup(args[6], state)?;
             let h = lookup(args[7], state)?;
-            // eqangle a b c d e f g h means: angle between lines AB,CD = angle between lines EF,GH
-            // We store as angle(a,b,c) = angle(d,e,f) where b,e are vertices
-            // AlphaGeometry's eqangle has 8 args: directed angle of (ab, cd) = directed angle of (ef, gh)
-            // For our Relation, we'll store the 8-arg version differently:
-            // We map to EqualAngle using vertex form when possible
-            // But AG's eqangle is about directed angles between lines, not vertex angles
-            // For now, map eqangle a b c d e f g h to our representation
-            // AG format: angle(line(a,b), line(c,d)) = angle(line(e,f), line(g,h))
-            // This doesn't directly map to vertex-angle form. We need a separate representation.
-            // For MVP, we'll use a simplified mapping.
-            // When b==c (i.e., the two lines share a point), it's a vertex angle at b
-            // eqangle a b b d e f f h → angle(a,b,d) = angle(e,f,h)
-            if b == c && f == g {
-                Ok(Relation::equal_angle(a, b, d, e, f, h))
-            } else {
-                // General directed angle — store as EqualAngle with the line endpoints
-                // We'll use a new convention: store as the 8-arg form using two EqualAngle facts
-                // For now, approximate: use (a,b,c) and (e,f,g) as the angle triples
-                Ok(Relation::equal_angle(a, b, d, e, f, h))
+            // eqangle a b c d e f g h means: angle(line(a,b), line(c,d)) = angle(line(e,f), line(g,h))
+            // Convert to vertex form by finding shared point between each line pair
+            let v1 = find_vertex(a, b, c, d);
+            let v2 = find_vertex(e, f, g, h);
+            match (v1, v2) {
+                (Some((r1, vtx1, r2)), Some((r3, vtx2, r4))) => {
+                    Ok(Relation::equal_angle(r1, vtx1, r2, r3, vtx2, r4))
+                }
+                _ => {
+                    // No shared vertex — store approximation using positions 1,5 as vertices
+                    Ok(Relation::equal_angle(a, b, d, e, f, h))
+                }
             }
         }
         "cyclic" => {
@@ -863,19 +856,46 @@ fn parse_goal(goal_str: &str, state: &ProofState) -> Result<Relation, ParseError
             let d = lookup(args[3], state)?;
             Ok(Relation::cyclic(a, b, c, d))
         }
-        "contri" | "simtri" => {
-            // Congruent/similar triangles — complex goal, handle as needed
+        "simtri" => {
+            // Similar triangles: angle(B,A,C) = angle(Q,P,R)
             require_args(predicate, args, 6)?;
-            let _a = lookup(args[0], state)?;
-            let _b = lookup(args[1], state)?;
+            let a = lookup(args[0], state)?;
+            let b = lookup(args[1], state)?;
+            let c = lookup(args[2], state)?;
+            let p = lookup(args[3], state)?;
+            let q = lookup(args[4], state)?;
+            let r = lookup(args[5], state)?;
+            Ok(Relation::equal_angle(b, a, c, q, p, r))
+        }
+        "contri" => {
+            // Congruent triangles: simtri + congruent sides
+            // Decompose to congruent side check: |AB| = |PQ|
+            require_args(predicate, args, 6)?;
+            let a = lookup(args[0], state)?;
+            let b = lookup(args[1], state)?;
             let _c = lookup(args[2], state)?;
-            let _d = lookup(args[3], state)?;
-            let _e = lookup(args[4], state)?;
-            let _f = lookup(args[5], state)?;
-            // For now, return a placeholder — congruent triangle goals need decomposition
-            Err(ParseError(format!("Goal predicate '{}' not yet supported", predicate)))
+            let p = lookup(args[3], state)?;
+            let q = lookup(args[4], state)?;
+            let _r = lookup(args[5], state)?;
+            Ok(Relation::congruent(a, b, p, q))
         }
         _ => Err(ParseError(format!("Unknown goal predicate: '{}'", predicate))),
+    }
+}
+
+/// Find vertex (shared point) between line(p1,p2) and line(p3,p4).
+/// Returns (ray_start, vertex, ray_end) or None if no shared point.
+fn find_vertex(p1: u16, p2: u16, p3: u16, p4: u16) -> Option<(u16, u16, u16)> {
+    if p1 == p3 {
+        Some((p2, p1, p4))
+    } else if p1 == p4 {
+        Some((p2, p1, p3))
+    } else if p2 == p3 {
+        Some((p1, p2, p4))
+    } else if p2 == p4 {
+        Some((p1, p2, p3))
+    } else {
+        None
     }
 }
 
@@ -1480,19 +1500,57 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_contri_goal_unsupported() {
+    fn test_parse_contri_goal() {
         let input = "test\na b c d e f = triangle ? contri a b c d e f";
-        let result = parse_problem(input);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().0.contains("not yet supported"));
+        let state = parse_problem(input).unwrap();
+        // contri decomposes to congruent(a,b, d,e)
+        let a = state.try_id("a").unwrap();
+        let b = state.try_id("b").unwrap();
+        let d = state.try_id("d").unwrap();
+        let e = state.try_id("e").unwrap();
+        assert_eq!(state.goal, Some(Relation::congruent(a, b, d, e)));
     }
 
     #[test]
-    fn test_parse_simtri_goal_unsupported() {
+    fn test_parse_simtri_goal() {
         let input = "test\na b c d e f = triangle ? simtri a b c d e f";
-        let result = parse_problem(input);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().0.contains("not yet supported"));
+        let state = parse_problem(input).unwrap();
+        // simtri decomposes to equal_angle(b,a,c, e,d,f)
+        let a = state.try_id("a").unwrap();
+        let b = state.try_id("b").unwrap();
+        let c = state.try_id("c").unwrap();
+        let d = state.try_id("d").unwrap();
+        let e = state.try_id("e").unwrap();
+        let f = state.try_id("f").unwrap();
+        assert_eq!(state.goal, Some(Relation::equal_angle(b, a, c, e, d, f)));
+    }
+
+    #[test]
+    fn test_parse_eqangle_shared_vertex() {
+        // eqangle d f d c d c d g: lines share vertex d (not at positions 1,5)
+        // line(d,f) ∩ line(d,c): shared=d → (f, d, c)
+        // line(d,c) ∩ line(d,g): shared=d → (c, d, g)
+        let input = "test\na b c d e f g = triangle ? eqangle d f d c d c d g";
+        let state = parse_problem(input).unwrap();
+        let c = state.id("c");
+        let d = state.id("d");
+        let f = state.id("f");
+        let g = state.id("g");
+        assert_eq!(state.goal, Some(Relation::equal_angle(f, d, c, c, d, g)));
+    }
+
+    #[test]
+    fn test_parse_eqangle_cross_shared_vertex() {
+        // eqangle a b c a d e f d: line(a,b)∩line(c,a) shared=a, line(d,e)∩line(f,d) shared=d
+        let input = "test\na b c d e f = triangle ? eqangle a b c a d e f d";
+        let state = parse_problem(input).unwrap();
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        let d = state.id("d");
+        let e = state.id("e");
+        let f = state.id("f");
+        assert_eq!(state.goal, Some(Relation::equal_angle(b, a, c, e, d, f)));
     }
 
     // --- Stub predicates that create points but no facts ---

@@ -10,8 +10,9 @@ use geoprover::mcts::{mcts_search, MctsConfig};
 #[test]
 fn test_level1_isosceles_base_angles() {
     // Isosceles triangle with |AB| = |AC| → base angles equal
-    // angle(A,B,C) = angle(A,C,B)
-    let input = "isosceles_base\na b c = iso_triangle a b c ? eqangle a b a c a c a b";
+    // angle(ABC) = angle(ACB), i.e., angle between line(BA),line(BC) = angle between line(CA),line(CB)
+    // eqangle b a b c c a c b
+    let input = "isosceles_base\na b c = iso_triangle a b c ? eqangle b a b c c a c b";
     let mut state = parse_problem(input).unwrap();
     let proved = saturate(&mut state);
     assert!(proved, "Isosceles base angles should be proved by deduction");

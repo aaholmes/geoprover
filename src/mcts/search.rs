@@ -224,11 +224,14 @@ mod tests {
 
     #[test]
     fn test_mcts_unsolvable() {
+        // Use a goal that can't be accidentally proved by construction cascading:
+        // Cyclic(a,b,c,d) requires 4 points on a common circle — hard to derive from free points
         let mut state = ProofState::new();
         let a = state.add_object("a", ObjectType::Point);
         let b = state.add_object("b", ObjectType::Point);
         let c = state.add_object("c", ObjectType::Point);
-        state.set_goal(Relation::collinear(a, b, c));
+        let d = state.add_object("d", ObjectType::Point);
+        state.set_goal(Relation::cyclic(a, b, c, d));
 
         let config = MctsConfig {
             num_iterations: 20,

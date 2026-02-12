@@ -46,15 +46,33 @@ pub fn saturate(state: &mut ProofState) -> bool {
         new_facts.extend(rule_two_equidistant_perp(&state.facts));
         new_facts.extend(rule_midpoint_diagonal_parallelogram(&state.facts));
         new_facts.extend(rule_cyclic_equal_angle_congruent(&state.facts));
+        new_facts.extend(rule_cyclic_parallel_eqangle(&state.facts));
+        new_facts.extend(rule_equidistant_cyclic_perp(&state.facts));
+        new_facts.extend(rule_midpoint_parallelogram(&state.facts));
+        new_facts.extend(rule_eqangle_perp_to_perp(&state.facts));
 
         // Filter degenerate facts and genuinely new facts
         new_facts.retain(|f| {
-            if let Relation::Parallel(a, b, c, d) = f {
-                // Parallel lines in Euclidean geometry cannot share a point
-                // (they'd be the same line, already captured by Collinear)
-                if a == c || a == d || b == c || b == d {
-                    return false;
+            match f {
+                Relation::Parallel(a, b, c, d) => {
+                    // Parallel lines cannot share a point
+                    if a == c || a == d || b == c || b == d {
+                        return false;
+                    }
                 }
+                Relation::Perpendicular(a, b, c, d) => {
+                    // A line can't be perpendicular to itself; skip degenerate lines
+                    if a == b || c == d || (a == c && b == d) || (a == d && b == c) {
+                        return false;
+                    }
+                }
+                Relation::EqualAngle(a, b, c, d, e, f) => {
+                    // Skip degenerate angles (vertex equals a ray endpoint)
+                    if a == b || b == c || d == e || e == f {
+                        return false;
+                    }
+                }
+                _ => {}
             }
             !state.facts.contains(f)
         });
@@ -282,13 +300,52 @@ fn rule_alternate_interior_angles(facts: &HashSet<Relation>) -> Vec<Relation> {
 
 // --- Rule 7: Corresponding Angles ---
 // If AB ∥ CD, then angle(T,A,B) = angle(T,C,D) for transversal T
-fn rule_corresponding_angles(_facts: &HashSet<Relation>) -> Vec<Relation> {
-    // Corresponding angles are closely related to alternate interior
-    // For AB ∥ CD with transversal through A and C:
-    // corresponding: angle(B,A,C) = angle(D,C,A_extended)
-    // This is handled implicitly by the alternate interior angles combined with
-    // supplementary/vertical angles. For now, skip separate implementation.
-    Vec::new()
+/// AG Rule 9: Two perpendiculars with non-parallel first lines → equal angles
+/// perp(A,B,C,D) and perp(E,F,G,H) and ¬para(A,B,E,F) → eqangle(A,B,E,F, C,D,G,H)
+/// In vertex form: if two perp pairs share vertices in their respective lines,
+/// generate the corresponding equal angle facts.
+fn rule_corresponding_angles(facts: &HashSet<Relation>) -> Vec<Relation> {
+    let mut new = Vec::new();
+    let perps: Vec<_> = facts
+        .iter()
+        .filter_map(|f| match f {
+            Relation::Perpendicular(a, b, c, d) => Some((*a, *b, *c, *d)),
+            _ => None,
+        })
+        .collect();
+
+    let parallels: HashSet<(u16, u16, u16, u16)> = facts
+        .iter()
+        .filter_map(|f| match f {
+            Relation::Parallel(a, b, c, d) => Some((*a, *b, *c, *d)),
+            _ => None,
+        })
+        .collect();
+
+    for i in 0..perps.len() {
+        for j in (i + 1)..perps.len() {
+            let (a1, b1, c1, d1) = perps[i];
+            let (a2, b2, c2, d2) = perps[j];
+
+            // Skip if the first lines are parallel
+            if is_parallel_pair(a1, b1, a2, b2, &parallels) {
+                continue;
+            }
+
+            // Try to form vertex angles from perpendicular line endpoints
+            if let Some((r1, v1, r2)) = find_vertex_deduction(a1, b1, a2, b2) {
+                if let Some((r3, v2, r4)) = find_vertex_deduction(c1, d1, c2, d2) {
+                    new.push(Relation::equal_angle(r1, v1, r2, r3, v2, r4));
+                }
+            }
+            if let Some((r1, v1, r2)) = find_vertex_deduction(a1, b1, c2, d2) {
+                if let Some((r3, v2, r4)) = find_vertex_deduction(c1, d1, a2, b2) {
+                    new.push(Relation::equal_angle(r1, v1, r2, r3, v2, r4));
+                }
+            }
+        }
+    }
+    new
 }
 
 // --- Transitive Equal Angles ---
@@ -1283,6 +1340,277 @@ fn rule_cyclic_equal_angle_congruent(facts: &HashSet<Relation>) -> Vec<Relation>
         }
     }
     new
+}
+
+// --- AG Rule 22: Cyclic + Parallel → EqualAngle ---
+// cyclic(A,B,C,D) and para(A,B,C,D) → eqangle(A,D,C, D,C,B) (equal base angles of cyclic trapezoid)
+fn rule_cyclic_parallel_eqangle(facts: &HashSet<Relation>) -> Vec<Relation> {
+    let mut new = Vec::new();
+
+    let cyclics: Vec<_> = facts
+        .iter()
+        .filter_map(|f| match f {
+            Relation::Cyclic(a, b, c, d) => Some((*a, *b, *c, *d)),
+            _ => None,
+        })
+        .collect();
+
+    let parallels: Vec<_> = facts
+        .iter()
+        .filter_map(|f| match f {
+            Relation::Parallel(a, b, c, d) => Some((*a, *b, *c, *d)),
+            _ => None,
+        })
+        .collect();
+
+    for &(ca, cb, cc, cd) in &cyclics {
+        let cyc_pts = [ca, cb, cc, cd];
+        // For each pair of sides of the cyclic quad that are parallel
+        for &(pa, pb, pc, pd) in &parallels {
+            // Check if the parallel lines form two sides of the cyclic quad
+            // We need to find two sides (edges) of ABCD that match the parallel lines
+            // Sides of the cyclic quad: (0,1),(1,2),(2,3),(0,3) and diagonals (0,2),(1,3)
+            // For a cyclic quad ABCD with AB ∥ CD (isosceles trapezoid):
+            // equal base angles: angle(A,D,C) = angle(B,C,D)
+            let side_pairs: [(usize, usize, usize, usize); 3] =
+                [(0, 1, 2, 3), (0, 2, 1, 3), (0, 3, 1, 2)];
+
+            for &(i, j, k, l) in &side_pairs {
+                // Check if para matches side (i,j) and (k,l)
+                if lines_equal(cyc_pts[i], cyc_pts[j], pa, pb)
+                    && lines_equal(cyc_pts[k], cyc_pts[l], pc, pd)
+                {
+                    // Side (i,j) ∥ (k,l) in cyclic quad → equal base angles
+                    // The non-parallel sides connect i-k, j-l (or i-l, j-k)
+                    // Equal base angles at the endpoints of the non-parallel sides
+                    new.push(Relation::equal_angle(
+                        cyc_pts[i],
+                        cyc_pts[k],
+                        cyc_pts[l],
+                        cyc_pts[j],
+                        cyc_pts[l],
+                        cyc_pts[k],
+                    ));
+                    new.push(Relation::equal_angle(
+                        cyc_pts[i],
+                        cyc_pts[l],
+                        cyc_pts[k],
+                        cyc_pts[j],
+                        cyc_pts[k],
+                        cyc_pts[l],
+                    ));
+                }
+                if lines_equal(cyc_pts[i], cyc_pts[j], pc, pd)
+                    && lines_equal(cyc_pts[k], cyc_pts[l], pa, pb)
+                {
+                    new.push(Relation::equal_angle(
+                        cyc_pts[i],
+                        cyc_pts[k],
+                        cyc_pts[l],
+                        cyc_pts[j],
+                        cyc_pts[l],
+                        cyc_pts[k],
+                    ));
+                    new.push(Relation::equal_angle(
+                        cyc_pts[i],
+                        cyc_pts[l],
+                        cyc_pts[k],
+                        cyc_pts[j],
+                        cyc_pts[k],
+                        cyc_pts[l],
+                    ));
+                }
+            }
+        }
+    }
+    new
+}
+
+// --- AG Rule 25: Equidistant + Cyclic → Perpendicular ---
+// cong(A,P,B,P) and cong(A,Q,B,Q) and cyclic(A,B,P,Q) → perp(P,A,A,Q)
+fn rule_equidistant_cyclic_perp(facts: &HashSet<Relation>) -> Vec<Relation> {
+    let mut new = Vec::new();
+
+    // Collect equidistant triples: (center, pt1, pt2) where |center-pt1| = |center-pt2|
+    let mut equidistant: Vec<(u16, u16, u16)> = Vec::new();
+    for fact in facts {
+        if let Relation::Congruent(a, b, c, d) = fact {
+            // |AB| = |CD| — look for pattern where one endpoint is shared
+            if a == c {
+                equidistant.push((*a, *b, *d));
+            } else if a == d {
+                equidistant.push((*a, *b, *c));
+            } else if b == c {
+                equidistant.push((*b, *a, *d));
+            } else if b == d {
+                equidistant.push((*b, *a, *c));
+            }
+        }
+    }
+
+    // For each pair of equidistant triples sharing the same (pt1, pt2)
+    for i in 0..equidistant.len() {
+        for j in (i + 1)..equidistant.len() {
+            let (p, a1, b1) = equidistant[i];
+            let (q, a2, b2) = equidistant[j];
+            if p == q {
+                continue;
+            }
+            // Check if they share the same pair of points
+            if !segments_equal(a1, b1, a2, b2) {
+                continue;
+            }
+            let (a, b) = (a1, b1);
+            // Check if A, B, P, Q are cyclic
+            if facts.contains(&Relation::cyclic(a, b, p, q)) {
+                new.push(Relation::perpendicular(p, a, a, q));
+                new.push(Relation::perpendicular(p, b, b, q));
+            }
+        }
+    }
+    new
+}
+
+// --- AG Rule 27: Midpoint + Parallelogram → Midpoint ---
+// midp(M,A,B) and para(A,C,B,D) and para(A,D,B,C) → midp(M,C,D)
+fn rule_midpoint_parallelogram(facts: &HashSet<Relation>) -> Vec<Relation> {
+    let mut new = Vec::new();
+
+    let midpoints: Vec<_> = facts
+        .iter()
+        .filter_map(|f| match f {
+            Relation::Midpoint(m, a, b) => Some((*m, *a, *b)),
+            _ => None,
+        })
+        .collect();
+
+    let parallels: HashSet<(u16, u16, u16, u16)> = facts
+        .iter()
+        .filter_map(|f| match f {
+            Relation::Parallel(a, b, c, d) => Some((*a, *b, *c, *d)),
+            _ => None,
+        })
+        .collect();
+
+    for &(m, a, b) in &midpoints {
+        // Find all points c such that (a,c) is parallel to some (b,d)
+        // and (a,d) is parallel to (b,c) — forming a parallelogram
+        // We need to search through parallel facts for lines involving a and b
+        let mut a_partners: Vec<(u16, u16)> = Vec::new(); // (c, d) where para(a,c,b,d)
+        for &(pa, pb, pc, pd) in &parallels {
+            // Check if one line contains a and other contains b
+            if pa == a || pb == a {
+                let c = if pa == a { pb } else { pa };
+                if pc == b || pd == b {
+                    let d = if pc == b { pd } else { pc };
+                    a_partners.push((c, d));
+                }
+            } else if pc == a || pd == a {
+                let c = if pc == a { pd } else { pc };
+                if pa == b || pb == b {
+                    let d = if pa == b { pb } else { pa };
+                    a_partners.push((c, d));
+                }
+            }
+        }
+
+        // For each pair (c, d), check if the other pair of sides is also parallel
+        for &(c, d) in &a_partners {
+            // All 5 points must be distinct for a genuine parallelogram
+            let pts = [m, a, b, c, d];
+            let mut sorted = pts;
+            sorted.sort();
+            if sorted.windows(2).any(|w| w[0] == w[1]) {
+                continue;
+            }
+            // Need para(a,d,b,c) for parallelogram ACBD
+            if is_parallel_pair(a, d, b, c, &parallels) {
+                new.push(Relation::midpoint(m, c, d));
+            }
+        }
+    }
+    new
+}
+
+// --- AG Rule 31: EqualAngle + Perpendicular → Perpendicular ---
+// If angle between lines AB and PQ equals angle between CD and UV, and PQ ⊥ UV, then AB ⊥ CD
+fn rule_eqangle_perp_to_perp(facts: &HashSet<Relation>) -> Vec<Relation> {
+    let mut new = Vec::new();
+
+    let eqangles: Vec<_> = facts
+        .iter()
+        .filter_map(|f| match f {
+            Relation::EqualAngle(a, b, c, d, e, f) => Some((*a, *b, *c, *d, *e, *f)),
+            _ => None,
+        })
+        .collect();
+
+    let perps: HashSet<(u16, u16, u16, u16)> = facts
+        .iter()
+        .filter_map(|f| match f {
+            Relation::Perpendicular(a, b, c, d) => Some((*a, *b, *c, *d)),
+            _ => None,
+        })
+        .collect();
+
+    for &(a1, v1, c1, a2, v2, c2) in &eqangles {
+        // EqualAngle(a1,v1,c1, a2,v2,c2) means angle(a1,v1,c1) = angle(a2,v2,c2)
+        // The angle arms are lines (a1,v1), (v1,c1) for the first angle
+        // and lines (a2,v2), (v2,c2) for the second angle
+
+        // If the second angle's arms are perpendicular → first angle's arms are perpendicular
+        // Check if (a2,v2) ⊥ (v2,c2) — the arms of the second angle
+        if is_perp_pair(a2, v2, v2, c2, &perps) {
+            new.push(Relation::perpendicular(a1, v1, v1, c1));
+        }
+        // Check if the first angle's arms are perpendicular → second angle's arms are perp
+        if is_perp_pair(a1, v1, v1, c1, &perps) {
+            new.push(Relation::perpendicular(a2, v2, v2, c2));
+        }
+    }
+    new
+}
+
+// --- Helper: check if line (a,b) is perpendicular to line (c,d) ---
+fn is_perp_pair(a: u16, b: u16, c: u16, d: u16, perps: &HashSet<(u16, u16, u16, u16)>) -> bool {
+    // Check all canonical orderings
+    let check = Relation::perpendicular(a, b, c, d);
+    if let Relation::Perpendicular(pa, pb, pc, pd) = check {
+        perps.contains(&(pa, pb, pc, pd))
+    } else {
+        false
+    }
+}
+
+// --- Helper: check if two lines are parallel ---
+fn is_parallel_pair(
+    a: u16,
+    b: u16,
+    c: u16,
+    d: u16,
+    parallels: &HashSet<(u16, u16, u16, u16)>,
+) -> bool {
+    let check = Relation::parallel(a, b, c, d);
+    if let Relation::Parallel(pa, pb, pc, pd) = check {
+        parallels.contains(&(pa, pb, pc, pd))
+    } else {
+        false
+    }
+}
+
+// --- Helper: find vertex (shared point) between two lines ---
+fn find_vertex_deduction(p1: u16, p2: u16, p3: u16, p4: u16) -> Option<(u16, u16, u16)> {
+    if p1 == p3 {
+        Some((p2, p1, p4))
+    } else if p1 == p4 {
+        Some((p2, p1, p3))
+    } else if p2 == p3 {
+        Some((p1, p2, p4))
+    } else if p2 == p4 {
+        Some((p1, p2, p3))
+    } else {
+        None
+    }
 }
 
 // --- Helper: check if two line pairs represent the same line ---
@@ -2513,5 +2841,93 @@ mod tests {
         state.add_fact(Relation::collinear(o, a, c));
         state.set_goal(Relation::perpendicular(a, b, b, c));
         assert!(saturate(&mut state));
+    }
+
+    #[test]
+    fn test_midpoint_para_no_spurious_collinear() {
+        // Midpoint of A,B with no parallel facts should not create spurious collinear(a,b,c)
+        let mut state = make_state_with_points(&["a", "b", "c", "m"]);
+        let (a, b, c, m) = (state.id("a"), state.id("b"), state.id("c"), state.id("m"));
+        state.add_fact(Relation::midpoint(m, a, b));
+        state.set_goal(Relation::collinear(a, b, c));
+        assert!(!saturate(&mut state), "Midpoint(m,a,b) alone should NOT prove collinear(a,b,c)");
+    }
+
+    // --- Tests for AG Rule 22: Cyclic + Parallel → EqualAngle ---
+
+    #[test]
+    fn test_cyclic_parallel_eqangle() {
+        // Cyclic trapezoid: ABCD cyclic with AB ∥ CD → equal base angles
+        let mut state = make_state_with_points(&["a", "b", "c", "d"]);
+        let (a, b, c, d) = (state.id("a"), state.id("b"), state.id("c"), state.id("d"));
+        state.add_fact(Relation::cyclic(a, b, c, d));
+        state.add_fact(Relation::parallel(a, b, c, d));
+        // Should derive equal base angles
+        state.set_goal(Relation::equal_angle(a, d, c, b, c, d));
+        assert!(saturate(&mut state), "Cyclic + parallel should give equal base angles");
+    }
+
+    // --- Tests for AG Rule 25: Equidistant + Cyclic → Perpendicular ---
+
+    #[test]
+    fn test_equidistant_cyclic_perp() {
+        // P and Q equidistant from A and B, ABPQ cyclic → PA ⊥ AQ
+        let mut state = make_state_with_points(&["a", "b", "p", "q"]);
+        let (a, b, p, q) = (state.id("a"), state.id("b"), state.id("p"), state.id("q"));
+        state.add_fact(Relation::congruent(a, p, b, p));
+        state.add_fact(Relation::congruent(a, q, b, q));
+        state.add_fact(Relation::cyclic(a, b, p, q));
+        state.set_goal(Relation::perpendicular(p, a, a, q));
+        assert!(saturate(&mut state), "Equidistant + cyclic should give perpendicular");
+    }
+
+    // --- Tests for AG Rule 27: Midpoint + Parallelogram → Midpoint ---
+
+    #[test]
+    fn test_midpoint_parallelogram() {
+        // M midpoint of AB, ACBD is parallelogram → M midpoint of CD
+        let mut state = make_state_with_points(&["a", "b", "c", "d", "m"]);
+        let (a, b, c, d, m) = (
+            state.id("a"), state.id("b"), state.id("c"), state.id("d"), state.id("m"),
+        );
+        state.add_fact(Relation::midpoint(m, a, b));
+        state.add_fact(Relation::parallel(a, c, b, d));
+        state.add_fact(Relation::parallel(a, d, b, c));
+        // M should also be midpoint of C and D
+        state.set_goal(Relation::congruent(c, m, m, d));
+        assert!(saturate(&mut state), "Midpoint + parallelogram should give midpoint of other diagonal");
+    }
+
+    // --- Tests for AG Rule 31: EqualAngle + Perpendicular → Perpendicular ---
+
+    #[test]
+    fn test_eqangle_perp_to_perp() {
+        // angle(a,v1,b) = angle(c,v2,d) and v1-b ⊥ b-... wait,
+        // if second angle's arms are perpendicular, first angle's arms should be too
+        let mut state = make_state_with_points(&["a", "v1", "b", "c", "v2", "d"]);
+        let (a, v1, b, c, v2, d) = (
+            state.id("a"), state.id("v1"), state.id("b"),
+            state.id("c"), state.id("v2"), state.id("d"),
+        );
+        state.add_fact(Relation::equal_angle(a, v1, b, c, v2, d));
+        state.add_fact(Relation::perpendicular(c, v2, v2, d));
+        state.set_goal(Relation::perpendicular(a, v1, v1, b));
+        assert!(saturate(&mut state), "EqualAngle + perp should transfer perpendicularity");
+    }
+
+    // --- Tests for corresponding_angles (AG Rule 9) ---
+
+    #[test]
+    fn test_corresponding_angles_two_perps() {
+        // Two perpendiculars sharing vertices should generate equal angle facts
+        let mut state = make_state_with_points(&["a", "b", "c", "d"]);
+        let (a, b, c, d) = (state.id("a"), state.id("b"), state.id("c"), state.id("d"));
+        // perp(a,b,b,c) and perp(a,d,d,c) — sharing vertex a on first lines
+        state.add_fact(Relation::perpendicular(a, b, b, c));
+        state.add_fact(Relation::perpendicular(a, d, d, c));
+        // Should generate equal angle relating the two perpendicular configurations
+        let result = rule_corresponding_angles(&state.facts);
+        // At minimum, the rule should produce some equal angle facts
+        assert!(!result.is_empty(), "Two perpendiculars with shared vertices should produce equal angles");
     }
 }
