@@ -61,6 +61,11 @@ pub fn saturate(state: &mut ProofState) -> bool {
         new_facts.extend(rule_parallel_collinear_ratio(&state.facts));
         new_facts.extend(rule_congruent_ratio(&state.facts));
         new_facts.extend(rule_ratio_collinear_parallel(&state.facts));
+        // Quadrilateral + extended ratio rules
+        new_facts.extend(rule_parallelogram_opposite_angles(&state.facts));
+        new_facts.extend(rule_isosceles_trapezoid_base_angles(&state.facts));
+        new_facts.extend(rule_trapezoid_midsegment(&state.facts));
+        new_facts.extend(rule_parallel_base_ratio(&state.facts));
 
         // Filter degenerate facts and genuinely new facts
         new_facts.retain(|f| {
@@ -2230,6 +2235,222 @@ fn rule_ratio_collinear_parallel(facts: &HashSet<Relation>) -> Vec<Relation> {
     new
 }
 
+// --- Rule: Parallelogram Opposite Angles ---
+// para(A,B,C,D) ∧ para(A,D,B,C) → eqangle(D,A,B, B,C,D) ∧ eqangle(A,B,C, C,D,A)
+// In parallelogram ABCD (AB∥CD, AD∥BC), opposite angles are equal.
+fn rule_parallelogram_opposite_angles(facts: &HashSet<Relation>) -> Vec<Relation> {
+    let mut new = Vec::new();
+    let parallel_set: HashSet<(u16, u16, u16, u16)> = facts
+        .iter()
+        .filter_map(|f| match f {
+            Relation::Parallel(a, b, c, d) => Some((*a, *b, *c, *d)),
+            _ => None,
+        })
+        .collect();
+
+    for &(a, b, c, d) in &parallel_set {
+        // para(a,b,c,d) means AB∥CD. Check if AD∥BC also holds.
+        // We need to check all vertex assignments for ABCD parallelogram:
+        // Line1 = {a,b}, Line2 = {c,d}
+        // Possible parallelogram vertex orderings: A,B from line1, C,D from line2
+        // For AB∥CD, the other pair AD∥BC must hold
+        for &(p_a, p_b, p_c, p_d) in &[
+            (a, b, d, c),
+            (a, b, c, d),
+            (b, a, d, c),
+            (b, a, c, d),
+        ] {
+            // Parallelogram ABCD: AB∥CD (already have) and AD∥BC
+            if is_parallel_pair(p_a, p_d, p_b, p_c, &parallel_set) {
+                // Opposite angles: angle(D,A,B) = angle(B,C,D)
+                new.push(Relation::equal_angle(p_d, p_a, p_b, p_b, p_c, p_d));
+                // Opposite angles: angle(A,B,C) = angle(C,D,A)
+                new.push(Relation::equal_angle(p_a, p_b, p_c, p_c, p_d, p_a));
+            }
+        }
+    }
+    new
+}
+
+// --- Rule: Isosceles Trapezoid Base Angles ---
+// para(A,B,C,D) ∧ cong(A,D, B,C) → eqangle(D,A,B, A,B,C) ∧ eqangle(A,D,C, B,C,D)
+// If AB∥CD and |AD|=|BC|, base angles at AB are equal, base angles at CD are equal.
+fn rule_isosceles_trapezoid_base_angles(facts: &HashSet<Relation>) -> Vec<Relation> {
+    let mut new = Vec::new();
+    let cong_set: HashSet<(u16, u16, u16, u16)> = facts
+        .iter()
+        .filter_map(|f| match f {
+            Relation::Congruent(a, b, c, d) => Some((*a, *b, *c, *d)),
+            _ => None,
+        })
+        .collect();
+
+    for fact in facts {
+        if let Relation::Parallel(a, b, c, d) = fact {
+            // para(a,b,c,d): line {a,b} ∥ line {c,d}
+            // Check all vertex assignments for trapezoid
+            for &(p_a, p_b, p_c, p_d) in &[
+                (*a, *b, *d, *c),
+                (*a, *b, *c, *d),
+                (*b, *a, *d, *c),
+                (*b, *a, *c, *d),
+            ] {
+                // Trapezoid: AB∥CD, legs AD and BC
+                if is_congruent_pair(p_a, p_d, p_b, p_c, &cong_set) {
+                    // Base angles at AB: angle(D,A,B) = angle(A,B,C) (vertex A, vertex B)
+                    new.push(Relation::equal_angle(p_d, p_a, p_b, p_a, p_b, p_c));
+                    // Base angles at CD: angle(A,D,C) = angle(B,C,D) (vertex D, vertex C)
+                    new.push(Relation::equal_angle(p_a, p_d, p_c, p_b, p_c, p_d));
+                }
+            }
+        }
+    }
+    new
+}
+
+// --- Rule: Trapezoid Midsegment ---
+// para(A,B,C,D) ∧ midp(E,A,D) ∧ coll(F,B,C) ∧ para(E,F,A,B) → midp(F,B,C)
+// In a trapezoid AB∥CD, if E is midpoint of leg AD and F is on leg BC with EF∥AB,
+// then F is midpoint of BC.
+fn rule_trapezoid_midsegment(facts: &HashSet<Relation>) -> Vec<Relation> {
+    let mut new = Vec::new();
+    let parallel_set: HashSet<(u16, u16, u16, u16)> = facts
+        .iter()
+        .filter_map(|f| match f {
+            Relation::Parallel(a, b, c, d) => Some((*a, *b, *c, *d)),
+            _ => None,
+        })
+        .collect();
+
+    let midpoints: Vec<_> = facts
+        .iter()
+        .filter_map(|f| match f {
+            Relation::Midpoint(m, a, b) => Some((*m, *a, *b)),
+            _ => None,
+        })
+        .collect();
+
+    let collinears: Vec<_> = facts
+        .iter()
+        .filter_map(|f| match f {
+            Relation::Collinear(a, b, c) => Some((*a, *b, *c)),
+            _ => None,
+        })
+        .collect();
+
+    for &(a, b, c, d) in &parallel_set {
+        // para(a,b,c,d): line {a,b} ∥ line {c,d}
+        // Try all vertex assignments for trapezoid ABCD
+        for &(p_a, p_b, p_c, p_d) in &[
+            (a, b, d, c),
+            (a, b, c, d),
+            (b, a, d, c),
+            (b, a, c, d),
+        ] {
+            // Legs are AD and BC
+            // Check midpoint of leg AD
+            for &(e, ma, mb) in &midpoints {
+                if !segments_equal(ma, mb, p_a, p_d) {
+                    continue;
+                }
+                // E is midpoint of AD. Find F collinear with B,C and para(E,F,A,B)
+                for &(cx, cy, cz) in &collinears {
+                    let triple = [cx, cy, cz];
+                    if !triple.contains(&p_b) || !triple.contains(&p_c) {
+                        continue;
+                    }
+                    // F is the other point in the collinear triple
+                    for &f_pt in &triple {
+                        if f_pt == p_b || f_pt == p_c {
+                            continue;
+                        }
+                        // Check para(E,F,A,B) — EF ∥ AB
+                        if is_parallel_pair(e, f_pt, p_a, p_b, &parallel_set) {
+                            new.push(Relation::midpoint(f_pt, p_b, p_c));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    new
+}
+
+// --- Rule: Parallel Base Ratio ---
+// para(A,B,C,D) ∧ coll(O,A,C) ∧ coll(O,B,D) ∧ ncoll(A,B,C)
+//   → eqratio(A,B, C,D, O,A, O,C) ∧ eqratio(A,B, C,D, O,B, O,D)
+// Extends existing Thales rule to include ratios involving the parallel base segments.
+fn rule_parallel_base_ratio(facts: &HashSet<Relation>) -> Vec<Relation> {
+    let mut new = Vec::new();
+
+    let parallels: Vec<_> = facts
+        .iter()
+        .filter_map(|f| match f {
+            Relation::Parallel(a, b, c, d) => Some((*a, *b, *c, *d)),
+            _ => None,
+        })
+        .collect();
+
+    let collinears: Vec<_> = facts
+        .iter()
+        .filter_map(|f| match f {
+            Relation::Collinear(a, b, c) => Some((*a, *b, *c)),
+            _ => None,
+        })
+        .collect();
+
+    for &(a, b, c, d) in &parallels {
+        // AB ∥ CD. Look for transversals: point O collinear with one from {A,B} and one from {C,D}
+        let ab_pts = [a, b];
+        let cd_pts = [c, d];
+
+        for &pt_ab in &ab_pts {
+            for &pt_cd in &cd_pts {
+                for &(p, q, r) in &collinears {
+                    let triple = [p, q, r];
+                    if !triple.contains(&pt_ab) || !triple.contains(&pt_cd) {
+                        continue;
+                    }
+                    for &o in &triple {
+                        if o == pt_ab || o == pt_cd {
+                            continue;
+                        }
+                        let other_ab = if pt_ab == a { b } else { a };
+                        let other_cd = if pt_cd == c { d } else { c };
+
+                        // Need O collinear with other_ab and other_cd too
+                        let col_obd = collinears.iter().any(|&(x, y, z)| {
+                            let t = [x, y, z];
+                            t.contains(&o) && t.contains(&other_ab) && t.contains(&other_cd)
+                        });
+
+                        if !col_obd {
+                            continue;
+                        }
+
+                        // Non-collinear guard
+                        if is_collinear_triple(pt_ab, other_ab, pt_cd, &collinears) {
+                            continue;
+                        }
+
+                        // |AB|/|CD| = |OA|/|OC| (ratio of bases = ratio of transversal segments)
+                        new.push(Relation::equal_ratio(
+                            pt_ab, other_ab, pt_cd, other_cd,
+                            o, pt_ab, o, pt_cd,
+                        ));
+                        // |AB|/|CD| = |OB|/|OD|
+                        new.push(Relation::equal_ratio(
+                            pt_ab, other_ab, pt_cd, other_cd,
+                            o, other_ab, o, other_cd,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    new
+}
+
 // --- Helper: check if line (a,b) is perpendicular to line (c,d) ---
 fn is_perp_pair(a: u16, b: u16, c: u16, d: u16, perps: &HashSet<(u16, u16, u16, u16)>) -> bool {
     // Check all canonical orderings
@@ -2252,6 +2473,22 @@ fn is_parallel_pair(
     let check = Relation::parallel(a, b, c, d);
     if let Relation::Parallel(pa, pb, pc, pd) = check {
         parallels.contains(&(pa, pb, pc, pd))
+    } else {
+        false
+    }
+}
+
+// --- Helper: check if two segments are congruent ---
+fn is_congruent_pair(
+    a: u16,
+    b: u16,
+    c: u16,
+    d: u16,
+    congs: &HashSet<(u16, u16, u16, u16)>,
+) -> bool {
+    let check = Relation::congruent(a, b, c, d);
+    if let Relation::Congruent(pa, pb, pc, pd) = check {
+        congs.contains(&(pa, pb, pc, pd))
     } else {
         false
     }
@@ -3779,5 +4016,155 @@ mod tests {
         } else {
             panic!("Goal should be EqualRatio, got {:?}", state.goal);
         }
+    }
+
+    // ============================
+    // Quadrilateral Rules
+    // ============================
+
+    #[test]
+    fn test_parallelogram_opposite_angles() {
+        // Parallelogram ABCD: AB∥CD, AD∥BC → opposite angles equal
+        let mut state = make_state_with_points(&["a", "b", "c", "d"]);
+        let (a, b, c, d) = (state.id("a"), state.id("b"), state.id("c"), state.id("d"));
+        state.add_fact(Relation::parallel(a, b, c, d)); // AB ∥ CD
+        state.add_fact(Relation::parallel(a, d, b, c)); // AD ∥ BC
+
+        let result = rule_parallelogram_opposite_angles(&state.facts);
+        assert!(!result.is_empty(), "Should produce equal angle facts");
+
+        // Check that opposite angle equalities are produced
+        let angle_dab_bcd = Relation::equal_angle(d, a, b, b, c, d);
+        let angle_abc_cda = Relation::equal_angle(a, b, c, c, d, a);
+        assert!(result.contains(&angle_dab_bcd),
+            "Should have angle(D,A,B) = angle(B,C,D), got {:?}", result);
+        assert!(result.contains(&angle_abc_cda),
+            "Should have angle(A,B,C) = angle(C,D,A), got {:?}", result);
+    }
+
+    #[test]
+    fn test_parallelogram_opposite_angles_saturate() {
+        // Full integration: saturate should prove opposite angles equal
+        let mut state = make_state_with_points(&["a", "b", "c", "d"]);
+        let (a, b, c, d) = (state.id("a"), state.id("b"), state.id("c"), state.id("d"));
+        state.add_fact(Relation::parallel(a, b, c, d));
+        state.add_fact(Relation::parallel(a, d, b, c));
+        state.set_goal(Relation::equal_angle(d, a, b, b, c, d));
+        assert!(saturate(&mut state), "Parallelogram opposite angles should be proved");
+    }
+
+    #[test]
+    fn test_isosceles_trapezoid_base_angles() {
+        // Trapezoid with AB∥CD and |AD|=|BC| → base angles equal
+        let mut state = make_state_with_points(&["a", "b", "c", "d"]);
+        let (a, b, c, d) = (state.id("a"), state.id("b"), state.id("c"), state.id("d"));
+        state.add_fact(Relation::parallel(a, b, c, d)); // AB ∥ CD
+        state.add_fact(Relation::congruent(a, d, b, c)); // |AD| = |BC|
+
+        let result = rule_isosceles_trapezoid_base_angles(&state.facts);
+        assert!(!result.is_empty(), "Should produce base angle equalities");
+
+        // Base angles at AB: angle(D,A,B) = angle(A,B,C)
+        let angle_dab_abc = Relation::equal_angle(d, a, b, a, b, c);
+        assert!(result.contains(&angle_dab_abc),
+            "Should have angle(D,A,B) = angle(A,B,C), got {:?}", result);
+
+        // Base angles at CD: angle(A,D,C) = angle(B,C,D)
+        let angle_adc_bcd = Relation::equal_angle(a, d, c, b, c, d);
+        assert!(result.contains(&angle_adc_bcd),
+            "Should have angle(A,D,C) = angle(B,C,D), got {:?}", result);
+    }
+
+    #[test]
+    fn test_isosceles_trapezoid_saturate() {
+        let mut state = make_state_with_points(&["a", "b", "c", "d"]);
+        let (a, b, c, d) = (state.id("a"), state.id("b"), state.id("c"), state.id("d"));
+        state.add_fact(Relation::parallel(a, b, c, d));
+        state.add_fact(Relation::congruent(a, d, b, c));
+        state.set_goal(Relation::equal_angle(d, a, b, a, b, c));
+        assert!(saturate(&mut state), "Isosceles trapezoid base angles should be proved");
+    }
+
+    #[test]
+    fn test_trapezoid_midsegment() {
+        // Trapezoid AB∥CD, E=midpoint(A,D), F on BC, EF∥AB → F=midpoint(B,C)
+        let mut state = make_state_with_points(&["a", "b", "c", "d", "e", "f"]);
+        let (a, b, c, d, e, f) = (
+            state.id("a"), state.id("b"), state.id("c"),
+            state.id("d"), state.id("e"), state.id("f"),
+        );
+        state.add_fact(Relation::parallel(a, b, c, d)); // AB ∥ CD
+        state.add_fact(Relation::midpoint(e, a, d));     // E = midpoint(A,D)
+        state.add_fact(Relation::collinear(f, b, c));    // F on line BC
+        state.add_fact(Relation::parallel(e, f, a, b));  // EF ∥ AB
+
+        let result = rule_trapezoid_midsegment(&state.facts);
+        let expected = Relation::midpoint(f, b, c);
+        assert!(result.contains(&expected),
+            "Should conclude F is midpoint of BC, got {:?}", result);
+    }
+
+    #[test]
+    fn test_trapezoid_midsegment_saturate() {
+        let mut state = make_state_with_points(&["a", "b", "c", "d", "e", "f"]);
+        let (a, b, c, d, e, f) = (
+            state.id("a"), state.id("b"), state.id("c"),
+            state.id("d"), state.id("e"), state.id("f"),
+        );
+        state.add_fact(Relation::parallel(a, b, c, d));
+        state.add_fact(Relation::midpoint(e, a, d));
+        state.add_fact(Relation::collinear(f, b, c));
+        state.add_fact(Relation::parallel(e, f, a, b));
+        state.set_goal(Relation::midpoint(f, b, c));
+        assert!(saturate(&mut state), "Trapezoid midsegment should be proved");
+    }
+
+    #[test]
+    fn test_parallel_base_ratio() {
+        // AB∥CD, O on transversals → |AB|/|CD| = |OA|/|OC|
+        let mut state = make_state_with_points(&["a", "b", "c", "d", "o"]);
+        let (a, b, c, d, o) = (
+            state.id("a"), state.id("b"), state.id("c"),
+            state.id("d"), state.id("o"),
+        );
+        state.add_fact(Relation::parallel(a, b, c, d));
+        state.add_fact(Relation::collinear(o, a, c)); // O, A, C collinear
+        state.add_fact(Relation::collinear(o, b, d)); // O, B, D collinear
+
+        let result = rule_parallel_base_ratio(&state.facts);
+        assert!(!result.is_empty(), "Should produce base ratio facts");
+
+        // |AB|/|CD| = |OA|/|OC|
+        let expected = Relation::equal_ratio(a, b, c, d, o, a, o, c);
+        assert!(result.contains(&expected),
+            "Should have |AB|/|CD| = |OA|/|OC|, got {:?}", result);
+    }
+
+    #[test]
+    fn test_parallel_base_ratio_saturate() {
+        // Test that base ratio enables chain: parallel → ratio → transitive → cong
+        let mut state = make_state_with_points(&["a", "b", "c", "d", "o"]);
+        let (a, b, c, d, o) = (
+            state.id("a"), state.id("b"), state.id("c"),
+            state.id("d"), state.id("o"),
+        );
+        state.add_fact(Relation::parallel(a, b, c, d));
+        state.add_fact(Relation::collinear(o, a, c));
+        state.add_fact(Relation::collinear(o, b, d));
+        state.set_goal(Relation::equal_ratio(a, b, c, d, o, a, o, c));
+        assert!(saturate(&mut state), "Parallel base ratio should be proved");
+    }
+
+    #[test]
+    fn test_is_congruent_pair_helper() {
+        let mut congs = HashSet::new();
+        let c = Relation::congruent(1, 2, 3, 4);
+        if let Relation::Congruent(a, b, c, d) = c {
+            congs.insert((a, b, c, d));
+        }
+        assert!(is_congruent_pair(1, 2, 3, 4, &congs));
+        assert!(is_congruent_pair(2, 1, 4, 3, &congs)); // reversed
+        assert!(is_congruent_pair(3, 4, 1, 2, &congs)); // swapped pairs
+        assert!(!is_congruent_pair(1, 2, 5, 6, &congs)); // not present
     }
 }
