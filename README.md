@@ -6,15 +6,15 @@ Neurosymbolic geometry theorem prover using a three-tier MCTS architecture adapt
 
 | Phase | Status | Details |
 |-------|--------|---------|
-| 1. Rust core | **Done** | ProofState, parser (228/231 JGEX), deduction (21 rules), construction (8/16 types) |
+| 1. Rust core | **Done** | ProofState, parser (228/231 JGEX), deduction (28 rules), construction (16 types) |
 | 2. MCTS | **Done** | MctsNode tree, UCB/PUCT selection, expand/evaluate/backprop, classical fallback |
 | 3. PyO3 bridge | Boilerplate | `lib.rs` has module init, no exposed functions yet |
 | 4. NN + training | Not started | `encoding.rs` is a stub, no Python code |
 | 5. Evaluation | Not started | No benchmark harness beyond integration tests |
 
-**282 tests passing** (265 unit + 17 integration), clippy clean, ~4,700 LOC Rust.
+**JGEX-AG-231: 126/228 solved (55%)** — 111 by deduction alone, 15 with MCTS (1-6 iterations).
 
-MCTS solves synthetic problems (midpoint congruence, circumcenter equidistance) in 1-2 iterations. JGEX-AG-231 problems require higher-level deduction rules (Thales' theorem, power of a point) before MCTS search becomes effective on the full benchmark.
+**308 tests passing** (291 unit + 17 integration), 98% test coverage, clippy clean, ~7,100 LOC Rust.
 
 ## Architecture
 
@@ -31,7 +31,7 @@ Rust extension module (MCTS, deduction engine, state encoding)
 
 | Tier | Role | Geometry equivalent |
 |------|------|-------------------|
-| 1 | Symbolic deduction | `saturate()` — 21 rules to fixed point |
+| 1 | Symbolic deduction | `saturate()` — 28 rules to fixed point |
 | 2 | MCTS tree search | Search over auxiliary constructions (~30-50 candidates/step) |
 | 3 | Neural oracle | SE-ResNet (~2M params), dual-head: policy + value (Phase 4) |
 
@@ -40,9 +40,9 @@ Rust extension module (MCTS, deduction engine, state encoding)
 ```
 src/
   proof_state.rs    ProofState, GeoObject, Relation (Zobrist hashing)
-  deduction.rs      21 forward-chaining rules + degenerate-fact filtering
-  construction.rs   8 construction types with priority classification
-  parser.rs         JGEX DSL parser (30+ predicates, 228/231 coverage)
+  deduction.rs      28 forward-chaining rules + degenerate-fact filtering
+  construction.rs   16 construction types with priority classification
+  parser.rs         JGEX DSL parser (40+ predicates, 228/231 coverage)
   mcts/
     mod.rs          Module re-exports
     node.rs         MctsNode (Rc<RefCell> tree), expand, evaluate, backprop, UCB/PUCT
@@ -63,7 +63,7 @@ src/
 
 ### Auxiliary Constructions (Action Space)
 
-16 types defined, 8 implemented: Midpoint, Altitude, Circumcenter, Orthocenter, Incenter, ParallelThrough, PerpendicularThrough, + fallback. Priority: GoalRelevant > RecentlyActive > Exploratory.
+16 types: Midpoint, AngleBisector, PerpendicularBisector, Altitude, ParallelThrough, PerpendicularThrough, Circumcenter, Incenter, Centroid, Orthocenter, CircumscribedCircle, IntersectLines, IntersectLineCircle, ReflectPoint, ExtendSegment, TangentLine. Priority: GoalRelevant > RecentlyActive > Exploratory.
 
 ### MCTS Search
 
@@ -73,15 +73,15 @@ src/
 - **Backprop**: Single-player — `total_value += value` at every ancestor (no sign flip)
 - **UCB**: `Q + c_puct * prior * sqrt(parent_visits) / (1 + child_visits)`, uniform priors in Phase 2
 
-### Deduction Rules (21 active, 1 stub)
+### Deduction Rules (28 active, 1 stub)
 
-**Parallel/perpendicular**: transitive parallel, perp-to-parallel, perp+parallel transfer, parallel+collinear extension, perp+collinear extension, parallel shared point collinear
+**Parallel/perpendicular**: transitive parallel, perp-to-parallel, perp+parallel transfer, parallel+collinear extension, perp+collinear extension, parallel shared point collinear, two equidistant points perpendicular
 
-**Congruence/midpoint**: transitive congruent, midpoint definition, midpoint converse, equidistant midpoint, perpendicular bisector
+**Congruence/midpoint**: transitive congruent, midpoint definition, midpoint converse, equidistant midpoint, perpendicular bisector, isosceles converse, perp+midpoint congruent, midpoint diagonal parallelogram, cyclic equal angle congruent
 
-**Angles**: isosceles base angles, alternate interior angles, transitive equal angle, perpendicular right angles, equal angles to parallel, cyclic inscribed angles
+**Angles**: isosceles base angles, alternate interior angles, transitive equal angle, perpendicular right angles, equal angles to parallel, cyclic inscribed angles, inscribed angle converse
 
-**Circles**: circle-point equidistance, congruent to OnCircle, cyclic from OnCircle
+**Circles**: circle-point equidistance, congruent to OnCircle, cyclic from OnCircle, Thales' theorem
 
 **Collinearity**: collinear transitivity, midline parallel
 
@@ -103,7 +103,7 @@ a b c = triangle; h = on_tline b a c, on_tline c a b ? perp a h b c
 ## Build & Test
 
 ```bash
-cargo test                                          # all 282 tests
+cargo test                                          # all 308 tests
 cargo clippy                                        # lint
 cargo test --test test_integration -- --nocapture   # integration tests with output
 maturin develop                                     # build PyO3 extension (Phase 3+)
