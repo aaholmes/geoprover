@@ -441,4 +441,121 @@ mod tests {
         );
         assert_eq!(node_depth(&grandchild), 2);
     }
+
+    // --- New coverage tests ---
+
+    #[test]
+    fn test_node_depth_three_levels() {
+        let state = ProofState::new();
+        let root = MctsNode::new_root(state);
+        let make_action = |ctype, args: Vec<u16>| crate::construction::Construction {
+            ctype,
+            args,
+            priority: crate::construction::Priority::Exploratory,
+        };
+        let child = MctsNode::new_child(
+            &root,
+            make_action(crate::construction::ConstructionType::Midpoint, vec![0, 1]),
+            ProofState::new(),
+        );
+        let grandchild = MctsNode::new_child(
+            &child,
+            make_action(crate::construction::ConstructionType::Altitude, vec![0, 1, 2]),
+            ProofState::new(),
+        );
+        let great_grandchild = MctsNode::new_child(
+            &grandchild,
+            make_action(crate::construction::ConstructionType::Circumcenter, vec![0, 1, 2]),
+            ProofState::new(),
+        );
+        assert_eq!(node_depth(&great_grandchild), 3);
+    }
+
+    #[test]
+    fn test_select_leaf_deep_tree() {
+        // Build a 3-level tree and verify select_leaf traverses to an unvisited node
+        let mut state = ProofState::new();
+        state.add_object("a", ObjectType::Point);
+        state.add_object("b", ObjectType::Point);
+        state.add_object("c", ObjectType::Point);
+        let root = MctsNode::new_root(state);
+
+        // Expand root, creating children
+        MctsNode::expand(&root, 5);
+        let config = MctsConfig::default();
+
+        // Visit first child so select_leaf might go deeper
+        let first_child = Rc::clone(&root.borrow().children[0]);
+        let val = MctsNode::evaluate(&first_child);
+        MctsNode::backprop(&first_child, val);
+
+        // Expand first child
+        MctsNode::expand(&first_child, 5);
+
+        // select_leaf should find an unvisited node (either sibling of first_child or child of first_child)
+        let leaf = select_leaf(&root, &config);
+        assert!(leaf.borrow().visits == 0 || leaf.borrow().children.is_empty());
+    }
+
+    #[test]
+    fn test_mcts_max_depth_zero() {
+        // max_depth=0 means no expansion should occur
+        let mut state = ProofState::new();
+        let a = state.add_object("a", ObjectType::Point);
+        let b = state.add_object("b", ObjectType::Point);
+        let c = state.add_object("c", ObjectType::Point);
+        state.set_goal(Relation::collinear(a, b, c));
+
+        let config = MctsConfig {
+            num_iterations: 50,
+            max_children: 10,
+            c_puct: 1.4,
+            max_depth: 0,
+        };
+        let result = mcts_search(state, &config);
+        // Can't prove collinearity with no expansion
+        assert!(!result.solved);
+        assert_eq!(result.iterations, 50);
+    }
+
+    #[test]
+    fn test_mcts_max_children_one() {
+        // With max_children=1, only one child per expansion
+        let mut state = ProofState::new();
+        let a = state.add_object("a", ObjectType::Point);
+        let b = state.add_object("b", ObjectType::Point);
+        state.add_object("c", ObjectType::Point);
+        state.set_goal(Relation::congruent(a, 3, 3, b));
+
+        let config = MctsConfig {
+            num_iterations: 500,
+            max_children: 1,
+            c_puct: 1.4,
+            max_depth: 2,
+        };
+        let result = mcts_search(state, &config);
+        // May or may not solve, but should not crash
+        // The single-child search is more restrictive but valid
+        assert!(result.iterations > 0);
+    }
+
+    #[test]
+    fn test_mcts_single_iteration() {
+        // With num_iterations=1, should run exactly one iteration
+        let mut state = ProofState::new();
+        let a = state.add_object("a", ObjectType::Point);
+        let b = state.add_object("b", ObjectType::Point);
+        state.add_object("c", ObjectType::Point);
+        state.set_goal(Relation::collinear(a, b, 2));
+
+        let config = MctsConfig {
+            num_iterations: 1,
+            max_children: 10,
+            c_puct: 1.4,
+            max_depth: 2,
+        };
+        let result = mcts_search(state, &config);
+        assert!(!result.solved);
+        assert_eq!(result.iterations, 1);
+    }
 }

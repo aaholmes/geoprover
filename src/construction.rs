@@ -748,4 +748,104 @@ mod tests {
         // Goal should be preserved in the new state
         assert_eq!(new_state.goal, Some(Relation::congruent(a, b, a, c)));
     }
+
+    // --- New coverage tests ---
+
+    #[test]
+    fn test_apply_reflect_point_construction() {
+        // ReflectPoint hits the default `_` arm — should create a generic point
+        let state = make_triangle();
+        let a = state.id("a");
+        let b = state.id("b");
+        let construction = Construction {
+            ctype: ConstructionType::ReflectPoint,
+            args: vec![a, b],
+            priority: Priority::Exploratory,
+        };
+        let new_state = apply_construction(&state, &construction);
+        assert_eq!(new_state.objects.len(), 4); // original 3 + 1 new
+        // No specific facts added (default arm)
+        assert_eq!(new_state.facts.len(), 0);
+    }
+
+    #[test]
+    fn test_apply_extend_segment_construction() {
+        // ExtendSegment hits the default `_` arm
+        let state = make_triangle();
+        let a = state.id("a");
+        let b = state.id("b");
+        let construction = Construction {
+            ctype: ConstructionType::ExtendSegment,
+            args: vec![a, b],
+            priority: Priority::Exploratory,
+        };
+        let new_state = apply_construction(&state, &construction);
+        assert_eq!(new_state.objects.len(), 4);
+    }
+
+    #[test]
+    fn test_generate_constructions_cyclic_goal() {
+        // Cyclic goal involves 4 points → constructions involving those points are GoalRelevant
+        let mut state = ProofState::new();
+        let a = state.add_object("a", ObjectType::Point);
+        let b = state.add_object("b", ObjectType::Point);
+        let c = state.add_object("c", ObjectType::Point);
+        let d = state.add_object("d", ObjectType::Point);
+        state.set_goal(Relation::cyclic(a, b, c, d));
+        let constructions = generate_constructions(&state);
+        // All constructions should be GoalRelevant since goal involves all 4 points
+        assert!(constructions.iter().all(|c| c.priority == Priority::GoalRelevant));
+        assert!(!constructions.is_empty());
+    }
+
+    #[test]
+    fn test_generate_constructions_oncircle_goal() {
+        // OnCircle goal involves 2 points
+        let mut state = ProofState::new();
+        let a = state.add_object("a", ObjectType::Point);
+        let b = state.add_object("b", ObjectType::Point);
+        let _c = state.add_object("c", ObjectType::Point);
+        state.set_goal(Relation::on_circle(a, b));
+        let constructions = generate_constructions(&state);
+        // Constructions involving a or b should be GoalRelevant
+        let goal_relevant: Vec<_> = constructions.iter()
+            .filter(|con| con.priority == Priority::GoalRelevant)
+            .collect();
+        assert!(!goal_relevant.is_empty());
+    }
+
+    #[test]
+    fn test_generate_constructions_empty_state() {
+        // No points → no constructions
+        let state = ProofState::new();
+        let constructions = generate_constructions(&state);
+        assert!(constructions.is_empty());
+    }
+
+    #[test]
+    fn test_generate_constructions_single_point() {
+        // One point → no pair-based constructions (midpoints need 2, etc.)
+        let mut state = ProofState::new();
+        state.add_object("a", ObjectType::Point);
+        let constructions = generate_constructions(&state);
+        assert!(constructions.is_empty());
+    }
+
+    #[test]
+    fn test_generate_constructions_two_points() {
+        // Two points → midpoint only (altitude, circumcenter, etc. need 3)
+        let mut state = ProofState::new();
+        state.add_object("a", ObjectType::Point);
+        state.add_object("b", ObjectType::Point);
+        let constructions = generate_constructions(&state);
+        let midpoints: Vec<_> = constructions.iter()
+            .filter(|c| c.ctype == ConstructionType::Midpoint)
+            .collect();
+        assert_eq!(midpoints.len(), 1); // Only (a,b)
+        // No altitudes, circumcenters, etc.
+        let triples: Vec<_> = constructions.iter()
+            .filter(|c| matches!(c.ctype, ConstructionType::Circumcenter | ConstructionType::Altitude | ConstructionType::Orthocenter | ConstructionType::Incenter))
+            .collect();
+        assert!(triples.is_empty());
+    }
 }

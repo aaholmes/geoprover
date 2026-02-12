@@ -1565,4 +1565,121 @@ mod tests {
         assert!(state.facts.contains(&Relation::congruent(a, d, a, b)));
         assert!(state.facts.contains(&Relation::perpendicular(a, d, a, b)));
     }
+
+    // --- New coverage tests ---
+
+    #[test]
+    fn test_parse_circumcenter_oncircle_facts() {
+        // Circumcenter should generate OnCircle facts for all three vertices
+        let input = "test\na b c = triangle; o = circumcenter a b c ? cong o a o b";
+        let state = parse_problem(input).unwrap();
+        let o = state.id("o");
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        assert!(state.facts.contains(&Relation::on_circle(a, o)));
+        assert!(state.facts.contains(&Relation::on_circle(b, o)));
+        assert!(state.facts.contains(&Relation::on_circle(c, o)));
+    }
+
+    #[test]
+    fn test_parse_circle_oncircle_facts() {
+        // circle predicate should generate OnCircle facts
+        let input = "test\na b c = triangle; o = circle o a b c ? cong o a o b";
+        let state = parse_problem(input).unwrap();
+        let o = state.id("o");
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        assert!(state.facts.contains(&Relation::on_circle(a, o)));
+        assert!(state.facts.contains(&Relation::on_circle(b, o)));
+        assert!(state.facts.contains(&Relation::on_circle(c, o)));
+    }
+
+    #[test]
+    fn test_parse_on_circle_oncircle_facts() {
+        // on_circle predicate should generate OnCircle facts for both points
+        let input = "test\na b c = triangle; x = on_circle o a ? cong o x o a";
+        let state = parse_problem(input).unwrap();
+        let o = state.id("o");
+        let x = state.id("x");
+        let a = state.id("a");
+        assert!(state.facts.contains(&Relation::on_circle(x, o)));
+        assert!(state.facts.contains(&Relation::on_circle(a, o)));
+    }
+
+    #[test]
+    fn test_parse_segment_standalone() {
+        // segment creates exactly two points with no facts
+        let input = "test\na b = segment ? coll a b a";
+        let state = parse_problem(input).unwrap();
+        assert!(state.try_id("a").is_some());
+        assert!(state.try_id("b").is_some());
+        assert_eq!(state.objects.len(), 2);
+        assert!(state.facts.is_empty());
+    }
+
+    #[test]
+    fn test_error_lookup_in_multi_constraint() {
+        // Second action references undefined point z
+        let input = "test\na b c = triangle; x = on_line a b, on_line z b ? coll a b c";
+        let result = parse_problem(input);
+        // This should succeed because ensure_point creates z on the fly
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_on_pline_fewer_args() {
+        // on_pline with fewer than 3 args — should still create output point
+        let input = "test\na b = segment; x = on_pline a b ? coll x a b";
+        let state = parse_problem(input).unwrap();
+        assert!(state.try_id("x").is_some());
+    }
+
+    #[test]
+    fn test_parse_midpoint_congruent_fact() {
+        // Midpoint should add congruent(a,m,m,b) fact
+        let input = "test\na b = segment; m = midpoint a b ? cong a m m b";
+        let state = parse_problem(input).unwrap();
+        let a = state.id("a");
+        let b = state.id("b");
+        let m = state.id("m");
+        assert!(state.facts.contains(&Relation::congruent(a, m, m, b)));
+    }
+
+    #[test]
+    fn test_parse_eqdistance_congruent_fact() {
+        // eqdistance x a b c → |XA| = |BC| (verify the congruent fact, not just point creation)
+        let input = "test\na b c = triangle; x = eqdistance a b c ? cong x a b c";
+        let state = parse_problem(input).unwrap();
+        let x = state.id("x");
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        assert!(state.facts.contains(&Relation::congruent(x, a, b, c)));
+    }
+
+    #[test]
+    fn test_parse_shift_parallel_and_congruent() {
+        // shift x a b c → Parallel(a,b, c,x) AND Congruent(a,b, c,x)
+        let input = "test\na b c = triangle; x = shift a b c ? cong a b c x";
+        let state = parse_problem(input).unwrap();
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        let x = state.id("x");
+        assert!(state.facts.contains(&Relation::parallel(a, b, c, x)));
+        assert!(state.facts.contains(&Relation::congruent(a, b, c, x)));
+    }
+
+    #[test]
+    fn test_parse_on_dia_perpendicular_fact() {
+        // on_dia x a b → Perpendicular(a,x, b,x) (angle AXB = 90)
+        let input = "test\na b = segment; x = on_dia a b ? perp a x b x";
+        let state = parse_problem(input).unwrap();
+        let a = state.id("a");
+        let b = state.id("b");
+        let x = state.id("x");
+        assert!(state.facts.contains(&Relation::perpendicular(a, x, b, x)));
+    }
 }

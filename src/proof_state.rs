@@ -479,4 +479,63 @@ mod tests {
         }
         assert_eq!(state.objects.len(), 100);
     }
+
+    // --- New coverage tests ---
+
+    #[test]
+    fn test_equal_angle_ray_normalization_a_greater_than_c() {
+        // When a > c in angle(a,b,c), it should flip to angle(c,b,a)
+        // Then both triples get sorted lex
+        let r1 = Relation::equal_angle(5, 1, 2, 3, 4, 0);
+        let r2 = Relation::equal_angle(2, 1, 5, 0, 4, 3);
+        assert_eq!(r1, r2);
+    }
+
+    #[test]
+    fn test_equal_angle_both_triples_flipped() {
+        // Both triples need normalization (a > c in both)
+        let r1 = Relation::equal_angle(5, 3, 1, 4, 2, 0);
+        // After normalization: t1 = (1,3,5), t2 = (0,2,4)
+        // Sorted: (0,2,4) < (1,3,5), so stored as EqualAngle(0,2,4,1,3,5)
+        let r2 = Relation::equal_angle(0, 2, 4, 1, 3, 5);
+        assert_eq!(r1, r2);
+    }
+
+    #[test]
+    fn test_on_circle_distinct_from_reversed() {
+        // OnCircle(point, center) is NOT the same as OnCircle(center, point)
+        let r1 = Relation::on_circle(1, 2);
+        let r2 = Relation::on_circle(2, 1);
+        assert_ne!(r1, r2);
+    }
+
+    #[test]
+    fn test_midpoint_canonical_same_regardless_of_order() {
+        // midpoint(m, a, b) == midpoint(m, b, a) for any m,a,b
+        let r1 = Relation::midpoint(5, 10, 3);
+        let r2 = Relation::midpoint(5, 3, 10);
+        assert_eq!(r1, r2);
+        // Both should store as Midpoint(5, 3, 10)
+        assert_eq!(r1, Relation::Midpoint(5, 3, 10));
+    }
+
+    #[test]
+    fn test_congruent_all_permutations_equal() {
+        // |AB| = |CD| should be the same regardless of segment order and pair order
+        let base = Relation::congruent(0, 3, 1, 2);
+        assert_eq!(base, Relation::congruent(3, 0, 1, 2));
+        assert_eq!(base, Relation::congruent(1, 2, 0, 3));
+        assert_eq!(base, Relation::congruent(2, 1, 3, 0));
+    }
+
+    #[test]
+    fn test_add_fact_returns_false_for_duplicate() {
+        let mut state = ProofState::new();
+        state.add_object("a", ObjectType::Point);
+        state.add_object("b", ObjectType::Point);
+        state.add_object("c", ObjectType::Point);
+        assert!(state.add_fact(Relation::collinear(0, 1, 2)));
+        assert!(!state.add_fact(Relation::collinear(0, 1, 2)));
+        assert!(!state.add_fact(Relation::collinear(2, 1, 0))); // same canonical form
+    }
 }

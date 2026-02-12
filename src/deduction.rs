@@ -1860,4 +1860,181 @@ mod tests {
         state.set_goal(Relation::collinear(b, c, d));
         assert!(saturate(&mut state));
     }
+
+    // --- New coverage tests ---
+
+    #[test]
+    fn test_saturate_max_iterations_limit() {
+        // Create a state that generates new facts each iteration but never proves goal.
+        // The loop should stop at MAX_SATURATE_ITERATIONS (50).
+        let mut state = make_state_with_points(&["a", "b", "c", "d", "e", "f", "g", "h"]);
+        let (a, b, c, d, e, f, g, h) = (
+            state.id("a"), state.id("b"), state.id("c"), state.id("d"),
+            state.id("e"), state.id("f"), state.id("g"), state.id("h"),
+        );
+        // Add many congruence chains to generate lots of transitive facts
+        state.add_fact(Relation::congruent(a, b, c, d));
+        state.add_fact(Relation::congruent(c, d, e, f));
+        state.add_fact(Relation::congruent(e, f, g, h));
+        // Set an impossible goal
+        state.set_goal(Relation::collinear(a, b, c));
+        // Should terminate (not hang) and return false
+        assert!(!saturate(&mut state));
+    }
+
+    #[test]
+    fn test_degenerate_parallel_filtered() {
+        // Parallel lines sharing a point should be filtered out as degenerate
+        let mut state = make_state_with_points(&["a", "b", "c", "d", "e", "f"]);
+        let (a, b, c, d, e, f) = (
+            state.id("a"), state.id("b"), state.id("c"),
+            state.id("d"), state.id("e"), state.id("f"),
+        );
+        // AB ∥ CD and CD ∥ AE: transitive would give AB ∥ AE (degenerate, shares A)
+        state.add_fact(Relation::parallel(a, b, c, d));
+        state.add_fact(Relation::parallel(c, d, a, e));
+        saturate(&mut state);
+        // AB ∥ AE should NOT be in facts (degenerate: shares point a)
+        assert!(!state.facts.contains(&Relation::parallel(a, b, a, e)));
+        // But AB ∥ CD and CD ∥ AE should remain
+        assert!(state.facts.contains(&Relation::parallel(a, b, c, d)));
+        let _ = f; // unused
+    }
+
+    #[test]
+    fn test_equidistant_midpoint_no_collinear() {
+        // |EA| = |EB| but NOT collinear(A,E,B) → should NOT derive midpoint
+        let mut state = make_state_with_points(&["a", "e", "b"]);
+        let (a, e, b) = (state.id("a"), state.id("e"), state.id("b"));
+        state.add_fact(Relation::congruent(e, a, e, b));
+        // No collinear fact
+        state.set_goal(Relation::midpoint(e, a, b));
+        assert!(!saturate(&mut state));
+    }
+
+    #[test]
+    fn test_congruent_derives_oncircle_basic() {
+        // Congruent(center, a, center, b) → OnCircle(a, center) and OnCircle(b, center)
+        let mut state = make_state_with_points(&["o", "a", "b"]);
+        let (o, a, b) = (state.id("o"), state.id("a"), state.id("b"));
+        state.add_fact(Relation::congruent(o, a, o, b));
+        saturate(&mut state);
+        assert!(state.facts.contains(&Relation::on_circle(a, o)));
+        assert!(state.facts.contains(&Relation::on_circle(b, o)));
+    }
+
+    #[test]
+    fn test_midline_parallel_shared_a1_b2() {
+        // Midpoint(m, a, b) ∧ Midpoint(n, c, a) → shared a (a1==b2) → Parallel(m, n, b, c)
+        let mut state = make_state_with_points(&["a", "b", "c", "m", "n"]);
+        let (a, b, c, m, n) = (
+            state.id("a"), state.id("b"), state.id("c"),
+            state.id("m"), state.id("n"),
+        );
+        state.add_fact(Relation::midpoint(m, a, b));
+        state.add_fact(Relation::midpoint(n, c, a));
+        state.set_goal(Relation::parallel(m, n, b, c));
+        assert!(saturate(&mut state));
+    }
+
+    #[test]
+    fn test_midline_parallel_shared_b1_a2() {
+        // Midpoint(m, a, b) ∧ Midpoint(n, b, c) → shared b (b1==a2) → Parallel(m, n, a, c)
+        let mut state = make_state_with_points(&["a", "b", "c", "m", "n"]);
+        let (a, b, c, m, n) = (
+            state.id("a"), state.id("b"), state.id("c"),
+            state.id("m"), state.id("n"),
+        );
+        state.add_fact(Relation::midpoint(m, a, b));
+        state.add_fact(Relation::midpoint(n, b, c));
+        state.set_goal(Relation::parallel(m, n, a, c));
+        assert!(saturate(&mut state));
+    }
+
+    #[test]
+    fn test_collinear_transitivity_no_shared_points() {
+        // Two collinear triples with no shared points → no deduction
+        let mut state = make_state_with_points(&["a", "b", "c", "d", "e", "f"]);
+        let (a, b, c, d, e, f) = (
+            state.id("a"), state.id("b"), state.id("c"),
+            state.id("d"), state.id("e"), state.id("f"),
+        );
+        state.add_fact(Relation::collinear(a, b, c));
+        state.add_fact(Relation::collinear(d, e, f));
+        state.set_goal(Relation::collinear(a, d, f));
+        assert!(!saturate(&mut state));
+    }
+
+    #[test]
+    fn test_is_collinear_pair_helper_direct() {
+        let collinears = vec![(0u16, 1, 2), (3, 4, 5)];
+        assert!(is_collinear_pair(0, 1, &collinears));
+        assert!(is_collinear_pair(1, 2, &collinears));
+        assert!(is_collinear_pair(0, 2, &collinears));
+        assert!(!is_collinear_pair(0, 3, &collinears));
+        assert!(!is_collinear_pair(1, 4, &collinears));
+        assert!(is_collinear_pair(3, 5, &collinears));
+    }
+
+    #[test]
+    fn test_perp_angles_a_equals_c_pattern() {
+        // Perp(a,b,a,d) → a==c → right angle at a: angle(b,a,d)
+        // Plus another right angle: Perp(e,f,e,g) → angle(f,e,g)
+        // Both should be equal
+        let mut state = make_state_with_points(&["a", "b", "d", "e", "f", "g"]);
+        let (a, b, d, e, f, g) = (
+            state.id("a"), state.id("b"), state.id("d"),
+            state.id("e"), state.id("f"), state.id("g"),
+        );
+        state.add_fact(Relation::perpendicular(a, b, a, d));
+        state.add_fact(Relation::perpendicular(e, f, e, g));
+        state.set_goal(Relation::equal_angle(b, a, d, f, e, g));
+        assert!(saturate(&mut state));
+    }
+
+    #[test]
+    fn test_perp_angles_a_equals_d_pattern() {
+        // Perp(a,b,c,a) → lines (a,b) and (c,a), shared point a
+        // a==d case: right angle at a: angle(b,a,c)
+        let mut state = make_state_with_points(&["a", "b", "c", "d", "e", "f"]);
+        let (a, b, c, d, e, f) = (
+            state.id("a"), state.id("b"), state.id("c"),
+            state.id("d"), state.id("e"), state.id("f"),
+        );
+        state.add_fact(Relation::perpendicular(a, b, c, a));
+        state.add_fact(Relation::perpendicular(d, e, e, f));
+        state.set_goal(Relation::equal_angle(b, a, c, d, e, f));
+        assert!(saturate(&mut state));
+    }
+
+    #[test]
+    fn test_equal_angles_to_parallel_guards_same_ray() {
+        // If the "other rays" from both vertices point to the same point (apex of isosceles),
+        // the rule should NOT produce a parallel (false positive guard).
+        let mut state = make_state_with_points(&["a", "b", "p"]);
+        let (a, b, p) = (state.id("a"), state.id("b"), state.id("p"));
+        // angle(p, a, b) = angle(p, b, a) — isosceles base angles, both other rays point to p
+        state.add_fact(Relation::equal_angle(p, a, b, p, b, a));
+        state.add_fact(Relation::collinear(a, p, b)); // p actually between a and b (degenerate)
+        // Should NOT derive Parallel(a,p, b,p) since other_ray1 == other_ray2 == p
+        saturate(&mut state);
+        assert!(!state.facts.contains(&Relation::parallel(a, p, b, p)));
+    }
+
+    #[test]
+    fn test_perpendicular_bisector_derives_perp_fact() {
+        // Two equidistant points from A,B with intersection E on line AB
+        // Should derive Perpendicular(P,Q, A,B) in addition to midpoint
+        let mut state = make_state_with_points(&["a", "b", "p", "q", "e"]);
+        let (a, b, p, q, e) = (
+            state.id("a"), state.id("b"), state.id("p"),
+            state.id("q"), state.id("e"),
+        );
+        state.add_fact(Relation::congruent(p, a, p, b));
+        state.add_fact(Relation::congruent(q, a, q, b));
+        state.add_fact(Relation::collinear(p, q, e));
+        state.add_fact(Relation::collinear(a, e, b));
+        state.set_goal(Relation::perpendicular(p, q, a, b));
+        assert!(saturate(&mut state));
+    }
 }
