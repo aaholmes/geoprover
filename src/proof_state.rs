@@ -127,6 +127,23 @@ impl Relation {
             right.0 .0, right.0 .1, right.1 .0, right.1 .1,
         )
     }
+
+    /// Return the set of point IDs involved in this relation.
+    pub fn point_ids(&self) -> Vec<u16> {
+        match self {
+            Relation::Collinear(a, b, c) => vec![*a, *b, *c],
+            Relation::Parallel(a, b, c, d) => vec![*a, *b, *c, *d],
+            Relation::Perpendicular(a, b, c, d) => vec![*a, *b, *c, *d],
+            Relation::Congruent(a, b, c, d) => vec![*a, *b, *c, *d],
+            Relation::EqualAngle(a, b, c, d, e, f) => vec![*a, *b, *c, *d, *e, *f],
+            Relation::Midpoint(m, a, b) => vec![*m, *a, *b],
+            Relation::OnCircle(p, c) => vec![*p, *c],
+            Relation::Cyclic(a, b, c, d) => vec![*a, *b, *c, *d],
+            Relation::EqualRatio(a, b, c, d, e, f, g, h) => {
+                vec![*a, *b, *c, *d, *e, *f, *g, *h]
+            }
+        }
+    }
 }
 
 #[derive(Debug)]

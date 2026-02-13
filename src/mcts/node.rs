@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 
 use crate::construction::{apply_construction, generate_constructions, Construction};
-use crate::deduction::saturate;
+use crate::deduction::{saturate_with_config, SaturateConfig};
 use crate::proof_state::ProofState;
 
 pub type NodeRef = Rc<RefCell<MctsNode>>;
@@ -91,8 +91,8 @@ impl MctsNode {
             return v;
         }
 
-        // Run deduction to fixed point
-        if saturate(&mut n.state) {
+        // Run deduction to fixed point (lightweight config for MCTS nodes)
+        if saturate_with_config(&mut n.state, &SaturateConfig::mcts_fast()) {
             n.terminal_value = Some(1.0);
             return 1.0;
         }

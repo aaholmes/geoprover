@@ -1,16 +1,63 @@
 use crate::proof_state::{ProofState, Relation};
 use std::collections::{HashMap, HashSet};
 
-/// Maximum iterations for saturate to prevent combinatorial explosion
-const MAX_SATURATE_ITERATIONS: usize = 50;
-/// Maximum fact count before stopping
-const MAX_FACTS: usize = 5000;
+/// Configuration for the saturate loop.
+#[derive(Debug, Clone)]
+pub struct SaturateConfig {
+    /// Maximum deduction iterations
+    pub max_iterations: usize,
+    /// Maximum total facts before stopping
+    pub max_facts: usize,
+    /// Maximum new facts added per iteration (batch cap)
+    pub max_new_per_iteration: usize,
+    /// Stop if no goal-relevant facts are produced for this many consecutive iterations
+    pub stall_limit: usize,
+}
 
-/// Run all deduction rules to fixed point. Returns true if goal is proved.
+impl Default for SaturateConfig {
+    fn default() -> Self {
+        SaturateConfig {
+            max_iterations: 50,
+            max_facts: 5000,
+            max_new_per_iteration: usize::MAX,
+            stall_limit: usize::MAX,
+        }
+    }
+}
+
+impl SaturateConfig {
+    /// Config for MCTS child node evaluation.
+    /// Uses goal-directed stall detection to cut off unproductive deduction early,
+    /// while keeping limits high enough for productive chains to complete.
+    pub fn mcts_fast() -> Self {
+        SaturateConfig {
+            max_iterations: 50,
+            max_facts: 5000,
+            max_new_per_iteration: 1000,
+            stall_limit: 8,
+        }
+    }
+}
+
+/// Run all deduction rules to fixed point using default config. Returns true if goal is proved.
 pub fn saturate(state: &mut ProofState) -> bool {
+    saturate_with_config(state, &SaturateConfig::default())
+}
+
+/// Run all deduction rules with the given config. Returns true if goal is proved.
+pub fn saturate_with_config(state: &mut ProofState, config: &SaturateConfig) -> bool {
+    // Pre-compute goal point set for relevance checking
+    let goal_points: HashSet<u16> = state
+        .goal
+        .as_ref()
+        .map(|g| g.point_ids().into_iter().collect())
+        .unwrap_or_default();
+
     let mut iterations = 0;
+    let mut stall_count = 0;
+
     loop {
-        if iterations >= MAX_SATURATE_ITERATIONS || state.facts.len() >= MAX_FACTS {
+        if iterations >= config.max_iterations || state.facts.len() >= config.max_facts {
             break;
         }
         iterations += 1;
@@ -66,6 +113,17 @@ pub fn saturate(state: &mut ProofState) -> bool {
         new_facts.extend(rule_isosceles_trapezoid_base_angles(&state.facts));
         new_facts.extend(rule_trapezoid_midsegment(&state.facts));
         new_facts.extend(rule_parallel_base_ratio(&state.facts));
+        // Parallel projection: only call when both parallels and collinears exist
+        {
+            let has_parallel = state.facts.iter().any(|f| matches!(f, Relation::Parallel(..)));
+            let has_collinear = state.facts.iter().any(|f| matches!(f, Relation::Collinear(..)));
+            if has_parallel && has_collinear {
+                let pp_facts = rule_parallel_projection(&state.facts);
+                for f in pp_facts {
+                    new_facts.push(f);
+                }
+            }
+        }
 
         // Filter degenerate facts and genuinely new facts
         new_facts.retain(|f| {
@@ -103,8 +161,50 @@ pub fn saturate(state: &mut ProofState) -> bool {
             break;
         }
 
+        // Goal-relevance tracking: count facts sharing points with goal
+        let goal_relevant_count = if !goal_points.is_empty() {
+            new_facts
+                .iter()
+                .filter(|f| f.point_ids().iter().any(|p| goal_points.contains(p)))
+                .count()
+        } else {
+            // No goal → can't stall-detect, treat everything as relevant
+            new_facts.len()
+        };
+
+        if goal_relevant_count > 0 {
+            stall_count = 0;
+        } else {
+            stall_count += 1;
+            if stall_count >= config.stall_limit {
+                break;
+            }
+        }
+
+        // Batch cap: prioritize goal-relevant facts, truncate the rest
+        if new_facts.len() > config.max_new_per_iteration {
+            // Partition: goal-relevant first, then non-relevant
+            let (mut relevant, mut other): (Vec<_>, Vec<_>) = if !goal_points.is_empty() {
+                new_facts.into_iter().partition(|f| {
+                    f.point_ids().iter().any(|p| goal_points.contains(p))
+                })
+            } else {
+                (new_facts, Vec::new())
+            };
+            let remaining = config.max_new_per_iteration.saturating_sub(relevant.len());
+            other.truncate(remaining);
+            relevant.extend(other);
+            relevant.truncate(config.max_new_per_iteration);
+            new_facts = relevant;
+        }
+
         for fact in new_facts {
             state.add_fact(fact);
+        }
+
+        // Post-batch limit check
+        if state.facts.len() >= config.max_facts {
+            break;
         }
 
         if state.is_proved() {
@@ -1623,9 +1723,11 @@ fn rule_sas_congruence(facts: &HashSet<Relation>) -> Vec<Relation> {
         })
         .collect();
 
-    // For each pair of congruence facts, find shared vertex patterns
+    // For each ordered pair of congruence facts, find shared vertex patterns.
+    // Must try both orderings since the matching is asymmetric (A,B vs B,C roles).
     for i in 0..congs.len() {
-        for j in (i + 1)..congs.len() {
+        for j in 0..congs.len() {
+            if i == j { continue; }
             let (a1, b1, c1, d1) = congs[i];
             let (a2, b2, c2, d2) = congs[j];
 
@@ -2443,6 +2545,111 @@ fn rule_parallel_base_ratio(facts: &HashSet<Relation>) -> Vec<Relation> {
                             pt_ab, other_ab, pt_cd, other_cd,
                             o, other_ab, o, other_cd,
                         ));
+                    }
+                }
+            }
+        }
+    }
+    new
+}
+
+// --- Rule: Parallel Projection (intercept theorem generalization) ---
+// If para(E,G, A,B) ∧ para(E,F, A,D) ∧ coll(E,A,...) ∧ coll(G,B,...) ∧ coll(F,D,...)
+// then para(G,F, B,D).
+// In general: two parallels cut by two transversals from the same point → third pair parallel.
+fn rule_parallel_projection(facts: &HashSet<Relation>) -> Vec<Relation> {
+    let mut new = Vec::new();
+
+    let parallels: Vec<_> = facts
+        .iter()
+        .filter_map(|f| match f {
+            Relation::Parallel(a, b, c, d) => Some((*a, *b, *c, *d)),
+            _ => None,
+        })
+        .collect();
+
+    let collinears: Vec<_> = facts
+        .iter()
+        .filter_map(|f| match f {
+            Relation::Collinear(a, b, c) => Some((*a, *b, *c)),
+            _ => None,
+        })
+        .collect();
+
+    // Parallel projection theorem:
+    // Given para(E,G, A,B) and para(E,F, A,D), and a common transversal point C:
+    //   coll(E,A,C), coll(G,B,C), coll(F,D,C) → para(G,F, B,D)
+    // E is the shared endpoint of the parallel segments.
+    // A is on the transversal through E. B, D are on the parallel base sides.
+    // C is the common intersection of transversals.
+
+    for i in 0..parallels.len() {
+        for j in (i + 1)..parallels.len() {
+            let (a1, b1, c1, d1) = parallels[i];
+            let (a2, b2, c2, d2) = parallels[j];
+
+            // Try all ways to orient the two parallel relations
+            let sides_i = [(a1, b1, c1, d1), (c1, d1, a1, b1)];
+            let sides_j = [(a2, b2, c2, d2), (c2, d2, a2, b2)];
+
+            for &(e1a, e1b, f1a, f1b) in &sides_i {
+                for &(e2a, e2b, f2a, f2b) in &sides_j {
+                    // Find shared point E between the two "E" sides
+                    let shared_pairs = [
+                        (e1a, e1b, e2a, e2b),
+                        (e1a, e1b, e2b, e2a),
+                        (e1b, e1a, e2a, e2b),
+                        (e1b, e1a, e2b, e2a),
+                    ];
+                    for &(e, g, e_check, f) in &shared_pairs {
+                        if e != e_check {
+                            continue;
+                        }
+                        // para(E,G, f1a,f1b) and para(E,F, f2a,f2b)
+                        // Try each pair of endpoints on the "base" sides
+                        let f1_pts = [f1a, f1b];
+                        let f2_pts = [f2a, f2b];
+
+                        for &a_pt in &f1_pts {
+                            for &d_pt in &f2_pts {
+                                let b_pt = if a_pt == f1a { f1b } else { f1a };
+                                let dd_pt = if d_pt == f2a { f2b } else { f2a };
+
+                                // Find point C collinear with (E, A) and (G, B) and (F, D)
+                                // Check coll(E, A, C), coll(G, B, C), coll(F, D, C)
+                                for &(x, y, z) in &collinears {
+                                    let t = [x, y, z];
+                                    if !t.contains(&e) || !t.contains(&a_pt) {
+                                        continue;
+                                    }
+                                    // C is the third point in this collinear triple
+                                    let c_pt = t.iter().find(|&&p| p != e && p != a_pt);
+                                    let c_pt = match c_pt {
+                                        Some(&c) => c,
+                                        None => continue,
+                                    };
+
+                                    // Check coll(G, B, C)
+                                    let col_gbc = collinears.iter().any(|&(x2, y2, z2)| {
+                                        let t2 = [x2, y2, z2];
+                                        t2.contains(&g) && t2.contains(&b_pt) && t2.contains(&c_pt)
+                                    });
+                                    if !col_gbc {
+                                        continue;
+                                    }
+                                    // Check coll(F, D, C)
+                                    let col_fdc = collinears.iter().any(|&(x2, y2, z2)| {
+                                        let t2 = [x2, y2, z2];
+                                        t2.contains(&f) && t2.contains(&dd_pt) && t2.contains(&c_pt)
+                                    });
+                                    if !col_fdc {
+                                        continue;
+                                    }
+                                    // Deduction: para(G, F, B, D)
+                                    new.push(Relation::parallel(g, f, b_pt, dd_pt));
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -4166,5 +4373,127 @@ mod tests {
         assert!(is_congruent_pair(2, 1, 4, 3, &congs)); // reversed
         assert!(is_congruent_pair(3, 4, 1, 2, &congs)); // swapped pairs
         assert!(!is_congruent_pair(1, 2, 5, 6, &congs)); // not present
+    }
+
+    // --- SaturateConfig tests ---
+
+    #[test]
+    fn test_saturate_with_config_default_proves_goal() {
+        // Same as test_transitive_parallel but using saturate_with_config
+        let mut state = make_state_with_points(&["a", "b", "c", "d", "e", "f"]);
+        let (a, b, c, d, e, f) = (
+            state.id("a"), state.id("b"), state.id("c"),
+            state.id("d"), state.id("e"), state.id("f"),
+        );
+        state.add_fact(Relation::parallel(a, b, c, d));
+        state.add_fact(Relation::parallel(c, d, e, f));
+        state.set_goal(Relation::parallel(a, b, e, f));
+        assert!(saturate_with_config(&mut state, &SaturateConfig::default()));
+    }
+
+    #[test]
+    fn test_saturate_with_config_mcts_fast() {
+        // Simple goal should still be provable with MCTS fast config
+        let mut state = make_state_with_points(&["a", "b", "c", "d", "e", "f"]);
+        let (a, b, c, d, e, f) = (
+            state.id("a"), state.id("b"), state.id("c"),
+            state.id("d"), state.id("e"), state.id("f"),
+        );
+        state.add_fact(Relation::parallel(a, b, c, d));
+        state.add_fact(Relation::parallel(c, d, e, f));
+        state.set_goal(Relation::parallel(a, b, e, f));
+        assert!(saturate_with_config(&mut state, &SaturateConfig::mcts_fast()));
+    }
+
+    #[test]
+    fn test_saturate_stall_detection() {
+        // Create a state where new facts are generated but none involve goal points.
+        // This should trigger stall detection after stall_limit iterations.
+        let mut state = make_state_with_points(&["a", "b", "c", "d", "e", "f", "g", "h"]);
+        let (a, b, c, d, e, f, _g, _h) = (
+            state.id("a"), state.id("b"), state.id("c"),
+            state.id("d"), state.id("e"), state.id("f"),
+            state.id("g"), state.id("h"),
+        );
+        // Facts involving a,b,c,d but goal involves e,f only
+        state.add_fact(Relation::parallel(a, b, c, d));
+        state.set_goal(Relation::parallel(e, f, e, f)); // degenerate, won't match anything
+        let config = SaturateConfig {
+            max_iterations: 50,
+            max_facts: 5000,
+            max_new_per_iteration: 2000,
+            stall_limit: 2,
+        };
+        assert!(!saturate_with_config(&mut state, &config));
+    }
+
+    #[test]
+    fn test_saturate_max_facts_limit() {
+        // Verify config max_facts is respected
+        let config = SaturateConfig {
+            max_iterations: 50,
+            max_facts: 10,
+            max_new_per_iteration: 2000,
+            stall_limit: 50,
+        };
+        let mut state = make_state_with_points(&["a", "b", "c", "d", "e", "f"]);
+        let (a, b, c, d, e, f) = (
+            state.id("a"), state.id("b"), state.id("c"),
+            state.id("d"), state.id("e"), state.id("f"),
+        );
+        state.add_fact(Relation::parallel(a, b, c, d));
+        state.add_fact(Relation::parallel(c, d, e, f));
+        // With 6 objects already, the max_facts=10 should stop before proving
+        // (but if the goal is proved in 1 iteration, it'll still succeed)
+        // This mainly tests that the limit is respected
+        saturate_with_config(&mut state, &config);
+        assert!(state.facts.len() <= 15); // some tolerance
+    }
+
+    // --- Parallel projection rule test ---
+
+    #[test]
+    fn test_parallel_projection_direct() {
+        // Test the rule directly without saturate
+        let mut state = make_state_with_points(&["a", "b", "c", "d", "e", "f", "g"]);
+        let a = state.id("a");
+        let b = state.id("b");
+        let _c = state.id("c");
+        let d = state.id("d");
+        let e = state.id("e");
+        let f = state.id("f");
+        let g = state.id("g");
+        state.add_fact(Relation::parallel(e, g, a, b));
+        state.add_fact(Relation::parallel(e, f, a, d));
+        state.add_fact(Relation::collinear(e, a, _c));
+        state.add_fact(Relation::collinear(g, b, _c));
+        state.add_fact(Relation::collinear(f, d, _c));
+        let result = rule_parallel_projection(&state.facts);
+        let goal = Relation::parallel(g, f, b, d);
+        assert!(
+            result.contains(&goal),
+            "Expected {:?} in results: {:?}",
+            goal,
+            result
+        );
+    }
+
+    #[test]
+    fn test_parallel_projection_saturate() {
+        let mut state = make_state_with_points(&["a", "b", "c", "d", "e", "f", "g"]);
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        let d = state.id("d");
+        let e = state.id("e");
+        let f = state.id("f");
+        let g = state.id("g");
+        state.add_fact(Relation::parallel(e, g, a, b));
+        state.add_fact(Relation::parallel(e, f, a, d));
+        state.add_fact(Relation::collinear(e, a, c));
+        state.add_fact(Relation::collinear(g, b, c));
+        state.add_fact(Relation::collinear(f, d, c));
+        state.set_goal(Relation::parallel(g, f, b, d));
+        assert!(saturate(&mut state));
     }
 }

@@ -569,6 +569,7 @@ fn parse_action(
         }
         "on_dia" => {
             // `x = on_dia a b` — x on circle with diameter AB → angle AXB = 90
+            // Also creates implicit midpoint M of AB and OnCircle facts
             for name in output_names {
                 state.add_object(name, ObjectType::Point);
             }
@@ -577,6 +578,19 @@ fn parse_action(
                 let a = ensure_point(args[0], state)?;
                 let b = ensure_point(args[1], state)?;
                 state.add_fact(Relation::perpendicular(a, x, b, x));
+                // Implicit midpoint of diameter
+                let mid_name = format!("__dia_mid_{}_{}", args[0], args[1]);
+                let m = state.add_object(&mid_name, ObjectType::Point);
+                state.add_fact(Relation::midpoint(m, a, b));
+                state.add_fact(Relation::collinear(a, m, b));
+                state.add_fact(Relation::congruent(a, m, m, b));
+                // x, a, b all lie on circle centered at M
+                state.add_fact(Relation::on_circle(x, m));
+                state.add_fact(Relation::on_circle(a, m));
+                state.add_fact(Relation::on_circle(b, m));
+                // Equidistance: |MA| = |MX| (radius)
+                state.add_fact(Relation::congruent(m, a, m, x));
+                state.add_fact(Relation::congruent(m, a, m, b));
             }
         }
         "free" => {
