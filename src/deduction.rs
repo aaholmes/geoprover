@@ -113,6 +113,12 @@ pub fn saturate_with_config(state: &mut ProofState, config: &SaturateConfig) -> 
         new_facts.extend(rule_isosceles_trapezoid_base_angles(&state.facts));
         new_facts.extend(rule_trapezoid_midsegment(&state.facts));
         new_facts.extend(rule_parallel_base_ratio(&state.facts));
+        // Tangent rules
+        new_facts.extend(rule_equal_tangent_lengths(&state.facts));
+        new_facts.extend(rule_tangent_chord_angle(&state.facts));
+        // Angle bisector rules
+        new_facts.extend(rule_angle_bisector_ratio(&state.facts));
+        new_facts.extend(rule_incenter_equal_inradii(&state.facts));
         // Parallel projection: only call when both parallels and collinears exist
         {
             let has_parallel = state.facts.iter().any(|f| matches!(f, Relation::Parallel(..)));
@@ -2744,6 +2750,317 @@ fn is_collinear_pair(p1: u16, p2: u16, collinears: &[(u16, u16, u16)]) -> bool {
     false
 }
 
+// --- Rule: Equal Tangent Lengths ---
+// If P is external to circle(O) and X, Y are tangent points on circle(O),
+// then |PX| = |PY|.
+// Detection: perp(O,X, P,X) ∧ on_circle(X,O) means PX is tangent at X.
+// Group by (O, P), emit congruent(P,X, P,Y) for each pair.
+fn rule_equal_tangent_lengths(facts: &HashSet<Relation>) -> Vec<Relation> {
+    let mut new = Vec::new();
+
+    // Collect on_circle facts as a set for fast lookup
+    let oncircle: HashSet<(u16, u16)> = facts
+        .iter()
+        .filter_map(|f| match f {
+            Relation::OnCircle(p, c) => Some((*p, *c)),
+            _ => None,
+        })
+        .collect();
+
+    // Collect perpendicular facts
+    let perps: Vec<(u16, u16, u16, u16)> = facts
+        .iter()
+        .filter_map(|f| match f {
+            Relation::Perpendicular(a, b, c, d) => Some((*a, *b, *c, *d)),
+            _ => None,
+        })
+        .collect();
+
+    // Find tangent triples: (tangent_point, center, external_point)
+    // perp(O,X, P,X) means line OX ⊥ line PX, and X is on circle(O)
+    // In canonical form perp(a,b, c,d): find shared point X between the two line pairs,
+    // then check on_circle(X, other) for the other point on each side.
+    let mut tangent_triples: Vec<(u16, u16, u16)> = Vec::new(); // (tangent_pt, center, external_pt)
+
+    for &(a, b, c, d) in &perps {
+        // Find shared point between line (a,b) and line (c,d)
+        let shared = [
+            (a == c, a, b, d),
+            (a == d, a, b, c),
+            (b == c, b, a, d),
+            (b == d, b, a, c),
+        ];
+        for &(is_match, x, other1, other2) in &shared {
+            if !is_match {
+                continue;
+            }
+            // X is the shared point. Check on_circle(X, other1) or on_circle(X, other2).
+            if oncircle.contains(&(x, other1)) {
+                tangent_triples.push((x, other1, other2));
+            }
+            if oncircle.contains(&(x, other2)) {
+                tangent_triples.push((x, other2, other1));
+            }
+        }
+    }
+
+    // Group by (center, external_point)
+    let mut groups: HashMap<(u16, u16), Vec<u16>> = HashMap::new();
+    for &(tangent_pt, center, ext_pt) in &tangent_triples {
+        groups.entry((center, ext_pt)).or_default().push(tangent_pt);
+    }
+
+    // For each group with 2+ tangent points, emit congruent pairs
+    for ((_center, ext_pt), tangent_pts) in &groups {
+        for i in 0..tangent_pts.len() {
+            for j in (i + 1)..tangent_pts.len() {
+                new.push(Relation::congruent(*ext_pt, tangent_pts[i], *ext_pt, tangent_pts[j]));
+            }
+        }
+    }
+
+    new
+}
+
+// --- Rule: Tangent-Chord Angle ---
+// The angle between a tangent and a chord equals the inscribed angle subtending the same arc.
+// If PX is tangent to circle(O) at X (perp(O,X, P,X) ∧ on_circle(X,O)),
+// and Y is on circle(O), and Z is on circle(O) (Z ≠ X, Z ≠ Y),
+// then angle(P,X,Y) = angle(X,Z,Y).
+fn rule_tangent_chord_angle(facts: &HashSet<Relation>) -> Vec<Relation> {
+    let mut new = Vec::new();
+
+    // Group points by circle center
+    let mut center_to_points: HashMap<u16, Vec<u16>> = HashMap::new();
+    for fact in facts {
+        if let Relation::OnCircle(point, center) = fact {
+            center_to_points
+                .entry(*center)
+                .or_default()
+                .push(*point);
+        }
+    }
+
+    // Collect perpendicular facts
+    let perps: Vec<(u16, u16, u16, u16)> = facts
+        .iter()
+        .filter_map(|f| match f {
+            Relation::Perpendicular(a, b, c, d) => Some((*a, *b, *c, *d)),
+            _ => None,
+        })
+        .collect();
+
+    // Collect on_circle as set
+    let oncircle: HashSet<(u16, u16)> = facts
+        .iter()
+        .filter_map(|f| match f {
+            Relation::OnCircle(p, c) => Some((*p, *c)),
+            _ => None,
+        })
+        .collect();
+
+    // Find tangent triples: (tangent_point X, center O, external_point P)
+    let mut tangent_triples: Vec<(u16, u16, u16)> = Vec::new();
+    for &(a, b, c, d) in &perps {
+        let shared = [
+            (a == c, a, b, d),
+            (a == d, a, b, c),
+            (b == c, b, a, d),
+            (b == d, b, a, c),
+        ];
+        for &(is_match, x, other1, other2) in &shared {
+            if !is_match {
+                continue;
+            }
+            if oncircle.contains(&(x, other1)) {
+                tangent_triples.push((x, other1, other2));
+            }
+            if oncircle.contains(&(x, other2)) {
+                tangent_triples.push((x, other2, other1));
+            }
+        }
+    }
+
+    // For each tangent (X, O, P), find chord endpoints Y on circle(O)
+    for &(x, o, p) in &tangent_triples {
+        if let Some(circle_pts) = center_to_points.get(&o) {
+            for &y in circle_pts {
+                if y == x {
+                    continue;
+                }
+                // For each other point Z on the circle
+                for &z in circle_pts {
+                    if z == x || z == y {
+                        continue;
+                    }
+                    // tangent-chord angle: angle(P,X,Y) = inscribed angle(X,Z,Y)
+                    new.push(Relation::equal_angle(p, x, y, x, z, y));
+                }
+            }
+        }
+    }
+
+    new
+}
+
+// --- Rule: Angle Bisector Ratio ---
+// If the angle bisector of angle BAC meets BC at D:
+//   equal_angle(B,A,D, D,A,C) ∧ collinear(B,D,C) → equal_ratio(B,D, D,C, A,B, A,C)
+// i.e., |BD|/|DC| = |AB|/|AC|
+fn rule_angle_bisector_ratio(facts: &HashSet<Relation>) -> Vec<Relation> {
+    let mut new = Vec::new();
+
+    // Gate: only fire when both EqualAngle and Collinear facts exist
+    let has_eqangle = facts.iter().any(|f| matches!(f, Relation::EqualAngle(..)));
+    let has_collinear = facts.iter().any(|f| matches!(f, Relation::Collinear(..)));
+    if !has_eqangle || !has_collinear {
+        return new;
+    }
+
+    let eqangles: Vec<_> = facts
+        .iter()
+        .filter_map(|f| match f {
+            Relation::EqualAngle(a, b, c, d, e, f) => Some((*a, *b, *c, *d, *e, *f)),
+            _ => None,
+        })
+        .collect();
+
+    let collinears: Vec<_> = facts
+        .iter()
+        .filter_map(|f| match f {
+            Relation::Collinear(a, b, c) => Some((*a, *b, *c)),
+            _ => None,
+        })
+        .collect();
+
+    // Look for bisector pattern: angle(B,A,D) = angle(D,A,C)
+    // In stored form: EqualAngle(a1,v1,c1, a2,v2,c2) where v1==v2 (same vertex A)
+    // and one ray end of one triple equals one ray end of the other (the point D)
+    for &(a1, v1, c1, a2, v2, c2) in &eqangles {
+        if v1 != v2 {
+            continue;
+        }
+        let a_vertex = v1;
+        // The two angle triples are (a1, A, c1) and (a2, A, c2)
+        // We need to find D that appears in both triples as a ray endpoint
+        // Possible bisector patterns: D=c1=a2, D=a1=c2, D=a1=a2, D=c1=c2
+        let d_candidates = [
+            (c1, a2, a1, c2), // D=c1=a2 → rays: a1-A-D, D-A-c2 → B=a1, C=c2
+            (a1, c2, c1, a2), // D=a1=c2 → rays: D-A-c1, a2-A-D → B=c1, C=a2 (symmetric)
+            (a1, a2, c1, c2), // D=a1=a2 → rays: D-A-c1, D-A-c2 → but D appears as first in both
+            (c1, c2, a1, a2), // D=c1=c2 → similar
+        ];
+
+        for &(d1, d2, b, c) in &d_candidates {
+            if d1 != d2 {
+                continue;
+            }
+            let d = d1;
+            if d == a_vertex || b == a_vertex || c == a_vertex || b == c || b == d || c == d {
+                continue;
+            }
+            // Check collinear(B, D, C)
+            let is_collinear = collinears.iter().any(|&(x, y, z)| {
+                let pts = [x, y, z];
+                pts.contains(&b) && pts.contains(&d) && pts.contains(&c)
+            });
+            if is_collinear {
+                // |BD|/|DC| = |AB|/|AC|
+                new.push(Relation::equal_ratio(b, d, d, c, a_vertex, b, a_vertex, c));
+            }
+        }
+    }
+
+    new
+}
+
+// --- Rule: Incenter Equal Inradii ---
+// If I is the incenter of a triangle (detected by having 3 bisector-like equal_angle facts
+// all sharing vertex I), and there exist perpendicular feet from I to sides,
+// then those feet are equidistant from I.
+// Detection: perp(I,P, A,B) where P is a foot on side AB → congruent(I,P, I,Q) for all such feet.
+fn rule_incenter_equal_inradii(facts: &HashSet<Relation>) -> Vec<Relation> {
+    let mut new = Vec::new();
+
+    // Gate: need EqualAngle and Perpendicular facts
+    let has_eqangle = facts.iter().any(|f| matches!(f, Relation::EqualAngle(..)));
+    let has_perp = facts.iter().any(|f| matches!(f, Relation::Perpendicular(..)));
+    if !has_eqangle || !has_perp {
+        return new;
+    }
+
+    let eqangles: Vec<_> = facts
+        .iter()
+        .filter_map(|f| match f {
+            Relation::EqualAngle(a, b, c, d, e, f) => Some((*a, *b, *c, *d, *e, *f)),
+            _ => None,
+        })
+        .collect();
+
+    // Count how many bisector-like equal_angle facts each point appears as vertex in.
+    // A bisector-like fact has the same vertex on both sides: angle(X, I, Y) = angle(Y, I, Z)
+    // where I is vertex in both triples.
+    let mut bisector_vertex_count: HashMap<u16, usize> = HashMap::new();
+    for &(_a1, v1, _c1, _a2, v2, _c2) in &eqangles {
+        if v1 == v2 {
+            *bisector_vertex_count.entry(v1).or_insert(0) += 1;
+        }
+    }
+
+    // An incenter has 3 bisector angle facts, but canonical dedup may collapse to 2 unique.
+    // Require >= 2 bisector-like equal_angle facts sharing the same vertex.
+    let incenters: Vec<u16> = bisector_vertex_count
+        .iter()
+        .filter(|(_, &count)| count >= 2)
+        .map(|(&pt, _)| pt)
+        .collect();
+
+    if incenters.is_empty() {
+        return new;
+    }
+
+    // For each incenter I, find perpendicular feet: perp(I,F, A,B) where F is on line AB
+    // The foot F is the point where perpendicular from I meets side AB.
+    // Pattern: perp(I,F, X,Y) — I,F is one line, X,Y is the side
+    let perps: Vec<(u16, u16, u16, u16)> = facts
+        .iter()
+        .filter_map(|f| match f {
+            Relation::Perpendicular(a, b, c, d) => Some((*a, *b, *c, *d)),
+            _ => None,
+        })
+        .collect();
+
+    for &incenter in &incenters {
+        // Find all foot points: points F where perp(I,F, ...) or perp(..., I,F)
+        let mut feet: Vec<u16> = Vec::new();
+        for &(a, b, c, d) in &perps {
+            // I must be on one side of the perp
+            if a == incenter && b != incenter {
+                feet.push(b);
+            } else if b == incenter && a != incenter {
+                feet.push(a);
+            } else if c == incenter && d != incenter {
+                feet.push(d);
+            } else if d == incenter && c != incenter {
+                feet.push(c);
+            }
+        }
+
+        // Deduplicate feet
+        feet.sort();
+        feet.dedup();
+
+        // Emit congruent(I, F1, I, F2) for all pairs of feet
+        for i in 0..feet.len() {
+            for j in (i + 1)..feet.len() {
+                new.push(Relation::congruent(incenter, feet[i], incenter, feet[j]));
+            }
+        }
+    }
+
+    new
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4495,5 +4812,222 @@ mod tests {
         state.add_fact(Relation::collinear(f, d, c));
         state.set_goal(Relation::parallel(g, f, b, d));
         assert!(saturate(&mut state));
+    }
+
+    // --- Equal tangent lengths rule tests ---
+
+    #[test]
+    fn test_equal_tangent_lengths_direct() {
+        // P external to circle(O), X and Y tangent points
+        // perp(O,X, P,X) and on_circle(X,O)
+        // perp(O,Y, P,Y) and on_circle(Y,O)
+        // → congruent(P,X, P,Y)
+        let mut state = make_state_with_points(&["o", "p", "x", "y"]);
+        let o = state.id("o");
+        let p = state.id("p");
+        let x = state.id("x");
+        let y = state.id("y");
+        state.add_fact(Relation::perpendicular(o, x, p, x));
+        state.add_fact(Relation::on_circle(x, o));
+        state.add_fact(Relation::perpendicular(o, y, p, y));
+        state.add_fact(Relation::on_circle(y, o));
+        let result = rule_equal_tangent_lengths(&state.facts);
+        let goal = Relation::congruent(p, x, p, y);
+        assert!(
+            result.contains(&goal),
+            "Expected {:?} in results: {:?}",
+            goal,
+            result
+        );
+    }
+
+    #[test]
+    fn test_equal_tangent_lengths_saturate() {
+        let mut state = make_state_with_points(&["o", "p", "x", "y"]);
+        let o = state.id("o");
+        let p = state.id("p");
+        let x = state.id("x");
+        let y = state.id("y");
+        state.add_fact(Relation::perpendicular(o, x, p, x));
+        state.add_fact(Relation::on_circle(x, o));
+        state.add_fact(Relation::perpendicular(o, y, p, y));
+        state.add_fact(Relation::on_circle(y, o));
+        state.set_goal(Relation::congruent(p, x, p, y));
+        assert!(saturate(&mut state));
+    }
+
+    #[test]
+    fn test_equal_tangent_lengths_no_circle() {
+        // perp exists but no on_circle → no tangent detected
+        let mut state = make_state_with_points(&["o", "p", "x", "y"]);
+        let o = state.id("o");
+        let p = state.id("p");
+        let x = state.id("x");
+        let y = state.id("y");
+        state.add_fact(Relation::perpendicular(o, x, p, x));
+        state.add_fact(Relation::perpendicular(o, y, p, y));
+        // No on_circle facts
+        let result = rule_equal_tangent_lengths(&state.facts);
+        assert!(result.is_empty());
+    }
+
+    // --- Tangent-chord angle rule tests ---
+
+    #[test]
+    fn test_tangent_chord_angle_direct() {
+        // PX tangent to circle(O) at X, Y and Z on circle
+        // → angle(P,X,Y) = angle(X,Z,Y)
+        let mut state = make_state_with_points(&["o", "p", "x", "y", "z"]);
+        let o = state.id("o");
+        let p = state.id("p");
+        let x = state.id("x");
+        let y = state.id("y");
+        let z = state.id("z");
+        state.add_fact(Relation::perpendicular(o, x, p, x));
+        state.add_fact(Relation::on_circle(x, o));
+        state.add_fact(Relation::on_circle(y, o));
+        state.add_fact(Relation::on_circle(z, o));
+        let result = rule_tangent_chord_angle(&state.facts);
+        let goal = Relation::equal_angle(p, x, y, x, z, y);
+        assert!(
+            result.contains(&goal),
+            "Expected {:?} in results: {:?}",
+            goal,
+            result
+        );
+    }
+
+    #[test]
+    fn test_tangent_chord_angle_saturate() {
+        let mut state = make_state_with_points(&["o", "p", "x", "y", "z"]);
+        let o = state.id("o");
+        let p = state.id("p");
+        let x = state.id("x");
+        let y = state.id("y");
+        let z = state.id("z");
+        state.add_fact(Relation::perpendicular(o, x, p, x));
+        state.add_fact(Relation::on_circle(x, o));
+        state.add_fact(Relation::on_circle(y, o));
+        state.add_fact(Relation::on_circle(z, o));
+        state.set_goal(Relation::equal_angle(p, x, y, x, z, y));
+        assert!(saturate(&mut state));
+    }
+
+    // --- Angle bisector ratio rule tests ---
+
+    #[test]
+    fn test_angle_bisector_ratio_direct() {
+        // Angle bisector of angle BAC meets BC at D
+        // equal_angle(B,A,D, D,A,C) ∧ collinear(B,D,C)
+        // → equal_ratio(B,D, D,C, A,B, A,C)
+        let mut state = make_state_with_points(&["a", "b", "c", "d"]);
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        let d = state.id("d");
+        state.add_fact(Relation::equal_angle(b, a, d, d, a, c));
+        state.add_fact(Relation::collinear(b, d, c));
+        let result = rule_angle_bisector_ratio(&state.facts);
+        let goal = Relation::equal_ratio(b, d, d, c, a, b, a, c);
+        assert!(
+            result.contains(&goal),
+            "Expected {:?} in results: {:?}",
+            goal,
+            result
+        );
+    }
+
+    #[test]
+    fn test_angle_bisector_ratio_saturate() {
+        let mut state = make_state_with_points(&["a", "b", "c", "d"]);
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        let d = state.id("d");
+        state.add_fact(Relation::equal_angle(b, a, d, d, a, c));
+        state.add_fact(Relation::collinear(b, d, c));
+        state.set_goal(Relation::equal_ratio(b, d, d, c, a, b, a, c));
+        assert!(saturate(&mut state));
+    }
+
+    #[test]
+    fn test_angle_bisector_ratio_no_collinear() {
+        // Has equal_angle but no collinear → no ratio emitted
+        let mut state = make_state_with_points(&["a", "b", "c", "d"]);
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        let d = state.id("d");
+        state.add_fact(Relation::equal_angle(b, a, d, d, a, c));
+        // No collinear fact
+        let result = rule_angle_bisector_ratio(&state.facts);
+        assert!(result.is_empty());
+    }
+
+    // --- Incenter equal inradii rule tests ---
+
+    #[test]
+    fn test_incenter_equal_inradii_direct() {
+        // I is incenter with 3 bisector angle facts, P and Q are feet
+        let mut state = make_state_with_points(&["i", "a", "b", "c", "p", "q", "r"]);
+        let i = state.id("i");
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        let p = state.id("p");
+        let q = state.id("q");
+        let r = state.id("r");
+        // 3 bisector angle facts at vertex I
+        state.add_fact(Relation::equal_angle(a, i, b, b, i, c));
+        state.add_fact(Relation::equal_angle(b, i, c, c, i, a));
+        state.add_fact(Relation::equal_angle(a, i, c, c, i, b));
+        // Perpendicular feet from I to sides
+        state.add_fact(Relation::perpendicular(i, p, a, b));
+        state.add_fact(Relation::perpendicular(i, q, b, c));
+        state.add_fact(Relation::perpendicular(i, r, a, c));
+        let result = rule_incenter_equal_inradii(&state.facts);
+        // Should contain congruent(I,P, I,Q), congruent(I,P, I,R), congruent(I,Q, I,R)
+        let g1 = Relation::congruent(i, p, i, q);
+        let g2 = Relation::congruent(i, p, i, r);
+        let g3 = Relation::congruent(i, q, i, r);
+        assert!(result.contains(&g1), "Expected {:?}", g1);
+        assert!(result.contains(&g2), "Expected {:?}", g2);
+        assert!(result.contains(&g3), "Expected {:?}", g3);
+    }
+
+    #[test]
+    fn test_incenter_equal_inradii_saturate() {
+        let mut state = make_state_with_points(&["i", "a", "b", "c", "p", "q"]);
+        let i = state.id("i");
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        let p = state.id("p");
+        let q = state.id("q");
+        state.add_fact(Relation::equal_angle(a, i, b, b, i, c));
+        state.add_fact(Relation::equal_angle(b, i, c, c, i, a));
+        state.add_fact(Relation::equal_angle(a, i, c, c, i, b));
+        state.add_fact(Relation::perpendicular(i, p, a, b));
+        state.add_fact(Relation::perpendicular(i, q, b, c));
+        state.set_goal(Relation::congruent(i, p, i, q));
+        assert!(saturate(&mut state));
+    }
+
+    #[test]
+    fn test_incenter_not_enough_bisectors() {
+        // Only 1 bisector angle fact → not an incenter
+        let mut state = make_state_with_points(&["i", "a", "b", "c", "p", "q"]);
+        let i = state.id("i");
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        let p = state.id("p");
+        let q = state.id("q");
+        state.add_fact(Relation::equal_angle(a, i, b, b, i, a));
+        // Only 1 bisector fact
+        state.add_fact(Relation::perpendicular(i, p, a, b));
+        state.add_fact(Relation::perpendicular(i, q, b, c));
+        let result = rule_incenter_equal_inradii(&state.facts);
+        assert!(result.is_empty());
     }
 }
