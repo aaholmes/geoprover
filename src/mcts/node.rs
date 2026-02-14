@@ -140,7 +140,7 @@ impl MctsNode {
 
 /// Compute delta_D: fraction of goal sub-conditions present in the state.
 /// Simple heuristic for proof distance.
-fn compute_delta_d(state: &ProofState) -> f64 {
+pub fn compute_delta_d(state: &ProofState) -> f64 {
     let goal = match &state.goal {
         Some(g) => g,
         None => return 0.0,
