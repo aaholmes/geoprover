@@ -34,6 +34,34 @@ pub struct Construction {
     pub priority: Priority,
 }
 
+impl Construction {
+    /// Serialize a construction as compact text using object names from the state.
+    ///
+    /// Format examples: `mid a b`, `alt c a b`, `circumcenter a b c`
+    pub fn to_text(&self, state: &ProofState) -> String {
+        let names: Vec<&str> = self.args.iter().map(|&id| state.name_of(id)).collect();
+        let keyword = match self.ctype {
+            ConstructionType::Midpoint => "mid",
+            ConstructionType::AngleBisector => "bisect",
+            ConstructionType::PerpendicularBisector => "pbisect",
+            ConstructionType::Altitude => "alt",
+            ConstructionType::ParallelThrough => "pthrough",
+            ConstructionType::PerpendicularThrough => "tthrough",
+            ConstructionType::Circumcenter => "circumcenter",
+            ConstructionType::Incenter => "incenter",
+            ConstructionType::Centroid => "centroid",
+            ConstructionType::Orthocenter => "orthocenter",
+            ConstructionType::CircumscribedCircle => "circumcirc",
+            ConstructionType::IntersectLines => "intersectll",
+            ConstructionType::IntersectLineCircle => "intersectlc",
+            ConstructionType::ReflectPoint => "reflect",
+            ConstructionType::ExtendSegment => "extend",
+            ConstructionType::TangentLine => "tangent",
+        };
+        format!("{} {}", keyword, names.join(" "))
+    }
+}
+
 /// Generate all candidate auxiliary constructions for the current state.
 pub fn generate_constructions(state: &ProofState) -> Vec<Construction> {
     let mut constructions = Vec::new();
@@ -830,6 +858,60 @@ mod tests {
         state.add_object("a", ObjectType::Point);
         let constructions = generate_constructions(&state);
         assert!(constructions.is_empty());
+    }
+
+    #[test]
+    fn test_construction_to_text_midpoint() {
+        let state = make_triangle();
+        let c = Construction {
+            ctype: ConstructionType::Midpoint,
+            args: vec![0, 1],
+            priority: Priority::Exploratory,
+        };
+        assert_eq!(c.to_text(&state), "mid a b");
+    }
+
+    #[test]
+    fn test_construction_to_text_altitude() {
+        let state = make_triangle();
+        let c = Construction {
+            ctype: ConstructionType::Altitude,
+            args: vec![0, 1, 2],
+            priority: Priority::Exploratory,
+        };
+        assert_eq!(c.to_text(&state), "alt a b c");
+    }
+
+    #[test]
+    fn test_construction_to_text_all_types() {
+        let state = make_triangle();
+        let types_keywords = vec![
+            (ConstructionType::Midpoint, "mid"),
+            (ConstructionType::AngleBisector, "bisect"),
+            (ConstructionType::PerpendicularBisector, "pbisect"),
+            (ConstructionType::Altitude, "alt"),
+            (ConstructionType::ParallelThrough, "pthrough"),
+            (ConstructionType::PerpendicularThrough, "tthrough"),
+            (ConstructionType::Circumcenter, "circumcenter"),
+            (ConstructionType::Incenter, "incenter"),
+            (ConstructionType::Centroid, "centroid"),
+            (ConstructionType::Orthocenter, "orthocenter"),
+            (ConstructionType::CircumscribedCircle, "circumcirc"),
+            (ConstructionType::IntersectLines, "intersectll"),
+            (ConstructionType::IntersectLineCircle, "intersectlc"),
+            (ConstructionType::ReflectPoint, "reflect"),
+            (ConstructionType::ExtendSegment, "extend"),
+            (ConstructionType::TangentLine, "tangent"),
+        ];
+        for (ctype, keyword) in types_keywords {
+            let c = Construction {
+                ctype,
+                args: vec![0, 1],
+                priority: Priority::Exploratory,
+            };
+            let text = c.to_text(&state);
+            assert!(text.starts_with(keyword), "Expected {} to start with {}", text, keyword);
+        }
     }
 
     #[test]

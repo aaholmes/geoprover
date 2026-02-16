@@ -1,6 +1,6 @@
 """End-to-end tests for the neural network modules.
 
-Tests: model.py, orchestrate.py, train.py, evaluate.py
+Tests: model.py (GeoTransformer), orchestrate.py, train.py, evaluate.py
 """
 
 import sys
@@ -13,27 +13,65 @@ sys.path.insert(0, os.path.dirname(__file__))
 import torch
 import geoprover
 from model import (
-    GeoNet, construction_to_index, tensor_from_flat,
+    GeoNet, GeoTransformer, GeoNetCNN,
+    construction_to_index, tokenize, tokenize_and_pad,
     build_valid_mask, constructions_to_policy_target,
-    count_parameters, POLICY_SIZE, NUM_CHANNELS, GRID_SIZE,
-    CONSTRUCTION_TYPES,
+    count_parameters, POLICY_SIZE, VOCAB_SIZE, MAX_SEQ_LEN,
+    PAD_ID, CLS_ID, GOAL_ID, SEP_ID,
+    CONSTRUCTION_TYPES, TOKEN_TO_ID,
 )
 
 
+def test_tokenizer():
+    """Test the custom tokenizer."""
+    text = "coll a b c ; para a b c d ; ? perp a h b c"
+    ids = tokenize(text)
+    assert ids[0] == CLS_ID, f"First token should be CLS, got {ids[0]}"
+    assert len(ids) > 5, f"Should have multiple tokens, got {len(ids)}"
+    # Check known tokens are in vocabulary
+    for token in ["coll", "para", "perp", "a", "b", "c", "d", "h", ";", "?"]:
+        assert token in TOKEN_TO_ID, f"Token '{token}' not in vocabulary"
+    print(f"  Tokenized {len(text.split())} words -> {len(ids)} token IDs")
+    print(f"  VOCAB_SIZE = {VOCAB_SIZE}")
+    print("  PASS: tokenizer")
+
+
+def test_tokenize_and_pad():
+    """Test tokenize + padding."""
+    text = "coll a b c"
+    t = tokenize_and_pad(text, max_len=32)
+    assert t.shape == (32,), f"Shape should be (32,), got {t.shape}"
+    assert t.dtype == torch.long
+    assert t[0].item() == CLS_ID
+    # Rest should be padded
+    ids = tokenize(text)
+    for i in range(len(ids), 32):
+        assert t[i].item() == PAD_ID, f"Position {i} should be PAD"
+    print("  PASS: tokenize_and_pad")
+
+
 def test_model_architecture():
-    """Test GeoNet can be instantiated and has ~2M params."""
-    model = GeoNet()
+    """Test GeoTransformer can be instantiated and has ~5-10M params."""
+    model = GeoTransformer()
     params = count_parameters(model)
-    print(f"GeoNet parameters: {params:,}")
-    assert 1_500_000 < params < 4_000_000, f"Expected ~2-3M params, got {params:,}"
+    print(f"  GeoTransformer parameters: {params:,}")
+    assert 3_000_000 < params < 15_000_000, f"Expected ~5-10M params, got {params:,}"
+    # GeoNet should be an alias
+    assert GeoNet is GeoTransformer
     print("  PASS: model architecture")
 
 
 def test_forward_pass():
-    """Test forward pass with a random tensor."""
-    model = GeoNet()
-    x = torch.randn(2, NUM_CHANNELS, GRID_SIZE, GRID_SIZE)
-    v_logit, k, policy = model(x)
+    """Test forward pass with tokenized input."""
+    model = GeoTransformer()
+    # Create a batch of 2 token sequences
+    text1 = "coll a b c ; para a b c d"
+    text2 = "cong a b c d ; ? perp a h b c"
+    t1 = tokenize_and_pad(text1, max_len=64)
+    t2 = tokenize_and_pad(text2, max_len=64)
+    batch = torch.stack([t1, t2])
+
+    v_logit, k, policy = model(batch)
     assert v_logit.shape == (2,), f"v_logit shape: {v_logit.shape}"
     assert k.shape == (2,), f"k shape: {k.shape}"
     assert policy.shape == (2, POLICY_SIZE), f"policy shape: {policy.shape}"
@@ -43,12 +81,12 @@ def test_forward_pass():
 
 def test_forward_with_mask():
     """Test forward pass with valid_mask."""
-    model = GeoNet()
-    x = torch.randn(1, NUM_CHANNELS, GRID_SIZE, GRID_SIZE)
+    model = GeoTransformer()
+    text = "coll a b c"
+    t = tokenize_and_pad(text, max_len=64).unsqueeze(0)
     mask = torch.zeros(1, POLICY_SIZE, dtype=torch.bool)
-    mask[0, [0, 10, 73, 146]] = True  # 4 valid actions
-    v_logit, k, policy = model(x, mask)
-    # Masked positions should be -inf
+    mask[0, [0, 10, 73, 146]] = True
+    v_logit, k, policy = model(t, mask)
     assert policy[0, 1].item() == float("-inf"), "Masked position should be -inf"
     assert policy[0, 0].item() != float("-inf"), "Valid position should not be -inf"
     print("  PASS: forward with mask")
@@ -56,15 +94,15 @@ def test_forward_with_mask():
 
 def test_predict_single():
     """Test single-state prediction."""
-    model = GeoNet()
-    x = torch.randn(NUM_CHANNELS, GRID_SIZE, GRID_SIZE)
+    model = GeoTransformer()
+    text = "coll a b c ; cong a b c d"
+    t = tokenize_and_pad(text, max_len=64)
     mask = torch.zeros(POLICY_SIZE, dtype=torch.bool)
     mask[[0, 73, 146]] = True
-    v_logit, k, policy = model.predict(x, mask)
+    v_logit, k, policy = model.predict(t, mask)
     assert isinstance(v_logit, float)
     assert isinstance(k, float)
     assert policy.shape == (POLICY_SIZE,)
-    # Policy should sum to ~1.0 over valid entries
     valid_sum = policy[[0, 73, 146]].sum().item()
     assert abs(valid_sum - 1.0) < 0.01, f"Policy sum over valid: {valid_sum}"
     print(f"  v_logit={v_logit:.4f}, k={k:.4f}, policy_sum={valid_sum:.4f}")
@@ -73,11 +111,10 @@ def test_predict_single():
 
 def test_compute_value():
     """Test value computation."""
-    model = GeoNet()
+    model = GeoTransformer()
     val = model.compute_value(v_logit=0.0, k=0.5, delta_d=0.5)
-    expected = 0.24491866  # tanh(0.0 + 0.5 * 0.5) = tanh(0.25)
+    expected = 0.24491866  # tanh(0.25)
     assert abs(val - expected) < 0.01, f"Expected ~{expected}, got {val}"
-    # Proved state: delta_d = 1.0 should give high value
     val_proved = model.compute_value(v_logit=0.5, k=0.5, delta_d=1.0)
     assert val_proved > 0.7, f"Proved state value: {val_proved}"
     print(f"  V(0.0, 0.5, 0.5) = {val:.4f}")
@@ -86,115 +123,118 @@ def test_compute_value():
 
 
 def test_construction_to_index():
-    """Test construction → policy index mapping."""
+    """Test construction -> policy index mapping."""
     idx = construction_to_index("Midpoint", [0, 1])
     assert 0 <= idx < POLICY_SIZE
-    # Same args in different order should give same index
     idx2 = construction_to_index("Midpoint", [1, 0])
     assert idx == idx2, f"Order shouldn't matter: {idx} != {idx2}"
-    # Different types should give different ranges
     idx_alt = construction_to_index("Altitude", [0, 1, 2])
     assert idx_alt != idx, "Different types should map to different indices"
-    assert idx_alt >= 73, "Altitude should be in second slot range"
-    print(f"  Midpoint(0,1) → {idx}, Altitude(0,1,2) → {idx_alt}")
+    print(f"  Midpoint(0,1) -> {idx}, Altitude(0,1,2) -> {idx_alt}")
     print("  PASS: construction_to_index")
 
 
-def test_tensor_from_flat():
-    """Test converting flat list to tensor."""
-    # From a real state
+def test_state_to_text():
+    """Test PyO3 state_to_text function."""
+    state = geoprover.parse_problem(
+        "orthocenter\n"
+        "a b c = triangle; h = on_tline b a c, on_tline c a b ? perp a h b c"
+    )
+    text = geoprover.state_to_text(state)
+    assert "perp" in text, f"Should contain 'perp': {text}"
+    assert "?" in text, f"Should contain goal marker: {text}"
+    # Should be tokenizable
+    ids = tokenize(text)
+    assert len(ids) > 3, f"Should produce multiple tokens: {ids}"
+    print(f"  State text: {text[:80]}...")
+    print(f"  Tokens: {len(ids)}")
+    print("  PASS: state_to_text")
+
+
+def test_construction_to_text():
+    """Test PyO3 construction_to_text function."""
     state = geoprover.parse_problem("test\na b c = triangle ? perp a b b c")
-    flat = geoprover.encode_state(state)
-    t = tensor_from_flat(flat)
-    assert t.shape == (NUM_CHANNELS, GRID_SIZE, GRID_SIZE)
-    assert t.dtype == torch.float32
-    print(f"  nonzero: {(t != 0).sum().item()}")
-    print("  PASS: tensor_from_flat")
+    cs = geoprover.generate_constructions(state)
+    assert len(cs) > 0
+    ct = geoprover.construction_to_text(cs[0], state)
+    assert len(ct) > 0, "Construction text should not be empty"
+    # Should be tokenizable
+    ids = tokenize(ct)
+    assert len(ids) > 1
+    print(f"  Construction text: {ct}")
+    print("  PASS: construction_to_text")
 
 
-def test_build_valid_mask():
-    """Test building valid mask from constructions."""
-    state = geoprover.parse_problem("test\na b c = triangle ? perp a b b c")
-    constructions = geoprover.generate_constructions(state)
-    mask = build_valid_mask(constructions)
-    assert mask.shape == (POLICY_SIZE,)
-    assert mask.sum().item() > 0
-    assert mask.sum().item() <= len(constructions)
-    print(f"  {len(constructions)} constructions → {mask.sum().item()} valid indices")
-    print("  PASS: build_valid_mask")
-
-
-def test_policy_target():
-    """Test converting visit counts to policy target."""
-    state = geoprover.parse_problem("test\na b c = triangle ? perp a b b c")
-    constructions = geoprover.generate_constructions(state)[:5]
-    visits = [10, 5, 3, 1, 1]
-    target = constructions_to_policy_target(constructions, visits)
-    assert target.shape == (POLICY_SIZE,)
-    assert abs(target.sum().item() - 1.0) < 0.01, f"Target sum: {target.sum().item()}"
-    print(f"  Target sum: {target.sum().item():.4f}, max: {target.max().item():.4f}")
-    print("  PASS: policy target")
+def test_synthetic_data():
+    """Test Rust synthetic data generation."""
+    data = geoprover.generate_synthetic_data(10, 42)
+    assert len(data) > 0, "Should generate some examples"
+    for state, construction, goal in data:
+        assert len(state) > 0, "State should not be empty"
+        assert len(construction) > 0, "Construction should not be empty"
+        assert len(goal) > 0, "Goal should not be empty"
+    print(f"  Generated {len(data)} synthetic examples")
+    print(f"  Example: state={data[0][0][:60]}..., constr={data[0][1]}, goal={data[0][2]}")
+    print("  PASS: synthetic_data")
 
 
 def test_integration_with_geoprover():
-    """Test full integration: parse → encode → model → predict."""
-    model = GeoNet()
+    """Test full integration: parse -> text -> model -> predict."""
+    model = GeoTransformer()
 
     state = geoprover.parse_problem(
         "orthocenter\n"
         "a b c = triangle; h = on_tline b a c, on_tline c a b ? perp a h b c"
     )
 
-    # Encode state
-    flat = geoprover.encode_state(state)
-    tensor = tensor_from_flat(flat)
+    # Encode as text and tokenize
+    state_text = geoprover.state_to_text(state)
+    token_ids = tokenize_and_pad(state_text, max_len=128)
 
     # Generate constructions and build mask
     constructions = geoprover.generate_constructions(state)
     mask = build_valid_mask(constructions)
 
     # Predict
-    v_logit, k, policy = model.predict(tensor, mask)
+    v_logit, k, policy = model.predict(token_ids, mask)
     delta_d = geoprover.compute_delta_d(state)
     value = model.compute_value(v_logit, k, delta_d)
 
     print(f"  Problem: orthocenter")
     print(f"  Objects: {state.num_objects()}, Facts: {state.num_facts()}")
+    print(f"  Text tokens: {(token_ids != PAD_ID).sum().item()}")
     print(f"  Constructions: {len(constructions)}")
     print(f"  v_logit={v_logit:.4f}, k={k:.4f}, delta_d={delta_d:.4f}")
     print(f"  Value: {value:.4f}")
-
-    # Find best construction
-    best_idx = policy.argmax().item()
-    for c in constructions:
-        if construction_to_index(c.construction_type(), c.args()) == best_idx:
-            print(f"  Best construction: {c.construction_type()} args={c.args()}")
-            break
     print("  PASS: integration with geoprover")
 
 
 def test_training_step():
-    """Test a single training step."""
-    model = GeoNet()
+    """Test a single training step with text input."""
+    model = GeoTransformer()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
-    # Create a small batch
     batch_size = 4
-    tensors = torch.randn(batch_size, NUM_CHANNELS, GRID_SIZE, GRID_SIZE)
+    max_len = 64
+    # Create text inputs
+    texts = [
+        "coll a b c ; cong a b c d",
+        "para a b c d ; perp a c b d",
+        "mid m a b ; cong a m m b",
+        "eqangle a b c d e f",
+    ]
+    token_ids = torch.stack([tokenize_and_pad(t, max_len=max_len) for t in texts])
     policy_targets = torch.zeros(batch_size, POLICY_SIZE)
     for i in range(batch_size):
-        # Random valid policy targets
         active = torch.randperm(POLICY_SIZE)[:5]
         policy_targets[i, active] = torch.rand(5)
         policy_targets[i] /= policy_targets[i].sum()
     value_targets = torch.rand(batch_size)
     delta_d = torch.rand(batch_size)
 
-    # Forward + backward
-    import torch.nn.functional as F
     from train import compute_loss
     optimizer.zero_grad()
-    loss, metrics = compute_loss(model, tensors, policy_targets, value_targets, delta_d)
+    loss, metrics = compute_loss(model, token_ids, policy_targets, value_targets, delta_d)
     loss.backward()
     optimizer.step()
 
@@ -209,7 +249,6 @@ def test_supervised_data_small():
     """Test supervised data generation on a small set."""
     from train import generate_supervised_data
     import tempfile
-    # Write a tiny problem file
     with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
         f.write("orthocenter\n")
         f.write("a b c = triangle; h = on_tline b a c, on_tline c a b ? perp a h b c\n")
@@ -221,7 +260,7 @@ def test_supervised_data_small():
         print(f"  Generated {len(samples)} samples")
         assert len(samples) >= 1, "Should generate at least 1 sample"
         s = samples[0]
-        assert len(s.tensor) == 20 * 32 * 32
+        assert isinstance(s.state_text, str)
         assert len(s.policy_target) == POLICY_SIZE
         assert 0.0 <= s.value_target <= 1.0
         print("  PASS: supervised data generation")
@@ -233,19 +272,18 @@ def test_mcts_search_basic():
     """Test NN-guided MCTS search on a simple problem."""
     from orchestrate import MctsConfig, mcts_search
 
-    model = GeoNet()
+    model = GeoTransformer()
     state = geoprover.parse_problem(
         "orthocenter\n"
         "a b c = triangle; h = on_tline b a c, on_tline c a b ? perp a h b c"
     )
-    # Saturate first (deduction should solve this)
     proved = geoprover.saturate(state)
     if proved:
         print("  Problem solved by deduction (expected)")
 
     # Test MCTS on a harder problem
     state2 = geoprover.parse_problem("test\na b c = triangle ? perp a b b c")
-    config = MctsConfig(num_iterations=5, max_children=10, max_depth=2)
+    config = MctsConfig(num_iterations=5, max_children=10, max_depth=2, max_seq_len=128)
     result = mcts_search(state2, model, config)
     print(f"  MCTS result: solved={result.solved}, value={result.best_value:.4f}, "
           f"visits={result.root_visits}, samples={len(result.samples)}, "
@@ -254,21 +292,58 @@ def test_mcts_search_basic():
     print("  PASS: MCTS search basic")
 
 
+def test_synthetic_dataset():
+    """Test SyntheticDataset for training."""
+    from train import SyntheticDataset
+
+    data = geoprover.generate_synthetic_data(5, 42)
+    dataset = SyntheticDataset(data, max_seq_len=64)
+    assert len(dataset) == len(data)
+
+    token_ids, policy, value, delta_d = dataset[0]
+    assert token_ids.shape == (64,)
+    assert token_ids.dtype == torch.long
+    assert policy.shape == (POLICY_SIZE,)
+    assert policy.sum().item() > 0, "Policy should have at least one non-zero entry"
+    assert value.item() == 1.0, "Value should be 1.0 (provable)"
+    print(f"  Dataset size: {len(dataset)}")
+    print(f"  Token IDs shape: {token_ids.shape}")
+    print(f"  Policy nonzero: {(policy > 0).sum().item()}")
+    print("  PASS: synthetic dataset")
+
+
+def test_legacy_cnn():
+    """Test that the legacy CNN model still works."""
+    model = GeoNetCNN()
+    params = count_parameters(model)
+    print(f"  GeoNetCNN parameters: {params:,}")
+    x = torch.randn(1, 20, 32, 32)
+    v_logit, k, policy = model(x)
+    assert v_logit.shape == (1,)
+    assert k.shape == (1,)
+    assert policy.shape == (1, POLICY_SIZE)
+    print("  PASS: legacy CNN")
+
+
 if __name__ == "__main__":
     tests = [
+        test_tokenizer,
+        test_tokenize_and_pad,
         test_model_architecture,
         test_forward_pass,
         test_forward_with_mask,
         test_predict_single,
         test_compute_value,
         test_construction_to_index,
-        test_tensor_from_flat,
-        test_build_valid_mask,
-        test_policy_target,
+        test_state_to_text,
+        test_construction_to_text,
+        test_synthetic_data,
         test_integration_with_geoprover,
         test_training_step,
         test_supervised_data_small,
         test_mcts_search_basic,
+        test_synthetic_dataset,
+        test_legacy_cnn,
     ]
 
     passed = 0

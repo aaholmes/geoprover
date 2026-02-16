@@ -8,6 +8,7 @@ pub mod construction;
 pub mod parser;
 pub mod encoding;
 pub mod mcts;
+pub mod synthetic;
 
 // --- PyO3 wrapper types ---
 
@@ -151,6 +152,24 @@ fn compute_delta_d(state: &PyProofState) -> PyResult<f64> {
     Ok(mcts::compute_delta_d(&state.inner))
 }
 
+/// Serialize a ProofState as compact text (relations + goal).
+#[pyfunction]
+fn state_to_text(state: &PyProofState) -> PyResult<String> {
+    Ok(state.inner.to_text())
+}
+
+/// Serialize a construction as compact text using object names from the state.
+#[pyfunction]
+fn construction_to_text(construction: &PyConstruction, state: &PyProofState) -> PyResult<String> {
+    Ok(construction.inner.to_text(&state.inner))
+}
+
+/// Generate synthetic training data: Vec of (state_text, construction_text, goal_text).
+#[pyfunction]
+fn generate_synthetic_data(num_examples: usize, seed: u64) -> PyResult<Vec<(String, String, String)>> {
+    Ok(synthetic::generate_batch(num_examples, seed))
+}
+
 // --- Module registration ---
 
 #[pymodule]
@@ -165,5 +184,8 @@ fn geoprover(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(generate_constructions, m)?)?;
     m.add_function(wrap_pyfunction!(apply_construction, m)?)?;
     m.add_function(wrap_pyfunction!(compute_delta_d, m)?)?;
+    m.add_function(wrap_pyfunction!(state_to_text, m)?)?;
+    m.add_function(wrap_pyfunction!(construction_to_text, m)?)?;
+    m.add_function(wrap_pyfunction!(generate_synthetic_data, m)?)?;
     Ok(())
 }

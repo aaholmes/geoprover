@@ -1,8 +1,9 @@
-"""Training loop for GeoNet: supervised pre-training + self-play expert iteration.
+"""Training loop for GeoTransformer: synthetic pre-training + expert iteration.
 
 Phases:
-  A. Supervised pre-training on deduction-solvable problems
-  B. Self-play expert iteration: MCTS with NN → collect data → train → repeat
+  A. Synthetic pre-training: train on Rust-generated synthetic data (100K+ examples)
+  B. JGEX supervised fine-tuning on deduction-solvable problems
+  C. Expert iteration: MCTS self-play -> collect data -> train -> repeat
 
 Loss: L = KL(policy || target) + c_value * MSE(value, target)
 """
@@ -24,10 +25,12 @@ import geoprover
 from model import (
     POLICY_SIZE,
     GeoNet,
+    GeoTransformer,
     build_valid_mask,
     construction_to_index,
     count_parameters,
-    tensor_from_flat,
+    tokenize_and_pad,
+    MAX_SEQ_LEN,
 )
 from orchestrate import (
     MctsConfig,
@@ -47,6 +50,9 @@ DEFAULT_VALUE_WEIGHT = 1.0
 DEFAULT_NUM_ITERATIONS = 20
 DEFAULT_PROBLEMS_FILE = "problems/jgex_ag_231.txt"
 DEFAULT_CHECKPOINT_DIR = "checkpoints"
+DEFAULT_SYNTHETIC_SIZE = 100000
+DEFAULT_SYNTHETIC_SEED = 42
+DEFAULT_MAX_SEQ_LEN = 256
 
 
 class ReplayBuffer:
@@ -69,50 +75,120 @@ class ReplayBuffer:
         return list(self.buffer)
 
 
-class GeometryDataset(Dataset):
-    """PyTorch dataset from training samples."""
+class TextGeometryDataset(Dataset):
+    """PyTorch dataset from text-based training samples."""
 
-    def __init__(self, samples: list[TrainingSample]):
+    def __init__(self, samples: list[TrainingSample], max_seq_len: int = DEFAULT_MAX_SEQ_LEN):
         self.samples = samples
+        self.max_seq_len = max_seq_len
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int):
         s = self.samples[idx]
-        tensor = torch.tensor(s.tensor, dtype=torch.float32).view(20, 32, 32)
+        token_ids = tokenize_and_pad(s.state_text, max_len=self.max_seq_len)
         policy = torch.tensor(s.policy_target, dtype=torch.float32)
         value = torch.tensor(s.value_target, dtype=torch.float32)
         delta_d = torch.tensor(s.delta_d, dtype=torch.float32)
-        return tensor, policy, value, delta_d
+        return token_ids, policy, value, delta_d
+
+
+class SyntheticDataset(Dataset):
+    """Dataset from Rust-generated synthetic (state_text, construction_text, goal_text) tuples."""
+
+    def __init__(self, examples: list[tuple[str, str, str]], max_seq_len: int = DEFAULT_MAX_SEQ_LEN):
+        self.examples = examples
+        self.max_seq_len = max_seq_len
+
+    def __len__(self) -> int:
+        return len(self.examples)
+
+    def __getitem__(self, idx: int):
+        state_text, construction_text, goal_text = self.examples[idx]
+
+        # State + goal as input: "coll a b c ; cong a b c d ; ? perp a h b c"
+        # The goal becomes the target for the value head (we know it's provable)
+        input_text = f"{state_text} ; ? {goal_text}" if state_text else f"? {goal_text}"
+        token_ids = tokenize_and_pad(input_text, max_len=self.max_seq_len)
+
+        # Policy target: the construction that makes the goal provable
+        # Encode as uniform over valid constructions (we don't have index info)
+        # Instead, use construction_text to create a 1-hot target at the matching index
+        policy = torch.zeros(POLICY_SIZE, dtype=torch.float32)
+        # We need construction type and args to compute index, but we only have text
+        # Parse construction text: "mid a b" -> type="Midpoint", args
+        c_type, c_args = _parse_construction_text(construction_text)
+        if c_type is not None:
+            idx_val = construction_to_index(c_type, c_args)
+            policy[idx_val] = 1.0
+
+        # Value: 1.0 (the goal is provable with this construction)
+        value = torch.tensor(1.0, dtype=torch.float32)
+        delta_d = torch.tensor(0.0, dtype=torch.float32)  # unknown before construction
+
+        return token_ids, policy, value, delta_d
+
+
+# Map from text keywords to ConstructionType names
+_KEYWORD_TO_TYPE = {
+    "mid": "Midpoint",
+    "alt": "Altitude",
+    "circumcenter": "Circumcenter",
+    "orthocenter": "Orthocenter",
+    "incenter": "Incenter",
+    "pthrough": "ParallelThrough",
+    "tthrough": "PerpendicularThrough",
+}
+
+
+def _parse_construction_text(text: str) -> tuple[str | None, list[int]]:
+    """Parse 'mid a b' -> ('Midpoint', [id_a, id_b]).
+
+    Since we don't have the actual state, we use point name -> sequential ID mapping.
+    """
+    parts = text.split()
+    if len(parts) < 2:
+        return None, []
+    keyword = parts[0]
+    c_type = _KEYWORD_TO_TYPE.get(keyword)
+    if c_type is None:
+        return None, []
+    # Map point names to sequential IDs (a=0, b=1, etc.)
+    args = []
+    for name in parts[1:]:
+        if name.startswith("aux_"):
+            try:
+                args.append(26 + int(name[4:]))
+            except ValueError:
+                args.append(0)
+        elif len(name) == 1 and name.isalpha():
+            args.append(ord(name) - ord("a"))
+        else:
+            args.append(0)
+    return c_type, args
 
 
 def compute_loss(
-    model: GeoNet,
-    tensors: torch.Tensor,
+    model: GeoTransformer,
+    token_ids: torch.Tensor,
     policy_targets: torch.Tensor,
     value_targets: torch.Tensor,
     delta_d: torch.Tensor,
     value_weight: float = DEFAULT_VALUE_WEIGHT,
 ) -> tuple[torch.Tensor, dict]:
-    """Compute combined policy + value loss.
-
-    Policy loss: KL divergence between predicted policy and target distribution.
-    Value loss: MSE between predicted combined value and target value.
-    """
-    v_logit, k, policy_logits = model(tensors)
+    """Compute combined policy + value loss."""
+    v_logit, k, policy_logits = model(token_ids)
 
     # Policy loss: KL(target || predicted)
-    # Only compute over positions that have nonzero target probability
     log_probs = F.log_softmax(policy_logits, dim=1)
-    # Mask: only where target > 0 to avoid log(0) in target
     policy_mask = policy_targets > 0
     if policy_mask.any():
         policy_loss = F.kl_div(
             log_probs, policy_targets, reduction="batchmean", log_target=False
         )
     else:
-        policy_loss = torch.tensor(0.0, device=tensors.device)
+        policy_loss = torch.tensor(0.0, device=token_ids.device)
 
     # Value loss: MSE between tanh(v_logit + k * delta_d) and target
     predicted_value = torch.tanh(v_logit + k * delta_d)
@@ -134,15 +210,9 @@ def compute_loss(
 def generate_supervised_data(
     problems_file: str,
     max_problems: int | None = None,
+    max_seq_len: int = DEFAULT_MAX_SEQ_LEN,
 ) -> list[TrainingSample]:
-    """Generate supervised training data from deduction-solvable problems.
-
-    For each problem solvable by deduction alone:
-      - Encode the initial state (before saturation) as the tensor
-      - Policy target: uniform over all candidate constructions (deduction solved it,
-        so any construction is fine — teaches exploration)
-      - Value target: 1.0 (provable)
-    """
+    """Generate supervised training data from deduction-solvable JGEX problems."""
     problems = load_problems(problems_file)
     if max_problems:
         problems = problems[:max_problems]
@@ -155,34 +225,22 @@ def generate_supervised_data(
         problem_text = f"{name}\n{definition}"
         try:
             state = geoprover.parse_problem(problem_text)
-
-            # Encode state BEFORE saturation (this is what the NN sees at decision time)
-            flat = geoprover.encode_state(state)
+            state_text = geoprover.state_to_text(state)
             delta_d_before = geoprover.compute_delta_d(state)
 
-            # Check if deduction solves it
             proved = geoprover.saturate(state)
             if not proved:
                 continue
 
             solved += 1
-            delta_d_after = geoprover.compute_delta_d(state)
 
-            # Create a sample. Policy target: uniform (no construction needed).
-            # Value target: 1.0 (provable).
             policy_target = [0.0] * POLICY_SIZE
-            # Don't set any policy slots — this teaches the value head that
-            # deduction-solvable states have high value regardless of construction
             samples.append(TrainingSample(
-                tensor=flat,
+                state_text=state_text,
                 policy_target=policy_target,
                 value_target=1.0,
                 delta_d=delta_d_before,
             ))
-
-            # Also create a negative sample from an unsolvable state?
-            # Not needed — the MCTS samples will provide negative examples.
-
         except Exception as e:
             print(f"  Skip {name}: {e}")
 
@@ -191,7 +249,7 @@ def generate_supervised_data(
 
 
 def train_epoch(
-    model: GeoNet,
+    model: GeoTransformer,
     dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: str,
@@ -202,40 +260,37 @@ def train_epoch(
     total_metrics = {}
     n_batches = 0
 
-    for tensors, policy_targets, value_targets, delta_d in dataloader:
-        tensors = tensors.to(device)
+    for token_ids, policy_targets, value_targets, delta_d in dataloader:
+        token_ids = token_ids.to(device)
         policy_targets = policy_targets.to(device)
         value_targets = value_targets.to(device)
         delta_d = delta_d.to(device)
 
         optimizer.zero_grad()
         loss, metrics = compute_loss(
-            model, tensors, policy_targets, value_targets, delta_d, value_weight
+            model, token_ids, policy_targets, value_targets, delta_d, value_weight
         )
         loss.backward()
-        # Gradient clipping
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
-        for k, v in metrics.items():
-            total_metrics[k] = total_metrics.get(k, 0.0) + v
+        for k_name, v in metrics.items():
+            total_metrics[k_name] = total_metrics.get(k_name, 0.0) + v
         n_batches += 1
 
-    # Average
     if n_batches > 0:
-        for k in total_metrics:
-            total_metrics[k] /= n_batches
+        for k_name in total_metrics:
+            total_metrics[k_name] /= n_batches
     return total_metrics
 
 
 def save_checkpoint(
-    model: GeoNet,
+    model: GeoTransformer,
     optimizer: torch.optim.Optimizer,
     iteration: int,
     metrics: dict,
     path: str,
 ) -> None:
-    """Save model checkpoint."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     torch.save({
         "model_state_dict": model.state_dict(),
@@ -247,12 +302,11 @@ def save_checkpoint(
 
 
 def load_checkpoint(
-    model: GeoNet,
+    model: GeoTransformer,
     optimizer: torch.optim.Optimizer | None,
     path: str,
     device: str,
 ) -> int:
-    """Load model checkpoint. Returns the iteration number."""
     checkpoint = torch.load(path, map_location=device, weights_only=True)
     model.load_state_dict(checkpoint["model_state_dict"])
     if optimizer and "optimizer_state_dict" in checkpoint:
@@ -261,7 +315,7 @@ def load_checkpoint(
 
 
 def expert_iteration(
-    model: GeoNet,
+    model: GeoTransformer,
     problems_file: str = DEFAULT_PROBLEMS_FILE,
     num_iterations: int = DEFAULT_NUM_ITERATIONS,
     epochs_per_iter: int = DEFAULT_EPOCHS_PER_ITER,
@@ -271,16 +325,16 @@ def expert_iteration(
     checkpoint_dir: str = DEFAULT_CHECKPOINT_DIR,
     device: str = "cpu",
     resume_from: str | None = None,
-) -> GeoNet:
+    synthetic_size: int = DEFAULT_SYNTHETIC_SIZE,
+    synthetic_seed: int = DEFAULT_SYNTHETIC_SEED,
+    max_seq_len: int = DEFAULT_MAX_SEQ_LEN,
+) -> GeoTransformer:
     """Run expert iteration training loop.
 
-    1. Generate supervised pre-training data
-    2. Pre-train model
-    3. For each iteration:
-       a. Self-play: run MCTS on problems with current model
-       b. Add samples to replay buffer
-       c. Train on replay buffer
-       d. Evaluate and checkpoint
+    1. Generate synthetic pre-training data (from Rust engine)
+    2. Pre-train on synthetic data
+    3. Fine-tune on JGEX supervised data
+    4. Expert iteration: MCTS self-play -> train -> repeat
     """
     problems = load_problems(problems_file)
     optimizer = torch.optim.Adam(
@@ -296,19 +350,44 @@ def expert_iteration(
         start_iter = load_checkpoint(model, optimizer, resume_from, device)
         print(f"Resumed from iteration {start_iter}")
 
-    # Phase A: supervised pre-training
+    # Phase A: Synthetic pre-training
     print("=" * 60)
-    print("Phase A: Supervised pre-training")
+    print("Phase A: Synthetic pre-training")
     print("=" * 60)
-    supervised_samples = generate_supervised_data(problems_file)
+    print(f"Generating {synthetic_size} synthetic examples (seed={synthetic_seed})...")
+    t0 = time.time()
+    synthetic_data = geoprover.generate_synthetic_data(synthetic_size, synthetic_seed)
+    elapsed = time.time() - t0
+    print(f"  Generated {len(synthetic_data)} examples in {elapsed:.1f}s")
+
+    if synthetic_data:
+        dataset = SyntheticDataset(synthetic_data, max_seq_len=max_seq_len)
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+        for epoch in range(epochs_per_iter * 2):  # more epochs for synthetic
+            metrics = train_epoch(model, loader, optimizer, device, value_weight)
+            scheduler.step()
+            print(f"  Synthetic epoch {epoch+1}: "
+                  f"loss={metrics['loss']:.4f} "
+                  f"policy={metrics['policy_loss']:.4f} "
+                  f"value={metrics['value_loss']:.4f}")
+        save_checkpoint(
+            model, optimizer, 0, metrics,
+            os.path.join(checkpoint_dir, "synthetic.pt"),
+        )
+
+    # Phase B: JGEX supervised fine-tuning
+    print("=" * 60)
+    print("Phase B: JGEX supervised fine-tuning")
+    print("=" * 60)
+    supervised_samples = generate_supervised_data(problems_file, max_seq_len=max_seq_len)
     if supervised_samples:
         replay.add(supervised_samples)
-        dataset = GeometryDataset(supervised_samples)
-        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        dataset = TextGeometryDataset(supervised_samples, max_seq_len=max_seq_len)
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
         for epoch in range(epochs_per_iter):
             metrics = train_epoch(model, loader, optimizer, device, value_weight)
             scheduler.step()
-            print(f"  Pre-train epoch {epoch+1}: "
+            print(f"  Supervised epoch {epoch+1}: "
                   f"loss={metrics['loss']:.4f} "
                   f"policy={metrics['policy_loss']:.4f} "
                   f"value={metrics['value_loss']:.4f}")
@@ -317,32 +396,30 @@ def expert_iteration(
             os.path.join(checkpoint_dir, "pretrained.pt"),
         )
 
-    # Phase B: expert iteration
+    # Phase C: Expert iteration
     print("=" * 60)
-    print("Phase B: Expert iteration")
+    print("Phase C: Expert iteration")
     print("=" * 60)
     mcts_config = MctsConfig(
-        num_iterations=100,  # fewer iterations per problem for speed
+        num_iterations=100,
         max_children=30,
         max_depth=3,
+        max_seq_len=max_seq_len,
     )
 
     for iteration in range(start_iter, num_iterations):
         print(f"\n--- Iteration {iteration+1}/{num_iterations} ---")
         t0 = time.time()
 
-        # Self-play: collect training data
         print("  Self-play...")
         new_samples = self_play_episode(problems, model, mcts_config, device)
         replay.add(new_samples)
-        print(f"  Collected {len(new_samples)} samples "
-              f"(buffer: {len(replay)})")
+        print(f"  Collected {len(new_samples)} samples (buffer: {len(replay)})")
 
-        # Train on replay buffer
         if len(replay) >= batch_size:
             train_samples = replay.all()
-            dataset = GeometryDataset(train_samples)
-            loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+            dataset = TextGeometryDataset(train_samples, max_seq_len=max_seq_len)
+            loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
             for epoch in range(epochs_per_iter):
                 metrics = train_epoch(model, loader, optimizer, device, value_weight)
                 scheduler.step()
@@ -351,7 +428,6 @@ def expert_iteration(
                   f"value={metrics['value_loss']:.4f} "
                   f"mean_v={metrics['mean_pred_value']:.3f}")
 
-        # Save checkpoint
         save_checkpoint(
             model, optimizer, iteration + 1, metrics,
             os.path.join(checkpoint_dir, f"iter_{iteration+1:03d}.pt"),
@@ -364,7 +440,7 @@ def expert_iteration(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train GeoNet")
+    parser = argparse.ArgumentParser(description="Train GeoTransformer")
     parser.add_argument("--problems", default=DEFAULT_PROBLEMS_FILE, help="Problem file path")
     parser.add_argument("--iterations", type=int, default=DEFAULT_NUM_ITERATIONS)
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS_PER_ITER)
@@ -375,6 +451,9 @@ def main():
     parser.add_argument("--resume", default=None, help="Resume from checkpoint")
     parser.add_argument("--supervised-only", action="store_true",
                         help="Only run supervised pre-training, no self-play")
+    parser.add_argument("--synthetic-size", type=int, default=DEFAULT_SYNTHETIC_SIZE)
+    parser.add_argument("--synthetic-seed", type=int, default=DEFAULT_SYNTHETIC_SEED)
+    parser.add_argument("--max-seq-len", type=int, default=DEFAULT_MAX_SEQ_LEN)
     args = parser.parse_args()
 
     device = args.device
@@ -384,22 +463,36 @@ def main():
 
     print(f"Device: {device}")
 
-    model = GeoNet().to(device)
-    print(f"GeoNet parameters: {count_parameters(model):,}")
+    model = GeoTransformer().to(device)
+    print(f"GeoTransformer parameters: {count_parameters(model):,}")
 
     if args.supervised_only:
-        samples = generate_supervised_data(args.problems)
-        if samples:
-            optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-            dataset = GeometryDataset(samples)
-            loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
-            for epoch in range(args.epochs * 5):  # more epochs for supervised-only
+        # Generate synthetic + supervised data and train
+        print("Generating synthetic data...")
+        synthetic_data = geoprover.generate_synthetic_data(args.synthetic_size, args.synthetic_seed)
+        print(f"Generated {len(synthetic_data)} synthetic examples")
+
+        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+
+        if synthetic_data:
+            dataset = SyntheticDataset(synthetic_data, max_seq_len=args.max_seq_len)
+            loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)
+            for epoch in range(args.epochs * 5):
                 metrics = train_epoch(model, loader, optimizer, device)
-                print(f"Epoch {epoch+1}: loss={metrics['loss']:.4f}")
-            save_checkpoint(
-                model, optimizer, 0, metrics,
-                os.path.join(args.checkpoint_dir, "supervised.pt"),
-            )
+                print(f"Synthetic epoch {epoch+1}: loss={metrics['loss']:.4f}")
+
+        samples = generate_supervised_data(args.problems, max_seq_len=args.max_seq_len)
+        if samples:
+            dataset = TextGeometryDataset(samples, max_seq_len=args.max_seq_len)
+            loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)
+            for epoch in range(args.epochs * 5):
+                metrics = train_epoch(model, loader, optimizer, device)
+                print(f"Supervised epoch {epoch+1}: loss={metrics['loss']:.4f}")
+
+        save_checkpoint(
+            model, optimizer, 0, metrics,
+            os.path.join(args.checkpoint_dir, "supervised.pt"),
+        )
     else:
         expert_iteration(
             model,
@@ -411,6 +504,9 @@ def main():
             checkpoint_dir=args.checkpoint_dir,
             device=device,
             resume_from=args.resume,
+            synthetic_size=args.synthetic_size,
+            synthetic_seed=args.synthetic_seed,
+            max_seq_len=args.max_seq_len,
         )
 
 

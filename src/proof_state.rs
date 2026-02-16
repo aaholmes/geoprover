@@ -234,6 +234,77 @@ impl ProofState {
     pub fn try_id(&self, name: &str) -> Option<u16> {
         self.name_to_id.get(name).copied()
     }
+
+    /// Get the name of an object by its ID.
+    pub fn name_of(&self, id: u16) -> &str {
+        &self.objects[id as usize].name
+    }
+
+    /// Serialize the proof state as a compact text string.
+    ///
+    /// Format: `coll a m b ; para a b c d ; ? perp a h b c`
+    /// Relations separated by ` ; `, goal after ` ? `.
+    pub fn to_text(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+
+        // Sort facts for deterministic output
+        let mut sorted_facts: Vec<&Relation> = self.facts.iter().collect();
+        sorted_facts.sort_by(|a, b| format!("{:?}", a).cmp(&format!("{:?}", b)));
+
+        for fact in sorted_facts {
+            parts.push(self.relation_to_text(fact));
+        }
+
+        let mut result = parts.join(" ; ");
+
+        if let Some(goal) = &self.goal {
+            if !result.is_empty() {
+                result.push_str(" ; ");
+            }
+            result.push_str("? ");
+            result.push_str(&self.relation_to_text(goal));
+        }
+
+        result
+    }
+
+    /// Convert a single relation to text using object names (public).
+    pub fn relation_to_text_pub(&self, rel: &Relation) -> String {
+        self.relation_to_text(rel)
+    }
+
+    /// Convert a single relation to text using object names.
+    fn relation_to_text(&self, rel: &Relation) -> String {
+        match rel {
+            Relation::Collinear(a, b, c) => {
+                format!("coll {} {} {}", self.name_of(*a), self.name_of(*b), self.name_of(*c))
+            }
+            Relation::Parallel(a, b, c, d) => {
+                format!("para {} {} {} {}", self.name_of(*a), self.name_of(*b), self.name_of(*c), self.name_of(*d))
+            }
+            Relation::Perpendicular(a, b, c, d) => {
+                format!("perp {} {} {} {}", self.name_of(*a), self.name_of(*b), self.name_of(*c), self.name_of(*d))
+            }
+            Relation::Congruent(a, b, c, d) => {
+                format!("cong {} {} {} {}", self.name_of(*a), self.name_of(*b), self.name_of(*c), self.name_of(*d))
+            }
+            Relation::EqualAngle(a, b, c, d, e, f) => {
+                format!("eqangle {} {} {} {} {} {}", self.name_of(*a), self.name_of(*b), self.name_of(*c), self.name_of(*d), self.name_of(*e), self.name_of(*f))
+            }
+            Relation::Midpoint(m, a, b) => {
+                format!("mid {} {} {}", self.name_of(*m), self.name_of(*a), self.name_of(*b))
+            }
+            Relation::OnCircle(p, c) => {
+                format!("oncirc {} {}", self.name_of(*p), self.name_of(*c))
+            }
+            Relation::Cyclic(a, b, c, d) => {
+                format!("cyclic {} {} {} {}", self.name_of(*a), self.name_of(*b), self.name_of(*c), self.name_of(*d))
+            }
+            Relation::EqualRatio(a, b, c, d, e, f, g, h) => {
+                format!("eqratio {} {} {} {} {} {} {} {}", self.name_of(*a), self.name_of(*b), self.name_of(*c), self.name_of(*d), self.name_of(*e), self.name_of(*f), self.name_of(*g), self.name_of(*h))
+            }
+        }
+    }
 }
 
 impl Clone for ProofState {
@@ -486,6 +557,78 @@ mod tests {
         assert_ne!(h1, h2);
         assert_ne!(h2, h3);
         assert_ne!(h1, h3);
+    }
+
+    #[test]
+    fn test_to_text_basic() {
+        let mut state = ProofState::new();
+        let a = state.add_object("a", ObjectType::Point);
+        let b = state.add_object("b", ObjectType::Point);
+        let c = state.add_object("c", ObjectType::Point);
+        state.add_fact(Relation::collinear(a, b, c));
+        state.set_goal(Relation::congruent(a, b, b, c));
+        let text = state.to_text();
+        assert!(text.contains("coll a b c"), "Expected collinear: {}", text);
+        assert!(text.contains("? cong"), "Expected goal: {}", text);
+    }
+
+    #[test]
+    fn test_to_text_no_goal() {
+        let mut state = ProofState::new();
+        let a = state.add_object("a", ObjectType::Point);
+        let b = state.add_object("b", ObjectType::Point);
+        let c = state.add_object("c", ObjectType::Point);
+        state.add_fact(Relation::collinear(a, b, c));
+        let text = state.to_text();
+        assert_eq!(text, "coll a b c");
+        assert!(!text.contains("?"));
+    }
+
+    #[test]
+    fn test_to_text_multiple_facts() {
+        let mut state = ProofState::new();
+        let a = state.add_object("a", ObjectType::Point);
+        let b = state.add_object("b", ObjectType::Point);
+        let c = state.add_object("c", ObjectType::Point);
+        state.add_fact(Relation::collinear(a, b, c));
+        state.add_fact(Relation::congruent(a, b, b, c));
+        let text = state.to_text();
+        // Should have both facts separated by ;
+        assert!(text.contains(" ; "), "Expected separator: {}", text);
+        assert!(text.contains("coll"), "Expected collinear: {}", text);
+        assert!(text.contains("cong"), "Expected congruent: {}", text);
+    }
+
+    #[test]
+    fn test_to_text_all_relation_types() {
+        let mut state = ProofState::new();
+        let a = state.add_object("a", ObjectType::Point);
+        let b = state.add_object("b", ObjectType::Point);
+        let c = state.add_object("c", ObjectType::Point);
+        let d = state.add_object("d", ObjectType::Point);
+        let o = state.add_object("o", ObjectType::Point);
+        state.add_fact(Relation::collinear(a, b, c));
+        state.add_fact(Relation::parallel(a, b, c, d));
+        state.add_fact(Relation::perpendicular(a, b, c, d));
+        state.add_fact(Relation::congruent(a, b, c, d));
+        state.add_fact(Relation::equal_angle(a, b, c, d, o, a));
+        state.add_fact(Relation::midpoint(o, a, b));
+        state.add_fact(Relation::on_circle(a, o));
+        state.add_fact(Relation::cyclic(a, b, c, d));
+        state.add_fact(Relation::equal_ratio(a, b, c, d, a, c, b, d));
+        let text = state.to_text();
+        for kw in &["coll", "para", "perp", "cong", "eqangle", "mid", "oncirc", "cyclic", "eqratio"] {
+            assert!(text.contains(kw), "Missing keyword {}: {}", kw, text);
+        }
+    }
+
+    #[test]
+    fn test_name_of() {
+        let mut state = ProofState::new();
+        state.add_object("point_a", ObjectType::Point);
+        state.add_object("center", ObjectType::Point);
+        assert_eq!(state.name_of(0), "point_a");
+        assert_eq!(state.name_of(1), "center");
     }
 
     #[test]

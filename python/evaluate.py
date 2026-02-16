@@ -1,9 +1,8 @@
-"""Evaluation suite: benchmark GeoNet on JGEX-AG-231 and IMO-AG-30.
+"""Evaluation suite: benchmark GeoTransformer on JGEX-AG-231 and IMO-AG-30.
 
 Compares three modes:
   1. Deduction only (no MCTS, no NN)
-  2. MCTS with uniform priors (classical fallback, no NN)
-  3. MCTS with NN policy/value (full system)
+  2. MCTS with NN policy/value (full system)
 
 Reports solve rates, proof lengths, and timing.
 """
@@ -17,7 +16,7 @@ from dataclasses import asdict, dataclass
 import torch
 
 import geoprover
-from model import GeoNet, count_parameters
+from model import GeoNet, GeoTransformer, count_parameters
 from orchestrate import MctsConfig, SearchResult, load_problems, solve_problem
 from train import load_checkpoint
 
@@ -27,11 +26,11 @@ class ProblemResult:
     """Result for a single problem."""
     name: str
     solved: bool
-    mode: str  # "deduction", "mcts_uniform", "mcts_nn"
+    mode: str  # "deduction", "mcts_nn"
     elapsed_ms: float
     num_facts: int
     num_objects: int
-    proof_length: int  # number of construction steps (0 for deduction)
+    proof_length: int
     value: float
 
 
@@ -58,13 +57,9 @@ def evaluate_deduction(problems: list[tuple[str, str]]) -> list[ProblemResult]:
             proved = geoprover.saturate(state)
             elapsed = (time.time() - t0) * 1000
             results.append(ProblemResult(
-                name=name,
-                solved=proved,
-                mode="deduction",
-                elapsed_ms=elapsed,
-                num_facts=state.num_facts(),
-                num_objects=state.num_objects(),
-                proof_length=0,
+                name=name, solved=proved, mode="deduction",
+                elapsed_ms=elapsed, num_facts=state.num_facts(),
+                num_objects=state.num_objects(), proof_length=0,
                 value=1.0 if proved else 0.0,
             ))
         except Exception as e:
@@ -79,7 +74,7 @@ def evaluate_deduction(problems: list[tuple[str, str]]) -> list[ProblemResult]:
 
 def evaluate_mcts_nn(
     problems: list[tuple[str, str]],
-    model: GeoNet,
+    model: GeoTransformer,
     config: MctsConfig,
     device: str = "cpu",
 ) -> list[ProblemResult]:
@@ -91,15 +86,11 @@ def evaluate_mcts_nn(
         try:
             result = solve_problem(problem_text, model, config, device)
             elapsed = (time.time() - t0) * 1000
-            # Get final state info
             state = geoprover.parse_problem(problem_text)
             geoprover.saturate(state)
             results.append(ProblemResult(
-                name=name,
-                solved=result.solved,
-                mode="mcts_nn",
-                elapsed_ms=elapsed,
-                num_facts=state.num_facts(),
+                name=name, solved=result.solved, mode="mcts_nn",
+                elapsed_ms=elapsed, num_facts=state.num_facts(),
                 num_objects=state.num_objects(),
                 proof_length=len(result.actions),
                 value=result.best_value,
@@ -115,7 +106,6 @@ def evaluate_mcts_nn(
 
 
 def summarize(results: list[ProblemResult], mode: str) -> BenchmarkResult:
-    """Compute aggregate statistics."""
     total = len(results)
     solved = sum(1 for r in results if r.solved)
     times = [r.elapsed_ms for r in results]
@@ -123,18 +113,14 @@ def summarize(results: list[ProblemResult], mode: str) -> BenchmarkResult:
     mean_time = sum(times) / total if total else 0
     median_time = times_sorted[total // 2] if total else 0
     return BenchmarkResult(
-        mode=mode,
-        total=total,
-        solved=solved,
+        mode=mode, total=total, solved=solved,
         solve_rate=solved / total if total else 0,
-        mean_time_ms=mean_time,
-        median_time_ms=median_time,
+        mean_time_ms=mean_time, median_time_ms=median_time,
         total_time_s=sum(times) / 1000,
     )
 
 
 def print_summary(bench: BenchmarkResult) -> None:
-    """Pretty-print benchmark results."""
     print(f"\n{'=' * 50}")
     print(f"  Mode: {bench.mode}")
     print(f"  Solved: {bench.solved}/{bench.total} ({bench.solve_rate:.1%})")
@@ -148,7 +134,6 @@ def compare_results(
     deduction: list[ProblemResult],
     mcts_nn: list[ProblemResult],
 ) -> None:
-    """Print comparison showing problems solved by MCTS but not deduction."""
     deduction_solved = {r.name for r in deduction if r.solved}
     mcts_solved = {r.name for r in mcts_nn if r.solved}
 
@@ -171,7 +156,6 @@ def save_results(
     results: dict[str, list[ProblemResult]],
     output_path: str,
 ) -> None:
-    """Save detailed results to JSON."""
     data = {}
     for mode, problem_results in results.items():
         data[mode] = [asdict(r) for r in problem_results]
@@ -182,7 +166,7 @@ def save_results(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate GeoNet")
+    parser = argparse.ArgumentParser(description="Evaluate GeoTransformer")
     parser.add_argument("--problems", default="problems/jgex_ag_231.txt")
     parser.add_argument("--checkpoint", default=None, help="Model checkpoint path")
     parser.add_argument("--device", default="cpu", choices=["cpu", "cuda", "mps"])
@@ -215,14 +199,14 @@ def main():
         return
 
     # 2. MCTS + NN
-    model = GeoNet().to(device)
+    model = GeoTransformer().to(device)
     if args.checkpoint and os.path.exists(args.checkpoint):
         load_checkpoint(model, None, args.checkpoint, device)
         print(f"Loaded model from {args.checkpoint}")
     else:
-        print("No checkpoint — using random NN weights (baseline)")
+        print("No checkpoint - using random NN weights (baseline)")
 
-    print(f"GeoNet parameters: {count_parameters(model):,}")
+    print(f"GeoTransformer parameters: {count_parameters(model):,}")
 
     config = MctsConfig(
         num_iterations=args.mcts_iterations,
@@ -237,10 +221,7 @@ def main():
     mcts_bench = summarize(mcts_results, "mcts_nn")
     print_summary(mcts_bench)
 
-    # Comparison
     compare_results(deduction_results, mcts_results)
-
-    # Save
     save_results(all_results, args.output)
 
 
