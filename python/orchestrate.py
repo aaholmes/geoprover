@@ -319,8 +319,10 @@ def self_play_episode(
     all_samples = []
     solved_count = 0
     deduction_count = 0
+    mcts_count = 0
+    t0 = time.time()
 
-    for name, definition in problems:
+    for i, (name, definition) in enumerate(problems):
         problem_text = f"{name}\n{definition}"
         try:
             result = solve_problem(problem_text, model, config, device)
@@ -328,10 +330,21 @@ def self_play_episode(
                 solved_count += 1
                 if result.actions == ["deduction"]:
                     deduction_count += 1
+                else:
+                    mcts_count += 1
             all_samples.extend(result.samples)
         except Exception as e:
             print(f"  Error on {name}: {e}")
 
+        # Progress every 50 problems
+        if (i + 1) % 50 == 0:
+            elapsed = time.time() - t0
+            print(f"    [{i+1}/{len(problems)}] solved={solved_count} "
+                  f"(ded={deduction_count}, mcts={mcts_count}) "
+                  f"samples={len(all_samples)} {elapsed:.0f}s")
+
+    elapsed = time.time() - t0
     print(f"  Solved: {solved_count}/{len(problems)} "
-          f"(deduction: {deduction_count}, MCTS: {solved_count - deduction_count})")
+          f"(deduction: {deduction_count}, MCTS: {mcts_count}) "
+          f"in {elapsed:.0f}s, {len(all_samples)} samples")
     return all_samples

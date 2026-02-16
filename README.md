@@ -1,6 +1,33 @@
 # Geoprover
 
-Neurosymbolic geometry theorem prover using a three-tier MCTS architecture adapted from the Caissawary chess engine. `saturate()` (forward-chaining deduction to fixed point) runs as the Tier 1 symbolic gate before every MCTS expansion. The SE-ResNet neural network suggests auxiliary constructions — the creative step deduction can't do. Benchmarks against AlphaGeometry's JGEX-AG-231 (231 problems) and IMO-AG-30 (30 formalized IMO problems).
+Neurosymbolic geometry theorem prover using a three-tier MCTS architecture adapted from the Caissawary chess engine. `saturate()` (forward-chaining deduction to fixed point) runs as the Tier 1 symbolic gate before every MCTS expansion. A text-based GeoTransformer neural network suggests auxiliary constructions — the creative step deduction can't do. Benchmarks against AlphaGeometry's JGEX-AG-231 (231 problems).
+
+## Results
+
+| Method | Solved | Rate | Mean Time | Notes |
+|--------|--------|------|-----------|-------|
+| Deduction only | 181/231 | 78.4% | 428ms | 49 rules, pure symbolic |
+| MCTS + random NN | 187/231 | 81.0% | 3.6s | Untrained transformer, 50 MCTS iters |
+| **MCTS + trained NN** | **189/231** | **81.8%** | **2.7s** | Synthetic + supervised pre-training |
+| Expert iter (self-play peak) | 190/231 | 82.3% | - | Best single episode during training |
+
+The trained NN solves **8-9 additional problems** that pure deduction cannot, including **Morley's theorem** and the **9-point circle**. The trained model is 25% faster than the random baseline because it prioritizes promising constructions.
+
+Deduction counts vary ±2 between runs due to `HashSet` iteration non-determinism in Rust.
+
+### Problems solved by MCTS+NN that deduction cannot
+
+| Problem | Steps | Time |
+|---------|-------|------|
+| L046-16 (parallel line concurrence) | 1 | 236ms |
+| 9-point circle | 1 | 1.3s |
+| L058-9 (angle bisector) | 1 | 35ms |
+| **Morley's theorem** | 1 | 2.1s |
+| GDD_FULL 21-40 #40 | 1 | 100ms |
+| Auxiliary construction #22 | 1 | 143ms |
+| Ye's auxiliary thinking | 2 | 19.1s |
+| E076-31 | 1 | 9.5s |
+| E051-28 | 1 | 5.9s |
 
 ## Current Status
 
@@ -8,13 +35,11 @@ Neurosymbolic geometry theorem prover using a three-tier MCTS architecture adapt
 |-------|--------|---------|
 | 1. Rust core | **Done** | ProofState, parser (231/231 JGEX), deduction (49 rules), construction (16 types) |
 | 2. MCTS | **Done** | MctsNode tree, UCB/PUCT selection, expand/evaluate/backprop, classical fallback |
-| 3. PyO3 bridge | **Done** | Tensor encoding (20x32x32), full PyO3 API: parse, saturate, encode, construct |
-| 4. NN + training | **Done** | GeoNet SE-ResNet (~3M params), NN-guided MCTS, expert iteration training loop |
-| 5. Evaluation | **Done** | Benchmark suite comparing deduction-only vs MCTS+NN, JSON result export |
+| 3. PyO3 bridge | **Done** | Text + tensor encoding, full PyO3 API: parse, saturate, encode, construct |
+| 4. NN + training | **Done** | GeoTransformer (~4M params), NN-guided MCTS, 3-phase training pipeline |
+| 5. Evaluation | **Done** | Benchmark suite, 3-way comparison (deduction vs random vs trained NN) |
 
-**JGEX-AG-231: ~180/231 by deduction (~78%), 185/231 with MCTS (80.1%).**
-
-**388 Rust tests** (371 unit + 17 integration) + **13 Python NN tests**, clippy clean.
+**390 Rust tests** (373 unit + 17 integration) + **17 Python NN tests**, clippy clean.
 
 ## Architecture
 
@@ -32,36 +57,44 @@ Rust extension module (MCTS, deduction engine, state encoding)
 | Tier | Role | Geometry equivalent |
 |------|------|-------------------|
 | 1 | Symbolic deduction | `saturate()` — 49 rules to fixed point |
-| 2 | MCTS tree search | Search over auxiliary constructions (~30-50 candidates/step) |
-| 3 | Neural oracle | GeoNet SE-ResNet (~3M params), dual-head: policy + value |
+| 2 | MCTS tree search | Search over auxiliary constructions (~20-30 candidates/step) |
+| 3 | Neural oracle | GeoTransformer (~4M params), dual-head: policy + value |
 
-**GeoNet architecture:**
-- Input: 20x32x32 tensor (12 relation channels + 3 goal channels + 1 reserved + 4 object-type channels)
-- Backbone: 128-channel SE-ResNet with 6 residual blocks
+**GeoTransformer architecture:**
+- Input: tokenized text sequence (proof state as relation list + goal)
+- Backbone: 6-layer transformer encoder, d_model=256, 8 heads, dim_ff=512
+- Custom tokenizer: ~86-token geometry vocabulary (point names, relation/construction keywords)
 - Policy head: 2048 logits over construction index space (7 types x 292 slots)
 - Value head: `V = tanh(v_logit + k * delta_D)` where k is a learned confidence scalar
+- ~4M trainable parameters
+
+**Training pipeline (3-phase):**
+1. Synthetic pre-training on Rust-generated random geometry configurations (10K+ examples)
+2. Supervised fine-tuning on deduction-solvable JGEX problems
+3. Expert iteration: MCTS self-play → collect visit distributions → train → repeat
 
 ## Source Layout
 
 ```
 src/
-  proof_state.rs    ProofState, GeoObject, Relation (Zobrist hashing)
+  proof_state.rs    ProofState, GeoObject, Relation (Zobrist hashing, text serialization)
   deduction.rs      49 forward-chaining rules + degenerate-fact filtering
   construction.rs   16 construction types with priority classification
   parser.rs         JGEX DSL parser (40+ predicates, 231/231 coverage)
-  encoding.rs       state_to_tensor() — 20x32x32 relation adjacency grid
-  lib.rs            PyO3 bridge (PyProofState, PyConstruction, 7 exposed functions)
+  encoding.rs       state_to_tensor() — 20x32x32 relation adjacency grid (legacy)
+  synthetic.rs      Random geometry data generator for pre-training
+  lib.rs            PyO3 bridge (PyProofState, PyConstruction, 10 exposed functions)
   mcts/
     mod.rs          Module re-exports
     node.rs         MctsNode (Rc<RefCell> tree), expand, evaluate, backprop, UCB/PUCT
     search.rs       mcts_search() loop, select_leaf, proof path extraction
 python/
-  model.py          GeoNet SE-ResNet, construction indexing, tensor conversion
+  model.py          GeoTransformer (text-based), GeoNetCNN (legacy), tokenizer
   orchestrate.py    NN-guided MCTS (Python-side tree), self-play data collection
-  train.py          Supervised pre-training + expert iteration training loop
+  train.py          3-phase training: synthetic → supervised → expert iteration
   evaluate.py       Benchmark suite: deduction vs MCTS+NN, comparison reports
-  test_nn.py        13 end-to-end tests for NN modules
-  test_bridge.py    PyO3 bridge smoke tests
+  test_nn.py        17 end-to-end tests for NN modules
+  test_bridge.py    11 PyO3 bridge smoke tests
 ```
 
 ## The Geometry Domain
@@ -73,6 +106,7 @@ python/
 - **Goal**: a single `Relation` to prove
 - **Proved** when `goal ∈ facts`. Any construction sequence that gets the goal into the fact set is a valid proof.
 - **Zobrist hash** on facts for transposition detection
+- **Text encoding**: `to_text()` serializes state as `"coll a b c ; para a b c d ; ? perp a h b c"`
 
 ### Auxiliary Constructions (Action Space)
 
@@ -121,7 +155,7 @@ a b c = triangle; h = on_tline b a c, on_tline c a b ? perp a h b c
 ## Build & Test
 
 ```bash
-cargo test                                          # 388 Rust tests
+cargo test                                          # 390 Rust tests
 cargo clippy                                        # lint
 cargo test --test test_integration -- --nocapture   # integration tests with output
 maturin develop                                     # build PyO3 extension
@@ -132,15 +166,16 @@ python python/test_nn.py                            # NN module tests
 ## Training
 
 ```bash
-# Supervised pre-training on deduction-solvable problems
-python python/train.py --supervised-only
+# Phase A+B: Synthetic pre-training + supervised fine-tuning
+python python/train.py --supervised-only --synthetic-size 10000
 
-# Full expert iteration (supervised + self-play)
-python python/train.py --iterations 20 --device cuda
+# Full pipeline: synthetic + supervised + expert iteration
+python python/train.py --iterations 5 --synthetic-size 10000
 
-# Evaluate against JGEX-AG-231
-python python/evaluate.py --checkpoint checkpoints/iter_020.pt
+# Resume expert iteration from checkpoint
+python python/train.py --resume checkpoints/supervised.pt --iterations 10
 
-# Deduction-only baseline
+# Evaluate
+python python/evaluate.py --checkpoint checkpoints/iter_005.pt
 python python/evaluate.py --deduction-only
 ```

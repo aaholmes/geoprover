@@ -41,18 +41,19 @@ from orchestrate import (
 )
 
 # Training defaults
-DEFAULT_LR = 1e-3
+DEFAULT_LR = 1e-4
 DEFAULT_WEIGHT_DECAY = 1e-4
 DEFAULT_BATCH_SIZE = 64
 DEFAULT_EPOCHS_PER_ITER = 5
 DEFAULT_REPLAY_SIZE = 50000
 DEFAULT_VALUE_WEIGHT = 1.0
-DEFAULT_NUM_ITERATIONS = 20
+DEFAULT_NUM_ITERATIONS = 10
 DEFAULT_PROBLEMS_FILE = "problems/jgex_ag_231.txt"
 DEFAULT_CHECKPOINT_DIR = "checkpoints"
-DEFAULT_SYNTHETIC_SIZE = 100000
+DEFAULT_SYNTHETIC_SIZE = 10000
 DEFAULT_SYNTHETIC_SEED = 42
 DEFAULT_MAX_SEQ_LEN = 256
+DEFAULT_SELFPLAY_MCTS_ITERS = 50
 
 
 class ReplayBuffer:
@@ -340,8 +341,10 @@ def expert_iteration(
     optimizer = torch.optim.Adam(
         model.parameters(), lr=lr, weight_decay=DEFAULT_WEIGHT_DECAY
     )
+    # Total training steps: synthetic (2x) + supervised (1x) + expert (num_iterations)
+    total_epochs = epochs_per_iter * 2 + epochs_per_iter + num_iterations * epochs_per_iter
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=num_iterations * epochs_per_iter
+        optimizer, T_max=total_epochs, eta_min=lr * 0.01,
     )
     replay = ReplayBuffer()
     start_iter = 0
@@ -356,7 +359,18 @@ def expert_iteration(
     print("=" * 60)
     print(f"Generating {synthetic_size} synthetic examples (seed={synthetic_seed})...")
     t0 = time.time()
-    synthetic_data = geoprover.generate_synthetic_data(synthetic_size, synthetic_seed)
+    # Generate in batches for progress reporting
+    batch_gen_size = min(synthetic_size, 2000)
+    synthetic_data = []
+    generated = 0
+    while generated < synthetic_size:
+        batch = min(batch_gen_size, synthetic_size - generated)
+        chunk = geoprover.generate_synthetic_data(batch, synthetic_seed + generated)
+        synthetic_data.extend(chunk)
+        generated += batch
+        elapsed = time.time() - t0
+        rate = len(synthetic_data) / elapsed if elapsed > 0 else 0
+        print(f"  {len(synthetic_data)}/{synthetic_size} ({rate:.0f}/s, {elapsed:.0f}s)")
     elapsed = time.time() - t0
     print(f"  Generated {len(synthetic_data)} examples in {elapsed:.1f}s")
 
@@ -401,8 +415,8 @@ def expert_iteration(
     print("Phase C: Expert iteration")
     print("=" * 60)
     mcts_config = MctsConfig(
-        num_iterations=100,
-        max_children=30,
+        num_iterations=DEFAULT_SELFPLAY_MCTS_ITERS,
+        max_children=20,
         max_depth=3,
         max_seq_len=max_seq_len,
     )
@@ -469,25 +483,54 @@ def main():
     if args.supervised_only:
         # Generate synthetic + supervised data and train
         print("Generating synthetic data...")
-        synthetic_data = geoprover.generate_synthetic_data(args.synthetic_size, args.synthetic_seed)
-        print(f"Generated {len(synthetic_data)} synthetic examples")
+        t0 = time.time()
+        synthetic_data = []
+        generated = 0
+        batch_gen_size = min(args.synthetic_size, 2000)
+        while generated < args.synthetic_size:
+            batch = min(batch_gen_size, args.synthetic_size - generated)
+            chunk = geoprover.generate_synthetic_data(batch, args.synthetic_seed + generated)
+            synthetic_data.extend(chunk)
+            generated += batch
+            elapsed = time.time() - t0
+            rate = len(synthetic_data) / elapsed if elapsed > 0 else 0
+            print(f"  {len(synthetic_data)}/{args.synthetic_size} ({rate:.0f}/s, {elapsed:.0f}s)")
+        print(f"Generated {len(synthetic_data)} synthetic examples in {time.time()-t0:.1f}s")
 
-        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+        num_synthetic_epochs = args.epochs * 3
+        num_supervised_epochs = args.epochs * 5
+        total_epochs = num_synthetic_epochs + num_supervised_epochs
+        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=DEFAULT_WEIGHT_DECAY)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=total_epochs, eta_min=args.lr * 0.01,
+        )
 
         if synthetic_data:
             dataset = SyntheticDataset(synthetic_data, max_seq_len=args.max_seq_len)
             loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)
-            for epoch in range(args.epochs * 5):
+            for epoch in range(num_synthetic_epochs):
                 metrics = train_epoch(model, loader, optimizer, device)
-                print(f"Synthetic epoch {epoch+1}: loss={metrics['loss']:.4f}")
+                scheduler.step()
+                print(f"Synthetic epoch {epoch+1}/{num_synthetic_epochs}: "
+                      f"loss={metrics['loss']:.4f} "
+                      f"policy={metrics['policy_loss']:.4f} "
+                      f"value={metrics['value_loss']:.4f}")
+            save_checkpoint(
+                model, optimizer, 0, metrics,
+                os.path.join(args.checkpoint_dir, "synthetic.pt"),
+            )
 
         samples = generate_supervised_data(args.problems, max_seq_len=args.max_seq_len)
         if samples:
             dataset = TextGeometryDataset(samples, max_seq_len=args.max_seq_len)
             loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)
-            for epoch in range(args.epochs * 5):
+            for epoch in range(num_supervised_epochs):
                 metrics = train_epoch(model, loader, optimizer, device)
-                print(f"Supervised epoch {epoch+1}: loss={metrics['loss']:.4f}")
+                scheduler.step()
+                print(f"Supervised epoch {epoch+1}/{num_supervised_epochs}: "
+                      f"loss={metrics['loss']:.4f} "
+                      f"policy={metrics['policy_loss']:.4f} "
+                      f"value={metrics['value_loss']:.4f}")
 
         save_checkpoint(
             model, optimizer, 0, metrics,
