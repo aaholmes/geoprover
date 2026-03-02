@@ -1,0 +1,658 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Geoprover - Geometry Theorem Prover</title>
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #f5f7fa;
+            color: #333;
+            line-height: 1.5;
+        }
+        .header {
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+            color: white;
+            padding: 2rem;
+            text-align: center;
+        }
+        .header h1 { font-size: 2.2rem; margin-bottom: 0.5rem; }
+        .header p { opacity: 0.8; font-size: 1.1rem; }
+        .stats-bar {
+            display: flex;
+            justify-content: center;
+            gap: 2rem;
+            padding: 1.5rem;
+            background: white;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            flex-wrap: wrap;
+        }
+        .stat-card {
+            text-align: center;
+            padding: 0.8rem 1.5rem;
+            border-radius: 8px;
+            background: #f8f9fc;
+        }
+        .stat-card .number { font-size: 2rem; font-weight: 700; color: #0f3460; }
+        .stat-card .label { font-size: 0.85rem; color: #666; text-transform: uppercase; letter-spacing: 0.5px; }
+        .container { max-width: 1400px; margin: 0 auto; padding: 1.5rem; }
+        .tabs {
+            display: flex;
+            gap: 0.5rem;
+            margin-bottom: 1rem;
+            border-bottom: 2px solid #e0e0e0;
+            padding-bottom: 0;
+        }
+        .tab {
+            padding: 0.6rem 1.2rem;
+            cursor: pointer;
+            border: none;
+            background: none;
+            font-size: 0.95rem;
+            color: #666;
+            border-bottom: 3px solid transparent;
+            transition: all 0.2s;
+        }
+        .tab:hover { color: #0f3460; }
+        .tab.active { color: #0f3460; border-bottom-color: #0f3460; font-weight: 600; }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+
+        /* Problem table */
+        .filter-bar {
+            display: flex;
+            gap: 1rem;
+            margin-bottom: 1rem;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        .filter-bar input {
+            padding: 0.5rem 1rem;
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            font-size: 0.9rem;
+            width: 300px;
+        }
+        .filter-bar select {
+            padding: 0.5rem 0.8rem;
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            font-size: 0.9rem;
+        }
+        .filter-bar .count { color: #666; font-size: 0.9rem; }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background: white;
+            border-radius: 8px;
+            overflow: hidden;
+            box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+        }
+        th {
+            background: #f0f2f5;
+            padding: 0.7rem 1rem;
+            text-align: left;
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: #555;
+            cursor: pointer;
+            user-select: none;
+        }
+        th:hover { background: #e4e7ec; }
+        td {
+            padding: 0.6rem 1rem;
+            border-top: 1px solid #f0f0f0;
+            font-size: 0.9rem;
+        }
+        tr:hover { background: #f8f9fc; }
+        .badge {
+            display: inline-block;
+            padding: 0.15rem 0.5rem;
+            border-radius: 10px;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+        .badge-solved { background: #d4edda; color: #155724; }
+        .badge-unsolved { background: #f8d7da; color: #721c24; }
+        .badge-deduction { background: #cce5ff; color: #004085; }
+        .badge-mcts { background: #fff3cd; color: #856404; }
+        .badge-both { background: #d4edda; color: #155724; }
+
+        /* Charts */
+        .chart-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1.5rem;
+            margin-bottom: 1.5rem;
+        }
+        .chart-card {
+            background: white;
+            border-radius: 8px;
+            padding: 1.5rem;
+            box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+        }
+        .chart-card h3 { margin-bottom: 1rem; color: #333; }
+        .chart-card.full-width { grid-column: 1 / -1; }
+
+        /* Problem detail modal */
+        .modal-overlay {
+            display: none;
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.5);
+            z-index: 1000;
+            justify-content: center;
+            align-items: center;
+        }
+        .modal-overlay.active { display: flex; }
+        .modal {
+            background: white;
+            border-radius: 12px;
+            padding: 2rem;
+            max-width: 800px;
+            width: 90%;
+            max-height: 80vh;
+            overflow-y: auto;
+        }
+        .modal h2 { margin-bottom: 1rem; }
+        .modal .close {
+            float: right;
+            cursor: pointer;
+            font-size: 1.5rem;
+            color: #999;
+        }
+        .modal .close:hover { color: #333; }
+        .detail-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1rem;
+            margin: 1rem 0;
+        }
+        .detail-item { padding: 0.5rem; background: #f8f9fc; border-radius: 6px; }
+        .detail-item .label { font-size: 0.8rem; color: #666; text-transform: uppercase; }
+        .detail-item .value { font-size: 1.1rem; font-weight: 600; }
+        pre.definition {
+            background: #1a1a2e;
+            color: #a8d8ea;
+            padding: 1rem;
+            border-radius: 6px;
+            overflow-x: auto;
+            font-size: 0.85rem;
+            margin: 1rem 0;
+        }
+
+        /* IMO table */
+        .imo-row { font-weight: 600; }
+        .ag-badge {
+            display: inline-block;
+            padding: 0.1rem 0.4rem;
+            border-radius: 4px;
+            font-size: 0.7rem;
+            font-weight: 600;
+            margin-left: 0.3rem;
+        }
+        .ag-solved { background: #c3e6cb; color: #155724; }
+        .ag-unsolved { background: #f5c6cb; color: #721c24; }
+
+        @media (max-width: 768px) {
+            .chart-row { grid-template-columns: 1fr; }
+            .detail-grid { grid-template-columns: 1fr; }
+            .stats-bar { gap: 1rem; }
+        }
+    </style>
+</head>
+<body>
+
+<div class="header">
+    <h1>Geoprover</h1>
+    <p>Neurosymbolic Geometry Theorem Prover &mdash; MCTS + Transformer + Forward-Chaining Deduction</p>
+</div>
+
+<div class="stats-bar" id="stats-bar"></div>
+
+<div class="container">
+    <div class="tabs">
+        <button class="tab active" onclick="switchTab('problems')">Problem Browser</button>
+        <button class="tab" onclick="switchTab('charts')">Ablation Charts</button>
+        <button class="tab" onclick="switchTab('imo')">IMO Results</button>
+        <button class="tab" onclick="switchTab('architecture')">Architecture</button>
+    </div>
+
+    <!-- Problem Browser -->
+    <div id="tab-problems" class="tab-content active">
+        <div class="filter-bar">
+            <input type="text" id="search" placeholder="Search problems..." oninput="filterTable()">
+            <select id="filter-mode" onchange="filterTable()">
+                <option value="all">All problems</option>
+                <option value="both">Solved by both</option>
+                <option value="deduction-only">Deduction only</option>
+                <option value="mcts-only">MCTS only</option>
+                <option value="unsolved">Unsolved</option>
+            </select>
+            <span class="count" id="filter-count"></span>
+        </div>
+        <table>
+            <thead>
+                <tr>
+                    <th onclick="sortTable(0)">#</th>
+                    <th onclick="sortTable(1)">Problem</th>
+                    <th onclick="sortTable(2)">Deduction</th>
+                    <th onclick="sortTable(3)">MCTS+NN</th>
+                    <th onclick="sortTable(4)">Time (ms)</th>
+                    <th onclick="sortTable(5)">Facts</th>
+                    <th onclick="sortTable(6)">Objects</th>
+                </tr>
+            </thead>
+            <tbody id="problem-table"></tbody>
+        </table>
+    </div>
+
+    <!-- Charts -->
+    <div id="tab-charts" class="tab-content">
+        <div class="chart-row">
+            <div class="chart-card">
+                <h3>Solve Rates: Deduction vs Random NN vs Trained NN</h3>
+                <div id="chart-bar"></div>
+            </div>
+            <div class="chart-card">
+                <h3>Time vs Problem Complexity</h3>
+                <div id="chart-scatter"></div>
+            </div>
+        </div>
+        <div class="chart-row">
+            <div class="chart-card">
+                <h3>Cumulative Solves by Time</h3>
+                <div id="chart-cumulative"></div>
+            </div>
+            <div class="chart-card">
+                <h3>Fact Count Distribution</h3>
+                <div id="chart-hist"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- IMO Results -->
+    <div id="tab-imo" class="tab-content">
+        <div class="chart-row">
+            <div class="chart-card full-width">
+                <h3>IMO-AG-30 Results vs AlphaGeometry</h3>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Problem</th>
+                            <th>Geoprover Deduction</th>
+                            <th>Geoprover MCTS+NN</th>
+                            <th>AlphaGeometry</th>
+                        </tr>
+                    </thead>
+                    <tbody id="imo-table"></tbody>
+                </table>
+                <div id="chart-imo-compare" style="margin-top: 1rem;"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Architecture -->
+    <div id="tab-architecture" class="tab-content">
+        <div class="chart-card">
+            <h3>Three-Tier Architecture</h3>
+            <div style="font-family: monospace; padding: 1rem; background: #1a1a2e; color: #a8d8ea; border-radius: 6px; line-height: 1.8;">
+<pre>
+Tier 1: Symbolic Deduction (52 forward-chaining rules)
+  Input: ProofState (points, facts, goal)
+  Output: saturated state (all derivable facts)
+  If goal in facts -> PROVED
+
+Tier 2: MCTS Tree Search (200 iterations, depth 3)
+  At each node: generate candidate constructions
+  Select via UCB/PUCT with NN priors
+  Evaluate: run Tier 1 deduction, then NN value
+
+Tier 3: Neural Oracle (GeoTransformer, ~5M params)
+  Input: tokenized proof state text
+  Output: policy (construction priors) + value (solve probability)
+  V = tanh(v_logit + k * delta_D)
+
+Training Pipeline:
+  Phase A: Synthetic pre-training (50K examples)
+  Phase B: Supervised fine-tuning (JGEX solved problems)
+  Phase C: Expert iteration (MCTS self-play)
+</pre>
+            </div>
+            <h3 style="margin-top:1.5rem;">Deduction Rules (52 total)</h3>
+            <div style="columns: 2; column-gap: 2rem; font-size: 0.9rem; margin-top: 0.5rem;">
+                <p><strong>Parallel/Perp (6):</strong> transitive parallel, perp-to-parallel, corresponding angles, alternate interior, perp-parallel transfer, two equidistant perp</p>
+                <p><strong>Congruence (7):</strong> transitive congruent, isosceles base angles, isosceles converse, perp+midpoint, SAS, ASA, SSS</p>
+                <p><strong>Angles (4):</strong> transitive equal angle, perpendicular angles, eqangle+perp, AA similarity</p>
+                <p><strong>Circle/Cyclic (7):</strong> circle equidistance, cyclic from oncircle, inscribed angles, inscribed converse, cyclic+parallel, cyclic+equal angle, opposite angles cyclic</p>
+                <p><strong>Midpoint (5):</strong> midpoint definition, midpoint converse, midline parallel, midpoint diagonal, midpoint parallelogram</p>
+                <p><strong>Collinear (3):</strong> line extension, transitivity, parallel shared point</p>
+                <p><strong>Ratio (6):</strong> transitive, ratio=1, midpoint ratio, Thales, congruent ratio, converse Thales</p>
+                <p><strong>Other (14):</strong> Thales theorem, equidistant midpoint, perp bisector, congruent oncircle, equal angles to parallel, quadrilateral rules (4), parallel projection, tangent rules (2), angle bisector rules (2), orthocenter concurrence</p>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Problem Detail Modal -->
+<div class="modal-overlay" id="modal" onclick="if(event.target===this)closeModal()">
+    <div class="modal">
+        <span class="close" onclick="closeModal()">&times;</span>
+        <h2 id="modal-title"></h2>
+        <pre class="definition" id="modal-definition"></pre>
+        <div class="detail-grid" id="modal-details"></div>
+    </div>
+</div>
+
+<script>
+// Data will be loaded from embedded JSON
+let jgexData = { deduction: [], mcts_nn: [] };
+let imoData = { deduction: [], mcts_nn: [] };
+
+// Known results
+const JGEX_RESULTS = {
+    deduction: 181,
+    random_nn: 187,
+    trained_nn: 189,
+};
+
+const IMO_PROBLEMS = [
+    "2000p1", "2000p6", "2001p1", "2001p5", "2002p2a", "2002p2b",
+    "2003p4", "2004p1", "2004p5", "2005p5", "2006p1", "2007p2",
+    "2007p4", "2008p1b", "2008p6", "2009p2", "2010p2", "2010p4",
+    "2011p6", "2012p1", "2012p5", "2013p3", "2014p4", "2015p3",
+    "2016p3", "2017p4", "2018p1", "2019p2", "2019p6", "2020p1"
+];
+
+const IMO_DEDUCTION_SOLVED = new Set(["2002p2b", "2003p4", "2004p5", "2010p4", "2017p4"]);
+const IMO_MCTS_SOLVED = new Set(["2002p2b", "2003p4", "2004p5", "2010p4", "2017p4", "2012p1", "2019p2"]);
+// AlphaGeometry solves 25/30
+const AG_SOLVED = new Set([
+    "2000p1", "2001p1", "2002p2a", "2002p2b", "2003p4", "2004p1", "2004p5",
+    "2005p5", "2006p1", "2007p2", "2008p1b", "2009p2", "2010p2", "2010p4",
+    "2011p6", "2012p1", "2012p5", "2013p3", "2014p4", "2015p3",
+    "2016p3", "2017p4", "2018p1", "2019p2", "2019p6"
+]);
+
+function init() {
+    loadData();
+    renderStats();
+    renderTable();
+    renderCharts();
+    renderIMOTable();
+    filterTable();
+}
+
+async function loadData() {
+    try {
+        const resp = await fetch('../results/eval_trained.json');
+        if (resp.ok) jgexData = await resp.json();
+    } catch(e) { console.log('Using embedded data'); }
+    try {
+        const resp = await fetch('../results/imo_mcts_nn.json');
+        if (resp.ok) imoData = await resp.json();
+    } catch(e) {}
+}
+
+function renderStats() {
+    const bar = document.getElementById('stats-bar');
+    const stats = [
+        { number: '52', label: 'Deduction Rules' },
+        { number: `${JGEX_RESULTS.deduction}/231`, label: 'JGEX Deduction' },
+        { number: `${JGEX_RESULTS.trained_nn}/231`, label: 'JGEX MCTS+NN' },
+        { number: `${IMO_MCTS_SOLVED.size}/30`, label: 'IMO-AG-30' },
+        { number: '~5M', label: 'NN Parameters' },
+        { number: `+${JGEX_RESULTS.trained_nn - JGEX_RESULTS.deduction}`, label: 'MCTS Contribution' },
+    ];
+    bar.innerHTML = stats.map(s =>
+        `<div class="stat-card"><div class="number">${s.number}</div><div class="label">${s.label}</div></div>`
+    ).join('');
+}
+
+function shortName(name) {
+    const parts = name.split('/');
+    return parts[parts.length - 1].replace('.gex', '');
+}
+
+function renderTable() {
+    const tbody = document.getElementById('problem-table');
+    const deduction = jgexData.deduction || [];
+    const mcts = jgexData.mcts_nn || [];
+
+    // Merge by index
+    const rows = [];
+    const n = Math.max(deduction.length, mcts.length, 231);
+    for (let i = 0; i < n; i++) {
+        const d = deduction[i] || {};
+        const m = mcts[i] || {};
+        const name = d.name || m.name || `Problem ${i+1}`;
+        rows.push({
+            idx: i + 1,
+            name: name,
+            short: shortName(name),
+            ded_solved: d.solved || false,
+            mcts_solved: m.solved || false,
+            time: m.elapsed_ms || d.elapsed_ms || 0,
+            facts: d.num_facts || m.num_facts || 0,
+            objects: d.num_objects || m.num_objects || 0,
+            definition: d.definition || '',
+            proof_length: m.proof_length || 0,
+            value: m.value || 0,
+        });
+    }
+
+    tbody.innerHTML = rows.map(r => {
+        const dedBadge = r.ded_solved
+            ? '<span class="badge badge-solved">SOLVED</span>'
+            : '<span class="badge badge-unsolved">failed</span>';
+        const mctsBadge = r.mcts_solved
+            ? '<span class="badge badge-solved">SOLVED</span>'
+            : '<span class="badge badge-unsolved">failed</span>';
+        const category = r.ded_solved && r.mcts_solved ? 'both'
+            : r.ded_solved ? 'deduction-only'
+            : r.mcts_solved ? 'mcts-only'
+            : 'unsolved';
+        return `<tr data-category="${category}" onclick="showDetail(${r.idx - 1})">
+            <td>${r.idx}</td>
+            <td title="${r.name}">${r.short}</td>
+            <td>${dedBadge}</td>
+            <td>${mctsBadge}</td>
+            <td>${r.time.toFixed(0)}</td>
+            <td>${r.facts}</td>
+            <td>${r.objects}</td>
+        </tr>`;
+    }).join('');
+}
+
+function filterTable() {
+    const search = document.getElementById('search').value.toLowerCase();
+    const mode = document.getElementById('filter-mode').value;
+    const rows = document.querySelectorAll('#problem-table tr');
+    let count = 0;
+    rows.forEach(row => {
+        const name = row.children[1]?.textContent.toLowerCase() || '';
+        const cat = row.getAttribute('data-category');
+        const matchSearch = name.includes(search);
+        const matchMode = mode === 'all' || cat === mode;
+        const show = matchSearch && matchMode;
+        row.style.display = show ? '' : 'none';
+        if (show) count++;
+    });
+    document.getElementById('filter-count').textContent = `${count} problems`;
+}
+
+let sortDir = {};
+function sortTable(col) {
+    const tbody = document.getElementById('problem-table');
+    const rows = Array.from(tbody.rows);
+    const dir = sortDir[col] = -(sortDir[col] || 1);
+    rows.sort((a, b) => {
+        let av = a.cells[col].textContent;
+        let bv = b.cells[col].textContent;
+        if (!isNaN(av) && !isNaN(bv)) return (parseFloat(av) - parseFloat(bv)) * dir;
+        return av.localeCompare(bv) * dir;
+    });
+    rows.forEach(r => tbody.appendChild(r));
+}
+
+function showDetail(idx) {
+    const d = (jgexData.deduction || [])[idx] || {};
+    const m = (jgexData.mcts_nn || [])[idx] || {};
+    const name = d.name || m.name || '';
+
+    document.getElementById('modal-title').textContent = shortName(name);
+    document.getElementById('modal-definition').textContent = name;
+
+    const details = [
+        { label: 'Deduction', value: d.solved ? 'SOLVED' : 'Failed' },
+        { label: 'MCTS+NN', value: m.solved ? 'SOLVED' : 'Failed' },
+        { label: 'Deduction Time', value: `${(d.elapsed_ms || 0).toFixed(0)}ms` },
+        { label: 'MCTS Time', value: `${(m.elapsed_ms || 0).toFixed(0)}ms` },
+        { label: 'Facts', value: d.num_facts || m.num_facts || 'N/A' },
+        { label: 'Objects', value: d.num_objects || m.num_objects || 'N/A' },
+        { label: 'Proof Steps', value: m.proof_length || 0 },
+        { label: 'Value Estimate', value: (m.value || 0).toFixed(4) },
+    ];
+    document.getElementById('modal-details').innerHTML = details.map(d =>
+        `<div class="detail-item"><div class="label">${d.label}</div><div class="value">${d.value}</div></div>`
+    ).join('');
+    document.getElementById('modal').classList.add('active');
+}
+
+function closeModal() {
+    document.getElementById('modal').classList.remove('active');
+}
+
+function renderCharts() {
+    // Bar chart: solve rates
+    Plotly.newPlot('chart-bar', [{
+        x: ['Deduction Only', 'MCTS + Random NN', 'MCTS + Trained NN'],
+        y: [JGEX_RESULTS.deduction, JGEX_RESULTS.random_nn, JGEX_RESULTS.trained_nn],
+        type: 'bar',
+        marker: {
+            color: ['#4488cc', '#ffaa44', '#22aa44'],
+        },
+        text: [`${JGEX_RESULTS.deduction}/231`, `${JGEX_RESULTS.random_nn}/231`, `${JGEX_RESULTS.trained_nn}/231`],
+        textposition: 'outside',
+    }], {
+        yaxis: { title: 'Problems Solved', range: [0, 231] },
+        margin: { t: 20, b: 40 },
+        height: 300,
+        plot_bgcolor: '#fafafa',
+    }, { responsive: true });
+
+    // Scatter: time vs facts
+    const ded = jgexData.deduction || [];
+    if (ded.length > 0) {
+        const solved = ded.filter(d => d.solved);
+        const unsolved = ded.filter(d => !d.solved);
+        Plotly.newPlot('chart-scatter', [
+            {
+                x: solved.map(d => d.num_facts),
+                y: solved.map(d => d.elapsed_ms),
+                mode: 'markers',
+                name: 'Solved',
+                marker: { color: '#22aa44', size: 5 },
+            },
+            {
+                x: unsolved.map(d => d.num_facts),
+                y: unsolved.map(d => d.elapsed_ms),
+                mode: 'markers',
+                name: 'Unsolved',
+                marker: { color: '#cc4444', size: 5 },
+            },
+        ], {
+            xaxis: { title: 'Number of Facts', type: 'log' },
+            yaxis: { title: 'Time (ms)', type: 'log' },
+            margin: { t: 20 },
+            height: 300,
+            legend: { x: 0.02, y: 0.98 },
+            plot_bgcolor: '#fafafa',
+        }, { responsive: true });
+
+        // Cumulative solves
+        const times = solved.map(d => d.elapsed_ms).sort((a, b) => a - b);
+        const cumX = times;
+        const cumY = times.map((_, i) => i + 1);
+        Plotly.newPlot('chart-cumulative', [{
+            x: cumX,
+            y: cumY,
+            mode: 'lines',
+            fill: 'tozeroy',
+            line: { color: '#4488cc' },
+        }], {
+            xaxis: { title: 'Time (ms)', type: 'log' },
+            yaxis: { title: 'Cumulative Solves' },
+            margin: { t: 20 },
+            height: 300,
+            plot_bgcolor: '#fafafa',
+        }, { responsive: true });
+
+        // Fact histogram
+        const allFacts = ded.map(d => d.num_facts);
+        Plotly.newPlot('chart-hist', [{
+            x: allFacts,
+            type: 'histogram',
+            nbinsx: 30,
+            marker: { color: '#4488cc' },
+        }], {
+            xaxis: { title: 'Number of Facts' },
+            yaxis: { title: 'Count' },
+            margin: { t: 20 },
+            height: 300,
+            plot_bgcolor: '#fafafa',
+        }, { responsive: true });
+    }
+}
+
+function renderIMOTable() {
+    const tbody = document.getElementById('imo-table');
+    tbody.innerHTML = IMO_PROBLEMS.map(p => {
+        const ded = IMO_DEDUCTION_SOLVED.has(p);
+        const mcts = IMO_MCTS_SOLVED.has(p);
+        const ag = AG_SOLVED.has(p);
+        return `<tr>
+            <td><strong>${p}</strong></td>
+            <td>${ded ? '<span class="badge badge-solved">SOLVED</span>' : '<span class="badge badge-unsolved">-</span>'}</td>
+            <td>${mcts ? '<span class="badge badge-solved">SOLVED</span>' : '<span class="badge badge-unsolved">-</span>'}</td>
+            <td>${ag ? '<span class="ag-badge ag-solved">SOLVED</span>' : '<span class="ag-badge ag-unsolved">-</span>'}</td>
+        </tr>`;
+    }).join('');
+
+    // IMO comparison bar
+    Plotly.newPlot('chart-imo-compare', [{
+        x: ['Geoprover Deduction', 'Geoprover MCTS+NN', 'AlphaGeometry'],
+        y: [IMO_DEDUCTION_SOLVED.size, IMO_MCTS_SOLVED.size, AG_SOLVED.size],
+        type: 'bar',
+        marker: { color: ['#4488cc', '#22aa44', '#9966cc'] },
+        text: [`${IMO_DEDUCTION_SOLVED.size}/30`, `${IMO_MCTS_SOLVED.size}/30`, `${AG_SOLVED.size}/30`],
+        textposition: 'outside',
+    }], {
+        yaxis: { title: 'Problems Solved', range: [0, 30] },
+        margin: { t: 20, b: 40 },
+        height: 250,
+        plot_bgcolor: '#fafafa',
+    }, { responsive: true });
+}
+
+function switchTab(name) {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+    document.querySelector(`[onclick="switchTab('${name}')"]`).classList.add('active');
+    document.getElementById(`tab-${name}`).classList.add('active');
+}
+
+// Keyboard shortcuts
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closeModal();
+});
+
+// Initialize
+init();
+</script>
+</body>
+</html>
