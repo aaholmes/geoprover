@@ -44,6 +44,7 @@ class GeoCoords:
     circles: list[tuple[str, float, float, float]] = field(default_factory=list)  # (center_name, cx, cy, r)
     construction_points: set[str] = field(default_factory=set)  # points added by constructions
     initial_points: set[str] = field(default_factory=set)  # base triangle/polygon points
+    edges: list[tuple[str, str, str]] = field(default_factory=list)  # (p1, p2, style): "initial" or "construction"
 
     def add(self, name: str, x: float, y: float, is_construction: bool = False) -> None:
         self.points[name] = (x, y)
@@ -141,6 +142,103 @@ def _dist(a: tuple[float, float], b: tuple[float, float]) -> float:
     return math.dist(a, b)
 
 
+def _strip_self(name: str, args: list[str]) -> list[str]:
+    """Remove the output name from args if it appears as first arg (JGEX convention)."""
+    if args and args[0] == name:
+        return args[1:]
+    return args
+
+
+def _resolve_on_line(name: str, predicates: list[str], coords: GeoCoords) -> tuple[float, float] | None:
+    """Try to resolve a point defined by multiple on_line/on_tline/on_pline/on_circle constraints."""
+    lines = []  # each entry: (point_on_line, direction) for line constraints
+    circles = []  # each entry: (center, radius_point) for circle constraints
+
+    for pred_str in predicates:
+        tokens = pred_str.strip().split()
+        ptype = tokens[0] if tokens else ""
+        pargs = _strip_self(name, tokens[1:])
+
+        if ptype == "on_line" and len(pargs) >= 2:
+            pa = coords.get(pargs[0])
+            pb = coords.get(pargs[1])
+            if pa and pb:
+                dx, dy = pb[0] - pa[0], pb[1] - pa[1]
+                if abs(dx) > 1e-10 or abs(dy) > 1e-10:
+                    lines.append((pa, (dx, dy), (pargs[0], pargs[1])))
+
+        elif ptype == "on_tline" and len(pargs) >= 3:
+            # on_tline x a b c = x on line through a, perpendicular to bc
+            pa = coords.get(pargs[0])
+            pb = coords.get(pargs[1])
+            pc = coords.get(pargs[2])
+            if pa and pb and pc:
+                dx, dy = pc[0] - pb[0], pc[1] - pb[1]
+                # perpendicular direction
+                if abs(dx) > 1e-10 or abs(dy) > 1e-10:
+                    lines.append((pa, (-dy, dx), (name, pargs[0])))
+
+        elif ptype == "on_pline" and len(pargs) >= 3:
+            # on_pline x a b c = x on line through a, parallel to bc
+            pa = coords.get(pargs[0])
+            pb = coords.get(pargs[1])
+            pc = coords.get(pargs[2])
+            if pa and pb and pc:
+                dx, dy = pc[0] - pb[0], pc[1] - pb[1]
+                if abs(dx) > 1e-10 or abs(dy) > 1e-10:
+                    lines.append((pa, (dx, dy), (name, pargs[0])))
+
+        elif ptype == "on_circle" and len(pargs) >= 2:
+            center = coords.get(pargs[0])
+            rp = coords.get(pargs[1])
+            if center and rp:
+                circles.append((center, _dist(center, rp), pargs[0]))
+
+    # Two lines → intersection
+    if len(lines) >= 2:
+        result = _line_intersection(lines[0][0], lines[0][1], lines[1][0], lines[1][1])
+        if result:
+            # Record edges: the point lies on both lines
+            for _, _, edge_pts in lines:
+                coords.edges.append((name, edge_pts[0], "construction"))
+                coords.edges.append((name, edge_pts[1], "construction"))
+            return result
+
+    # Line + circle → pick the intersection closest to other known points
+    if len(lines) >= 1 and len(circles) >= 1:
+        p0, d, edge_pts = lines[0]
+        center, r, cname = circles[0]
+        # Parametric: p0 + t*d, solve |p0+t*d - center|^2 = r^2
+        ocx, ocy = p0[0] - center[0], p0[1] - center[1]
+        a_coeff = d[0]**2 + d[1]**2
+        b_coeff = 2 * (ocx * d[0] + ocy * d[1])
+        c_coeff = ocx**2 + ocy**2 - r**2
+        disc = b_coeff**2 - 4 * a_coeff * c_coeff
+        if disc >= 0 and a_coeff > 1e-10:
+            sqrt_disc = math.sqrt(disc)
+            t1 = (-b_coeff + sqrt_disc) / (2 * a_coeff)
+            t2 = (-b_coeff - sqrt_disc) / (2 * a_coeff)
+            pt1 = (p0[0] + t1 * d[0], p0[1] + t1 * d[1])
+            pt2 = (p0[0] + t2 * d[0], p0[1] + t2 * d[1])
+            # Pick the point that's farther from existing points (more likely the "new" one)
+            existing = [coords.get(n) for n in coords.points if coords.get(n)]
+            if existing:
+                avg = (sum(p[0] for p in existing) / len(existing),
+                       sum(p[1] for p in existing) / len(existing))
+                # Pick the one farther from the centroid for variety
+                if _dist(pt1, avg) > _dist(pt2, avg):
+                    result = pt1
+                else:
+                    result = pt2
+            else:
+                result = pt1
+            coords.edges.append((name, edge_pts[0], "construction"))
+            coords.edges.append((name, edge_pts[1], "construction"))
+            return result
+
+    return None
+
+
 def synthesize_coordinates(definition: str) -> GeoCoords:
     """Synthesize coordinates for a JGEX problem definition.
 
@@ -151,13 +249,11 @@ def synthesize_coordinates(definition: str) -> GeoCoords:
     # Split into construction steps and goal
     parts = definition.split("?")
     constructions_str = parts[0].strip()
-    goal_str = parts[1].strip() if len(parts) > 1 else ""
 
     # Parse each construction clause (separated by ;)
     clauses = [c.strip() for c in constructions_str.split(";") if c.strip()]
 
     # Track which base points we've placed
-    base_placed = set()
     aux_counter = 0
 
     for clause in clauses:
@@ -175,21 +271,21 @@ def synthesize_coordinates(definition: str) -> GeoCoords:
             first_pred = predicates[0].strip()
             tokens = first_pred.split()
             pred_type = tokens[0] if tokens else ""
-            args = tokens[1:] if len(tokens) > 1 else []
+            args = _strip_self(name, tokens[1:])
 
-            is_construction = False
-
-            if pred_type == "triangle":
-                # Place triangle: A=(0,0), B=(4,0), C from angle
+            if pred_type in ("triangle", "r_triangle", "iso_triangle", "r_iso_triangle",
+                             "risos", "eq_triangle"):
                 tri_names = output_names
                 if len(tri_names) >= 3:
                     coords.add(tri_names[0], 0.0, 0.0)
                     coords.add(tri_names[1], 4.0, 0.0)
                     coords.add(tri_names[2], 1.5, 3.2)
                     for n in tri_names[:3]:
-                        base_placed.add(n)
                         coords.initial_points.add(n)
-                break  # triangle defines all output names at once
+                    coords.edges.append((tri_names[0], tri_names[1], "initial"))
+                    coords.edges.append((tri_names[1], tri_names[2], "initial"))
+                    coords.edges.append((tri_names[2], tri_names[0], "initial"))
+                break
 
             elif pred_type == "segment":
                 seg_names = output_names
@@ -197,8 +293,8 @@ def synthesize_coordinates(definition: str) -> GeoCoords:
                     coords.add(seg_names[0], 0.0, 0.0)
                     coords.add(seg_names[1], 4.0, 0.0)
                     for n in seg_names[:2]:
-                        base_placed.add(n)
                         coords.initial_points.add(n)
+                    coords.edges.append((seg_names[0], seg_names[1], "initial"))
                 break
 
             elif pred_type == "pentagon":
@@ -206,51 +302,45 @@ def synthesize_coordinates(definition: str) -> GeoCoords:
                 for i, n in enumerate(pent_names[:5]):
                     angle = math.pi / 2 + 2 * math.pi * i / 5
                     coords.add(n, 2 + 2 * math.cos(angle), 2 + 2 * math.sin(angle))
-                    base_placed.add(n)
                     coords.initial_points.add(n)
+                for i in range(len(pent_names[:5])):
+                    j = (i + 1) % len(pent_names[:5])
+                    coords.edges.append((pent_names[i], pent_names[j], "initial"))
                 break
 
             elif pred_type in ("free",):
-                # Free point — place it somewhere reasonable
                 coords.add(name, 2.5 + aux_counter * 0.5, 1.5 + aux_counter * 0.3, is_construction=True)
                 aux_counter += 1
 
             elif pred_type == "midpoint":
                 if len(args) >= 2:
-                    # midpoint m a b — first arg is the midpoint name (already in output_names)
                     a_name, b_name = args[0], args[1]
-                    # Sometimes it's "midpoint m a b" where m is output
-                    if a_name == name and len(args) >= 3:
-                        a_name, b_name = args[1], args[2]
                     pa = coords.get(a_name)
                     pb = coords.get(b_name)
                     if pa and pb:
                         coords.add(name, *_midpoint(pa, pb), is_construction=True)
+                        coords.edges.append((name, a_name, "construction"))
+                        coords.edges.append((name, b_name, "construction"))
                     else:
                         coords.add(name, 2.0, 1.6, is_construction=True)
 
             elif pred_type == "foot":
+                # foot f p a b = foot of perp from p onto line ab
                 if len(args) >= 3:
-                    foot_name = args[0]
-                    if foot_name == name:
-                        p_name, a_name, b_name = args[0], args[1], args[2]
-                        if len(args) >= 4:
-                            p_name, a_name, b_name = args[1], args[2], args[3]
-                    else:
-                        p_name, a_name, b_name = args[0], args[1], args[2]
+                    p_name, a_name, b_name = args[0], args[1], args[2]
                     pp = coords.get(p_name)
                     pa = coords.get(a_name)
                     pb = coords.get(b_name)
                     if pp and pa and pb:
                         coords.add(name, *_foot_of_perpendicular(pp, pa, pb), is_construction=True)
+                        # Edge from foot to the point it's the foot of, and along the base line
+                        coords.edges.append((name, p_name, "construction"))
                     else:
                         coords.add(name, 2.0, 0.0, is_construction=True)
 
             elif pred_type in ("circle", "circumcenter"):
                 if len(args) >= 3:
                     a_name, b_name, c_name = args[0], args[1], args[2]
-                    if a_name == name and len(args) >= 4:
-                        a_name, b_name, c_name = args[1], args[2], args[3]
                     pa = coords.get(a_name)
                     pb = coords.get(b_name)
                     pc = coords.get(c_name)
@@ -264,12 +354,9 @@ def synthesize_coordinates(definition: str) -> GeoCoords:
 
             elif pred_type == "orthocenter":
                 if len(args) >= 3:
-                    a_name, b_name, c_name = args[0], args[1], args[2]
-                    if a_name == name and len(args) >= 4:
-                        a_name, b_name, c_name = args[1], args[2], args[3]
-                    pa = coords.get(a_name)
-                    pb = coords.get(b_name)
-                    pc = coords.get(c_name)
+                    pa = coords.get(args[0])
+                    pb = coords.get(args[1])
+                    pc = coords.get(args[2])
                     if pa and pb and pc:
                         coords.add(name, *_orthocenter(pa, pb, pc), is_construction=True)
                     else:
@@ -277,12 +364,9 @@ def synthesize_coordinates(definition: str) -> GeoCoords:
 
             elif pred_type == "incenter":
                 if len(args) >= 3:
-                    a_name, b_name, c_name = args[0], args[1], args[2]
-                    if a_name == name and len(args) >= 4:
-                        a_name, b_name, c_name = args[1], args[2], args[3]
-                    pa = coords.get(a_name)
-                    pb = coords.get(b_name)
-                    pc = coords.get(c_name)
+                    pa = coords.get(args[0])
+                    pb = coords.get(args[1])
+                    pc = coords.get(args[2])
                     if pa and pb and pc:
                         coords.add(name, *_incenter(pa, pb, pc), is_construction=True)
                     else:
@@ -290,37 +374,74 @@ def synthesize_coordinates(definition: str) -> GeoCoords:
 
             elif pred_type == "mirror":
                 if len(args) >= 2:
-                    p_name, center_name = args[0], args[1]
-                    if p_name == name and len(args) >= 3:
-                        p_name, center_name = args[1], args[2]
-                    pp = coords.get(p_name)
-                    pc = coords.get(center_name)
+                    pp = coords.get(args[0])
+                    pc = coords.get(args[1])
                     if pp and pc:
                         coords.add(name, *_reflect(pp, pc), is_construction=True)
                     else:
                         coords.add(name, 3.0, 1.0, is_construction=True)
 
-            elif pred_type in ("on_line", "on_circle", "on_tline", "on_pline",
-                               "intersection_ll", "intersection_lc", "intersection_cc",
-                               "on_dia", "lc_tangent", "trisect", "excenter2",
-                               "incenter2", "eqangle3"):
-                # Complex constructions — place at a reasonable position
-                # Try to extract referenced points and place near them
-                ref_points = [coords.get(a) for a in args if coords.get(a) is not None]
-                if ref_points:
-                    cx = sum(p[0] for p in ref_points) / len(ref_points)
-                    cy = sum(p[1] for p in ref_points) / len(ref_points)
-                    # Offset slightly to avoid overlap
-                    offset = 0.3 + 0.2 * aux_counter
-                    coords.add(name, cx + offset, cy + offset * 0.7, is_construction=True)
+            elif pred_type == "intersection_ll":
+                # intersection_ll f a b c d = intersection of line(a,b) and line(c,d)
+                if len(args) >= 4:
+                    pa = coords.get(args[0])
+                    pb = coords.get(args[1])
+                    pc = coords.get(args[2])
+                    pd = coords.get(args[3])
+                    if pa and pb and pc and pd:
+                        da = (pb[0] - pa[0], pb[1] - pa[1])
+                        dc = (pd[0] - pc[0], pd[1] - pc[1])
+                        result = _line_intersection(pa, da, pc, dc)
+                        if result:
+                            coords.add(name, *result, is_construction=True)
+                            coords.edges.append((name, args[0], "construction"))
+                            coords.edges.append((name, args[1], "construction"))
+                            coords.edges.append((name, args[2], "construction"))
+                            coords.edges.append((name, args[3], "construction"))
+                        else:
+                            coords.add(name, 2.0 + aux_counter * 0.4, 1.5, is_construction=True)
+                    else:
+                        coords.add(name, 2.0 + aux_counter * 0.4, 1.5, is_construction=True)
+                    aux_counter += 1
+
+            elif pred_type in ("on_line", "on_tline", "on_pline", "on_circle"):
+                # Multi-predicate: try to resolve from all predicates
+                result = _resolve_on_line(name, predicates, coords)
+                if result:
+                    coords.add(name, *result, is_construction=True)
                 else:
-                    coords.add(name, 2.0 + aux_counter * 0.4, 1.5 + aux_counter * 0.3, is_construction=True)
-                aux_counter += 1
+                    # Fallback: place near referenced points
+                    ref_points = []
+                    for pred in predicates:
+                        for tok in pred.split()[1:]:
+                            if tok != name:
+                                pt = coords.get(tok)
+                                if pt:
+                                    ref_points.append(pt)
+                    if ref_points:
+                        cx = sum(p[0] for p in ref_points) / len(ref_points)
+                        cy = sum(p[1] for p in ref_points) / len(ref_points)
+                        offset = 0.3 + 0.2 * aux_counter
+                        coords.add(name, cx + offset, cy + offset * 0.7, is_construction=True)
+                    else:
+                        coords.add(name, 2.0 + aux_counter * 0.4, 1.5 + aux_counter * 0.3, is_construction=True)
+                    aux_counter += 1
 
             else:
-                # Unknown predicate — place somewhere
+                # Unknown predicate — place near referenced points
                 if name not in coords.points:
-                    coords.add(name, 2.0 + aux_counter * 0.4, 1.5 + aux_counter * 0.3, is_construction=True)
+                    ref_points = []
+                    for tok in args:
+                        pt = coords.get(tok)
+                        if pt:
+                            ref_points.append(pt)
+                    if ref_points:
+                        cx = sum(p[0] for p in ref_points) / len(ref_points)
+                        cy = sum(p[1] for p in ref_points) / len(ref_points)
+                        offset = 0.3 + 0.2 * aux_counter
+                        coords.add(name, cx + offset, cy + offset * 0.7, is_construction=True)
+                    else:
+                        coords.add(name, 2.0 + aux_counter * 0.4, 1.5 + aux_counter * 0.3, is_construction=True)
                     aux_counter += 1
 
     return coords
@@ -380,36 +501,22 @@ def render_diagram(
         circle = plt.Circle((cx, cy), r, fill=False, color="#cccccc", linewidth=0.8, linestyle="--")
         ax.add_patch(circle)
 
-    # Draw edges between initial points (triangle/polygon)
-    initial = sorted(coords.initial_points)
-    if len(initial) >= 3:
-        for i in range(len(initial)):
-            j = (i + 1) % len(initial)
-            p1 = coords.get(initial[i])
-            p2 = coords.get(initial[j])
-            if p1 and p2:
-                ax.plot([p1[0], p2[0]], [p1[1], p2[1]], "k-", linewidth=1.5, zorder=1)
-
-    # Draw construction lines (dashed blue)
-    clauses = [c.strip() for c in parts[0].split(";") if c.strip()]
-    for clause in clauses:
-        if "=" not in clause:
+    # Draw edges from explicit edge list
+    drawn_edges = set()
+    for e1, e2, style in coords.edges:
+        key = (min(e1, e2), max(e1, e2))
+        if key in drawn_edges:
             continue
-        lhs, rhs = clause.split("=", 1)
-        out_names = lhs.strip().split()
-        for out_name in out_names:
-            if out_name in coords.construction_points:
-                # Draw lines from construction point to referenced points
-                predicates = [p.strip() for p in rhs.split(",")]
-                for pred in predicates:
-                    tokens = pred.split()
-                    for tok in tokens[1:]:
-                        p1 = coords.get(out_name)
-                        p2 = coords.get(tok)
-                        if p1 and p2 and out_name != tok:
-                            ax.plot([p1[0], p2[0]], [p1[1], p2[1]],
-                                    color="#4488cc", linewidth=0.7, linestyle="--",
-                                    alpha=0.5, zorder=0)
+        drawn_edges.add(key)
+        p1 = coords.get(e1)
+        p2 = coords.get(e2)
+        if p1 and p2:
+            if style == "initial":
+                ax.plot([p1[0], p2[0]], [p1[1], p2[1]], "k-", linewidth=1.5, zorder=1)
+            else:
+                ax.plot([p1[0], p2[0]], [p1[1], p2[1]],
+                        color="#4488cc", linewidth=1.0, linestyle="--",
+                        alpha=0.7, zorder=0)
 
     # Highlight goal relation
     goal_color = "#22aa22" if solved else "#cc4444"
