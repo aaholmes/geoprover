@@ -1,21 +1,44 @@
 # Geoprover
 
-Neurosymbolic geometry theorem prover using a three-tier MCTS architecture adapted from the Caissawary chess engine. `saturate()` (forward-chaining deduction to fixed point) runs as the Tier 1 symbolic gate before every MCTS expansion. A text-based GeoTransformer neural network suggests auxiliary constructions — the creative step deduction can't do. Benchmarks against AlphaGeometry's JGEX-AG-231 (231 problems).
+Neurosymbolic geometry theorem prover using a three-tier MCTS architecture adapted from the Caissawary chess engine. `saturate()` (forward-chaining deduction to fixed point) runs as the Tier 1 symbolic gate before every MCTS expansion. A text-based GeoTransformer neural network suggests auxiliary constructions — the creative step deduction can't do. Benchmarks against AlphaGeometry's JGEX-AG-231 (231 problems) and IMO-AG-30 (30 IMO competition problems).
 
 ## Results
+
+### JGEX-AG-231 (standard benchmark)
 
 | Method | Solved | Rate | Mean Time | Notes |
 |--------|--------|------|-----------|-------|
 | Deduction only | 181/231 | 78.4% | 428ms | 49 rules, pure symbolic |
-| MCTS + random NN | 187/231 | 81.0% | 3.6s | Untrained transformer, 50 MCTS iters |
+| MCTS + random NN | 187/231 | 81.0% | 3.6s | Untrained transformer baseline |
 | **MCTS + trained NN** | **189/231** | **81.8%** | **2.7s** | Synthetic + supervised pre-training |
-| Expert iter (self-play peak) | 190/231 | 82.3% | - | Best single episode during training |
 
-The trained NN solves **8-9 additional problems** that pure deduction cannot, including **Morley's theorem** and the **9-point circle**. The trained model is 25% faster than the random baseline because it prioritizes promising constructions.
+The trained NN solves **9 additional problems** that pure deduction cannot, including **Morley's theorem** and the **9-point circle**. The trained model is 25% faster than the random baseline because it prioritizes promising constructions.
 
-Deduction counts vary ±2 between runs due to `HashSet` iteration non-determinism in Rust.
+Solve counts vary ±2 between runs due to `HashSet` iteration non-determinism in Rust.
+
+### IMO-AG-30 (competition problems)
+
+| Method | Solved | Rate | Mean Time | Notes |
+|--------|--------|------|-----------|-------|
+| Deduction only | 5/30 | 16.7% | 751ms | Pure symbolic |
+| **MCTS + trained NN** | **7/30** | **23.3%** | **15.5s** | +2 problems over deduction |
+
+MCTS+NN solves 2 additional IMO problems that deduction cannot: **IMO 2012 P1** (excircle tangent congruence, 44s) and **IMO 2019 P2** (cyclic quadrilateral, 73s). Both required a single auxiliary construction to unlock the proof.
+
+### Comparison with AlphaGeometry
+
+| System | Model Size | JGEX-AG-231 | IMO-AG-30 |
+|--------|-----------|-------------|-----------|
+| AlphaGeometry DD (deduction only) | — | ~75% | — |
+| AlphaGeometry (DD + LLM) | ~7B params | — | 25/30 |
+| **Geoprover (deduction only)** | **—** | **78.4%** | **5/30** |
+| **Geoprover (MCTS + trained NN)** | **~4M params** | **81.8%** | **7/30** |
+
+Geoprover's deduction engine exceeds AlphaGeometry's DD baseline on JGEX-AG-231. The MCTS+NN system achieves this with a **1750x smaller** neural component (~4M vs ~7B parameters). The IMO gap (7/30 vs 25/30) reflects the difficulty of multi-step auxiliary construction chains — IMO problems often require 3-5 constructions, while most JGEX problems need 0-1.
 
 ### Problems solved by MCTS+NN that deduction cannot
+
+**JGEX-AG-231:**
 
 | Problem | Steps | Time |
 |---------|-------|------|
@@ -28,6 +51,13 @@ Deduction counts vary ±2 between runs due to `HashSet` iteration non-determinis
 | Ye's auxiliary thinking | 2 | 19.1s |
 | E076-31 | 1 | 9.5s |
 | E051-28 | 1 | 5.9s |
+
+**IMO-AG-30:**
+
+| Problem | Steps | Time |
+|---------|-------|------|
+| IMO 2012 P1 (excircle tangent) | 1 | 43.7s |
+| IMO 2019 P2 (cyclic quadrilateral) | 1 | 73.2s |
 
 ## Current Status
 

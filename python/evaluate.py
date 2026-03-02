@@ -49,7 +49,7 @@ class BenchmarkResult:
 def evaluate_deduction(problems: list[tuple[str, str]]) -> list[ProblemResult]:
     """Evaluate deduction-only solving."""
     results = []
-    for name, definition in problems:
+    for i, (name, definition) in enumerate(problems):
         problem_text = f"{name}\n{definition}"
         t0 = time.time()
         try:
@@ -64,11 +64,15 @@ def evaluate_deduction(problems: list[tuple[str, str]]) -> list[ProblemResult]:
             ))
         except Exception as e:
             elapsed = (time.time() - t0) * 1000
+            proved = False
             results.append(ProblemResult(
                 name=name, solved=False, mode="deduction",
                 elapsed_ms=elapsed, num_facts=0, num_objects=0,
                 proof_length=0, value=0.0,
             ))
+        status = "SOLVED" if proved else "failed"
+        n_solved = sum(1 for r in results if r.solved)
+        print(f"  [{i+1}/{len(problems)}] {name}: {status} ({elapsed:.0f}ms) [{n_solved}/{i+1} so far]", flush=True)
     return results
 
 
@@ -80,7 +84,7 @@ def evaluate_mcts_nn(
 ) -> list[ProblemResult]:
     """Evaluate NN-guided MCTS solving."""
     results = []
-    for name, definition in problems:
+    for i, (name, definition) in enumerate(problems):
         problem_text = f"{name}\n{definition}"
         t0 = time.time()
         try:
@@ -88,8 +92,9 @@ def evaluate_mcts_nn(
             elapsed = (time.time() - t0) * 1000
             state = geoprover.parse_problem(problem_text)
             geoprover.saturate(state)
+            solved = result.solved
             results.append(ProblemResult(
-                name=name, solved=result.solved, mode="mcts_nn",
+                name=name, solved=solved, mode="mcts_nn",
                 elapsed_ms=elapsed, num_facts=state.num_facts(),
                 num_objects=state.num_objects(),
                 proof_length=len(result.actions),
@@ -97,11 +102,15 @@ def evaluate_mcts_nn(
             ))
         except Exception as e:
             elapsed = (time.time() - t0) * 1000
+            solved = False
             results.append(ProblemResult(
                 name=name, solved=False, mode="mcts_nn",
                 elapsed_ms=elapsed, num_facts=0, num_objects=0,
                 proof_length=0, value=0.0,
             ))
+        status = "SOLVED" if solved else "failed"
+        n_solved = sum(1 for r in results if r.solved)
+        print(f"  [{i+1}/{len(problems)}] {name}: {status} ({elapsed:.0f}ms) [{n_solved}/{i+1} so far]", flush=True)
     return results
 
 
