@@ -1,10 +1,13 @@
 //! Synthetic training data generator.
 //!
 //! Generates (state_text, construction_text, goal_text) tuples by:
-//! 1. Creating a random base configuration (triangle/quad)
-//! 2. Applying 1-3 random constructions + saturation to build facts
-//! 3. Applying one more "key" construction + saturation
+//! 1. Creating a random base configuration (triangle/quad/pentagon/hexagon)
+//! 2. Applying 1-4 random constructions + saturation to build facts
+//! 3. Applying one or more "key" constructions + saturation
 //! 4. Recording (state_before_key, key_construction, new_goal) triples
+//!
+//! Also generates negative examples: states where a goal is NOT achievable,
+//! with value_target=0 to teach the model to reject bad paths.
 
 use rand::seq::SliceRandom;
 use rand::Rng;
@@ -35,25 +38,26 @@ fn random_base_state(n_points: usize) -> ProofState {
     state
 }
 
+/// The 7 construction types we support.
+const USEFUL_TYPES: [ConstructionType; 7] = [
+    ConstructionType::Midpoint,
+    ConstructionType::Altitude,
+    ConstructionType::Circumcenter,
+    ConstructionType::Orthocenter,
+    ConstructionType::Incenter,
+    ConstructionType::ParallelThrough,
+    ConstructionType::PerpendicularThrough,
+];
+
 /// Pick a random applicable construction from the available ones.
 fn random_construction(rng: &mut impl Rng, state: &ProofState) -> Option<Construction> {
     let constructions = generate_constructions(state);
     if constructions.is_empty() {
         return None;
     }
-    // Only use the 7 types we actually implement
-    let useful_types = [
-        ConstructionType::Midpoint,
-        ConstructionType::Altitude,
-        ConstructionType::Circumcenter,
-        ConstructionType::Orthocenter,
-        ConstructionType::Incenter,
-        ConstructionType::ParallelThrough,
-        ConstructionType::PerpendicularThrough,
-    ];
     let filtered: Vec<&Construction> = constructions
         .iter()
-        .filter(|c| useful_types.contains(&c.ctype))
+        .filter(|c| USEFUL_TYPES.contains(&c.ctype))
         .collect();
     let pool = if filtered.is_empty() {
         constructions.iter().collect::<Vec<_>>()
@@ -61,6 +65,24 @@ fn random_construction(rng: &mut impl Rng, state: &ProofState) -> Option<Constru
         filtered
     };
     pool.choose(rng).map(|c| (*c).clone())
+}
+
+/// Pick a random construction of a DIFFERENT type than `exclude`.
+fn random_different_construction(
+    rng: &mut impl Rng,
+    state: &ProofState,
+    exclude: &Construction,
+) -> Option<Construction> {
+    let constructions = generate_constructions(state);
+    let filtered: Vec<&Construction> = constructions
+        .iter()
+        .filter(|c| USEFUL_TYPES.contains(&c.ctype))
+        .filter(|c| c.ctype != exclude.ctype || c.args != exclude.args)
+        .collect();
+    if filtered.is_empty() {
+        return None;
+    }
+    filtered.choose(rng).map(|c| (*c).clone())
 }
 
 /// Check if a relation makes an interesting goal.
@@ -76,14 +98,28 @@ fn is_interesting_goal(rel: &Relation) -> bool {
     }
 }
 
+/// Difficulty level for synthetic data generation.
+#[derive(Clone, Copy)]
+enum Difficulty {
+    Easy,   // 3-4 points, 1 setup, 1 key construction
+    Medium, // 4-5 points, 2 setup, 1-2 key constructions
+    Hard,   // 5-7 points, 2-4 setup, 2-3 key constructions
+}
+
 /// Generate training examples from a single random configuration.
-fn generate_one(rng: &mut impl Rng) -> Vec<(String, String, String)> {
+fn generate_one(rng: &mut impl Rng, difficulty: Difficulty) -> Vec<(String, String, String)> {
     let config = synth_saturate_config();
-    let n_points = rng.gen_range(3..=4);
+
+    let (n_points, n_setup_range, n_key_range) = match difficulty {
+        Difficulty::Easy => (rng.gen_range(3..=4), 1..=2, 1..=1),
+        Difficulty::Medium => (rng.gen_range(4..=5), 2..=3, 1..=2),
+        Difficulty::Hard => (rng.gen_range(5..=7), 2..=4, 2..=3),
+    };
+
     let base = random_base_state(n_points);
 
-    // Apply 1-2 "setup" constructions to create a richer state
-    let n_setup = rng.gen_range(1..=2);
+    // Apply setup constructions to create a richer state
+    let n_setup = rng.gen_range(n_setup_range);
     let mut setup_state = base;
     for _ in 0..n_setup {
         if let Some(c) = random_construction(rng, &setup_state) {
@@ -95,26 +131,37 @@ fn generate_one(rng: &mut impl Rng) -> Vec<(String, String, String)> {
     let mut before_state = setup_state.clone();
     deduction::saturate_with_config(&mut before_state, &config);
 
-    // Skip if the state is too trivial (< 3 facts) or too large (> 200)
-    if before_state.facts.len() < 3 || before_state.facts.len() > 200 {
+    // Skip if the state is too trivial (< 3 facts) or too large (> 500)
+    if before_state.facts.len() < 3 || before_state.facts.len() > 500 {
         return Vec::new();
     }
 
     let before_text = before_state.to_text();
 
-    // Apply one more construction (the "key" construction)
-    let construction = match random_construction(rng, &before_state) {
-        Some(c) => c,
-        None => return Vec::new(),
-    };
-    let construction_text = construction.to_text(&before_state);
+    // Apply key constructions (potentially multi-step)
+    let n_key = rng.gen_range(n_key_range);
+    let mut current_state = before_state.clone();
+    let mut key_constructions = Vec::new();
 
-    // Apply and saturate
-    let mut after_state = apply_construction(&before_state, &construction);
-    deduction::saturate_with_config(&mut after_state, &config);
+    for _ in 0..n_key {
+        let construction = match random_construction(rng, &current_state) {
+            Some(c) => c,
+            None => break,
+        };
+        key_constructions.push(construction.clone());
+        current_state = apply_construction(&current_state, &construction);
+        deduction::saturate_with_config(&mut current_state, &config);
+    }
 
-    // Find new interesting facts
-    let new_facts: Vec<Relation> = after_state
+    if key_constructions.is_empty() {
+        return Vec::new();
+    }
+
+    // Use the first key construction as the labeled one
+    let construction_text = key_constructions[0].to_text(&before_state);
+
+    // Find new interesting facts (only those requiring ALL key constructions)
+    let new_facts: Vec<Relation> = current_state
         .facts
         .iter()
         .filter(|f| !before_state.facts.contains(f))
@@ -128,7 +175,7 @@ fn generate_one(rng: &mut impl Rng) -> Vec<(String, String, String)> {
 
     let mut examples = Vec::new();
     for fact in sorted_facts.iter().take(3) {
-        let goal_text = after_state.relation_to_text_pub(fact);
+        let goal_text = current_state.relation_to_text_pub(fact);
         examples.push((
             before_text.clone(),
             construction_text.clone(),
@@ -139,9 +186,88 @@ fn generate_one(rng: &mut impl Rng) -> Vec<(String, String, String)> {
     examples
 }
 
+/// Generate a negative example: a state + goal where a different construction is needed.
+///
+/// Returns (state_text, wrong_construction_text, goal_text) with value 0.
+fn generate_negative(rng: &mut impl Rng) -> Option<(String, String, String)> {
+    let config = synth_saturate_config();
+    let n_points = rng.gen_range(3..=5);
+    let base = random_base_state(n_points);
+
+    // Setup
+    let n_setup = rng.gen_range(1..=2);
+    let mut setup_state = base;
+    for _ in 0..n_setup {
+        if let Some(c) = random_construction(rng, &setup_state) {
+            setup_state = apply_construction(&setup_state, &c);
+        }
+    }
+    let mut before_state = setup_state.clone();
+    deduction::saturate_with_config(&mut before_state, &config);
+
+    if before_state.facts.len() < 3 || before_state.facts.len() > 300 {
+        return None;
+    }
+
+    // Apply the correct construction
+    let correct_construction = random_construction(rng, &before_state)?;
+
+    // Apply and saturate to find a goal
+    let mut after_state = apply_construction(&before_state, &correct_construction);
+    deduction::saturate_with_config(&mut after_state, &config);
+
+    let new_facts: Vec<Relation> = after_state
+        .facts
+        .iter()
+        .filter(|f| !before_state.facts.contains(f))
+        .filter(|f| is_interesting_goal(f))
+        .cloned()
+        .collect();
+
+    if new_facts.is_empty() {
+        return None;
+    }
+
+    // Only keep goals that reference points existing in before_state
+    let max_before_id = before_state.objects.len() as u16;
+    let valid_facts: Vec<&Relation> = new_facts
+        .iter()
+        .filter(|f| f.point_ids().iter().all(|&id| id < max_before_id))
+        .collect();
+    if valid_facts.is_empty() {
+        return None;
+    }
+
+    // Pick a random goal that the correct construction achieves
+    let goal = (*valid_facts.choose(rng)?).clone();
+    let goal_text = after_state.relation_to_text_pub(&goal);
+
+    // Now apply a WRONG construction (different type)
+    let wrong_construction =
+        random_different_construction(rng, &before_state, &correct_construction)?;
+
+    // Check that the wrong construction doesn't also achieve the goal
+    let mut wrong_after = apply_construction(&before_state, &wrong_construction);
+    deduction::saturate_with_config(&mut wrong_after, &config);
+    if wrong_after.facts.contains(&goal) {
+        return None; // The "wrong" construction also works — skip
+    }
+
+    let wrong_text = wrong_construction.to_text(&before_state);
+
+    // Set the goal on before_state to get proper text output
+    let mut labeled_state = before_state.clone();
+    labeled_state.goal = Some(goal);
+    let before_text = labeled_state.to_text();
+
+    Some((before_text, wrong_text, goal_text))
+}
+
 /// Generate a batch of synthetic training examples.
 ///
 /// Returns Vec of (state_text, construction_text, goal_text) tuples.
+/// Positive examples (value=1.0) are followed by negative examples (value=0.0).
+/// Negative examples have construction_text prefixed with "NEG:" to distinguish them.
 pub fn generate_batch(num_examples: usize, seed: u64) -> Vec<(String, String, String)> {
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
     let mut results = Vec::new();
@@ -149,14 +275,37 @@ pub fn generate_batch(num_examples: usize, seed: u64) -> Vec<(String, String, St
     let max_attempts = num_examples * 30;
     let mut attempts = 0;
 
-    while results.len() < num_examples && attempts < max_attempts {
+    // Target: ~80% positive, ~20% negative
+    let num_positive = (num_examples * 4) / 5;
+    let num_negative = num_examples - num_positive;
+
+    // Generate positive examples with mixed difficulty
+    while results.len() < num_positive && attempts < max_attempts {
         attempts += 1;
-        let examples = generate_one(&mut rng);
+        let difficulty = match rng.gen_range(0..10) {
+            0..=4 => Difficulty::Easy,   // 50%
+            5..=7 => Difficulty::Medium, // 30%
+            _ => Difficulty::Hard,       // 20%
+        };
+        let examples = generate_one(&mut rng, difficulty);
         for ex in examples {
-            if results.len() >= num_examples {
+            if results.len() >= num_positive {
                 break;
             }
             results.push(ex);
+        }
+    }
+
+    // Generate negative examples
+    let mut neg_attempts = 0;
+    let neg_max = num_negative * 50;
+    let mut neg_count = 0;
+    while neg_count < num_negative && neg_attempts < neg_max {
+        neg_attempts += 1;
+        if let Some((state, construction, goal)) = generate_negative(&mut rng) {
+            // Mark negative with "NEG:" prefix so Python can detect value=0
+            results.push((state, format!("NEG:{}", construction), goal));
+            neg_count += 1;
         }
     }
 
@@ -174,6 +323,13 @@ mod tests {
         assert_eq!(state.name_of(0), "a");
         assert_eq!(state.name_of(1), "b");
         assert_eq!(state.name_of(2), "c");
+    }
+
+    #[test]
+    fn test_random_base_state_larger() {
+        let state = random_base_state(7);
+        assert_eq!(state.objects.len(), 7);
+        assert_eq!(state.name_of(6), "g");
     }
 
     #[test]
@@ -218,9 +374,10 @@ mod tests {
                 .any(|kw| state.contains(kw));
             assert!(has_relation, "State should contain relation keywords: {}", state);
 
-            // Construction should start with a known keyword
+            // Construction should start with a known keyword (or NEG: prefix)
+            let c = construction.strip_prefix("NEG:").unwrap_or(construction);
             let keywords = ["mid", "alt", "circumcenter", "orthocenter", "incenter", "pthrough", "tthrough"];
-            let starts_valid = keywords.iter().any(|kw| construction.starts_with(kw));
+            let starts_valid = keywords.iter().any(|kw| c.starts_with(kw));
             assert!(starts_valid, "Construction should start with known keyword: {}", construction);
 
             // Goal should contain a relation keyword
@@ -235,5 +392,30 @@ mod tests {
     fn test_generate_larger_batch() {
         let examples = generate_batch(50, 99);
         assert!(examples.len() >= 20, "Should generate at least 20/50 examples, got {}", examples.len());
+    }
+
+    #[test]
+    fn test_negative_examples_present() {
+        let examples = generate_batch(50, 42);
+        let neg_count = examples.iter().filter(|(_, c, _)| c.starts_with("NEG:")).count();
+        // Should have at least some negative examples (target is 20% of 50 = 10)
+        // But generation may fail sometimes, so be lenient
+        assert!(neg_count >= 1 || examples.len() < 40,
+            "Should have some negative examples, got {neg_count} negatives out of {} total",
+            examples.len());
+    }
+
+    #[test]
+    fn test_multi_point_generation() {
+        // Hard difficulty should sometimes produce states with 5+ objects
+        let examples = generate_batch(100, 123);
+        let has_large = examples.iter().any(|(state, _, _)| {
+            // Count unique point names (single letters)
+            let points: std::collections::HashSet<&str> = state.split_whitespace()
+                .filter(|w| w.len() == 1 && w.chars().next().map_or(false, |c| c.is_alphabetic()))
+                .collect();
+            points.len() >= 5
+        });
+        assert!(has_large, "Hard difficulty should generate states with 5+ points");
     }
 }

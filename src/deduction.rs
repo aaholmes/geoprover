@@ -119,6 +119,10 @@ pub fn saturate_with_config(state: &mut ProofState, config: &SaturateConfig) -> 
         // Angle bisector rules
         new_facts.extend(rule_angle_bisector_ratio(&state.facts));
         new_facts.extend(rule_incenter_equal_inradii(&state.facts));
+        // Similarity and concurrence rules
+        new_facts.extend(rule_aa_similarity(&state.facts));
+        new_facts.extend(rule_orthocenter_concurrence(&state.facts));
+        new_facts.extend(rule_opposite_angles_cyclic(&state.facts));
         // Parallel projection: only call when both parallels and collinears exist
         {
             let has_parallel = state.facts.iter().any(|f| matches!(f, Relation::Parallel(..)));
@@ -3061,6 +3065,235 @@ fn rule_incenter_equal_inradii(facts: &HashSet<Relation>) -> Vec<Relation> {
     new
 }
 
+// --- Rule: AA Similarity ---
+// If angle(A,B,C) = angle(D,E,F) AND angle(B,C,A) = angle(E,F,D),
+// then triangles ABC ~ DEF, yielding EqualRatio for corresponding sides:
+// |AB|/|DE| = |BC|/|EF| = |CA|/|FD|
+fn rule_aa_similarity(facts: &HashSet<Relation>) -> Vec<Relation> {
+    let mut new = Vec::new();
+
+    let eqangles: Vec<(u16, u16, u16, u16, u16, u16)> = facts
+        .iter()
+        .filter_map(|f| match f {
+            Relation::EqualAngle(a, b, c, d, e, f) => Some((*a, *b, *c, *d, *e, *f)),
+            _ => None,
+        })
+        .collect();
+
+    if eqangles.len() < 2 {
+        return new;
+    }
+
+    // For each pair of equal_angle facts, check if they form two angle conditions
+    // of the same two triangles.
+    for (i, &(a1, b1, c1, d1, e1, f1)) in eqangles.iter().enumerate() {
+        // First condition: angle at vertex b1 in triangle (a1,b1,c1) = angle at vertex e1 in triangle (d1,e1,f1)
+        for &(a2, b2, c2, d2, e2, f2) in &eqangles[(i + 1)..] {
+
+            // Check: do the two equal_angle facts use the same 6 points (two triangles)?
+            // Triangle 1 vertices: {b1, ...} and Triangle 2 vertices: {e1, ...}
+            // We need: angle at one vertex of T1 = angle at one vertex of T2 (fact i)
+            //          angle at another vertex of T1 = angle at another vertex of T2 (fact j)
+
+            // Case: b1 in T1, e1 in T2 (from fact i)
+            //        b2 in T1, e2 in T2 (from fact j)
+            let t1_points_i = [a1, b1, c1];
+            let t2_points_i = [d1, e1, f1];
+            let t1_points_j = [a2, b2, c2];
+            let t2_points_j = [d2, e2, f2];
+
+            // All 6 T1 points must form 3 distinct points (a triangle)
+            let mut t1_set: Vec<u16> = Vec::new();
+            for &p in t1_points_i.iter().chain(t1_points_j.iter()) {
+                if !t1_set.contains(&p) {
+                    t1_set.push(p);
+                }
+            }
+            let mut t2_set: Vec<u16> = Vec::new();
+            for &p in t2_points_i.iter().chain(t2_points_j.iter()) {
+                if !t2_set.contains(&p) {
+                    t2_set.push(p);
+                }
+            }
+
+            // Both must be exactly 3 distinct points (each triangle)
+            if t1_set.len() != 3 || t2_set.len() != 3 {
+                continue;
+            }
+
+            // Vertices must be different between the two facts
+            if b1 == b2 {
+                continue;
+            }
+
+            // The two triangles must be distinct (no shared vertices)
+            if t1_set.iter().any(|p| t2_set.contains(p)) {
+                // Allow self-similar triangles? For now skip overlapping.
+                continue;
+            }
+
+            // We have AA similarity: T1(t1_set) ~ T2(t2_set)
+            // The correspondence is: b1 <-> e1, b2 <-> e2, third1 <-> third2
+            let third1 = t1_set.iter().find(|&&p| p != b1 && p != b2).copied();
+            let third2 = t2_set.iter().find(|&&p| p != e1 && p != e2).copied();
+            if let (Some(v3_1), Some(v3_2)) = (third1, third2) {
+                // Correspondence: b1<->e1, b2<->e2, v3_1<->v3_2
+                // Ratios: |b1,b2|/|e1,e2| = |b2,v3_1|/|e2,v3_2| = |v3_1,b1|/|v3_2,e1|
+                new.push(Relation::equal_ratio(b1, b2, e1, e2, b2, v3_1, e2, v3_2));
+                new.push(Relation::equal_ratio(b1, b2, e1, e2, v3_1, b1, v3_2, e1));
+                new.push(Relation::equal_ratio(b2, v3_1, e2, v3_2, v3_1, b1, v3_2, e1));
+
+                // Also emit the third angle equality
+                new.push(Relation::equal_angle(a1.min(c1).max(b2.min(v3_1)),
+                    v3_1, b1.max(c1).min(b2.max(v3_1)),
+                    d1.min(f1).max(e2.min(v3_2)),
+                    v3_2, d1.max(f1).min(e2.max(v3_2))));
+                // Simpler: emit angle at third vertex
+                new.push(Relation::equal_angle(b1, v3_1, b2, e1, v3_2, e2));
+            }
+        }
+    }
+
+    new
+}
+
+// --- Rule: Orthocenter Concurrence ---
+// If AH ⊥ BC and BH ⊥ AC, then CH ⊥ AB.
+// Two altitudes of a triangle meeting at H imply the third altitude also passes through H.
+fn rule_orthocenter_concurrence(facts: &HashSet<Relation>) -> Vec<Relation> {
+    let mut new = Vec::new();
+
+    let perps: Vec<(u16, u16, u16, u16)> = facts
+        .iter()
+        .filter_map(|f| match f {
+            Relation::Perpendicular(a, b, c, d) => Some((*a, *b, *c, *d)),
+            _ => None,
+        })
+        .collect();
+
+    if perps.len() < 2 {
+        return new;
+    }
+
+    // For each pair of perp facts, check if they share a point H
+    // and their "base lines" form two sides of a triangle.
+    // perp(A,H, B,C) means line AH ⊥ line BC
+    // perp(B,H, A,C) means line BH ⊥ line AC
+    // → perp(C,H, A,B)
+
+    for i in 0..perps.len() {
+        for j in (i + 1)..perps.len() {
+            let (a1, b1, c1, d1) = perps[i];
+            let (a2, b2, c2, d2) = perps[j];
+
+            // Check all ways H can be the shared point between two altitude perpendiculars.
+            // Pattern: perp(V1,H, V2,V3) and perp(V2,H, V1,V3) → perp(V3,H, V1,V2)
+            // where V1,V2,V3 are triangle vertices and H is the orthocenter.
+
+            // Extract (altitude_vertex, H, base_v1, base_v2) from each perp
+            let combos1 = [
+                (a1, b1, c1, d1), // a1-b1 ⊥ c1-d1, so altitude from a1 through b1=H, base c1-d1
+                (b1, a1, c1, d1), // or altitude from b1 through a1=H
+                (c1, d1, a1, b1), // or altitude from c1 through d1=H, base a1-b1
+                (d1, c1, a1, b1), // or altitude from d1 through c1=H
+            ];
+            let combos2 = [
+                (a2, b2, c2, d2),
+                (b2, a2, c2, d2),
+                (c2, d2, a2, b2),
+                (d2, c2, a2, b2),
+            ];
+
+            for &(v1, h1, bv1a, bv1b) in &combos1 {
+                for &(v2, h2, bv2a, bv2b) in &combos2 {
+                    // Must share the same orthocenter H
+                    if h1 != h2 {
+                        continue;
+                    }
+                    let h = h1;
+
+                    // v1 must be one of the base vertices of perp2
+                    // v2 must be one of the base vertices of perp1
+                    let v2_in_base1 = v2 == bv1a || v2 == bv1b;
+                    let v1_in_base2 = v1 == bv2a || v1 == bv2b;
+                    if !v2_in_base1 || !v1_in_base2 {
+                        continue;
+                    }
+
+                    // Find the third vertex: the point in base1 that isn't v2
+                    let v3_from_base1 = if bv1a == v2 { bv1b } else { bv1a };
+                    // And the point in base2 that isn't v1
+                    let v3_from_base2 = if bv2a == v1 { bv2b } else { bv2a };
+
+                    // They must agree on the third vertex
+                    if v3_from_base1 != v3_from_base2 {
+                        continue;
+                    }
+                    let v3 = v3_from_base1;
+
+                    // All three vertices must be distinct, and different from H
+                    if v1 == v2 || v1 == v3 || v2 == v3 {
+                        continue;
+                    }
+                    if h == v1 || h == v2 || h == v3 {
+                        continue;
+                    }
+
+                    // Emit: perp(V3, H, V1, V2)
+                    new.push(Relation::perpendicular(v3, h, v1, v2));
+                }
+            }
+        }
+    }
+
+    new
+}
+
+// --- Rule: Opposite Angles → Cyclic (converse of inscribed angle theorem) ---
+// If ∠(A,B,C) = ∠(A,D,C) for four distinct points A,B,C,D
+// where B and D are on the same side of AC, then A,B,C,D are concyclic.
+// Guard: skip if any 3 of the 4 points are collinear (degenerate case).
+fn rule_opposite_angles_cyclic(facts: &HashSet<Relation>) -> Vec<Relation> {
+    let mut new = Vec::new();
+
+    let eqangles: Vec<(u16, u16, u16, u16, u16, u16)> = facts
+        .iter()
+        .filter_map(|f| match f {
+            Relation::EqualAngle(a, b, c, d, e, f) => Some((*a, *b, *c, *d, *e, *f)),
+            _ => None,
+        })
+        .collect();
+
+    // Collinear check using canonical form (Relation::collinear() sorts points)
+    let is_collinear = |a: u16, b: u16, c: u16| -> bool {
+        facts.contains(&Relation::collinear(a, b, c))
+    };
+
+    for &(a1, b1, c1, a2, b2, c2) in &eqangles {
+        // Pattern: angle(A,B,C) = angle(A,D,C) — same A and C, different vertices B and D
+        if a1 == a2 && c1 == c2 && b1 != b2
+            && a1 != b1 && a1 != b2 && a1 != c1 && b1 != c1 && b2 != c1
+        {
+            // Guard: no 3 of {a1, b1, c1, b2} are collinear
+            if !is_collinear(a1, b1, c1) && !is_collinear(a1, b1, b2)
+                && !is_collinear(a1, c1, b2) && !is_collinear(b1, c1, b2)
+            {
+                new.push(Relation::cyclic(a1, b1, c1, b2));
+            }
+        }
+        // Also: angle(A,B,C) = angle(C,D,A) — reversed ray order
+        if a1 == c2 && c1 == a2 && b1 != b2
+            && a1 != b1 && a1 != b2 && a1 != c1 && b1 != c1 && b2 != c1
+            && !is_collinear(a1, b1, c1) && !is_collinear(a1, b1, b2)
+            && !is_collinear(a1, c1, b2) && !is_collinear(b1, c1, b2)
+        {
+            new.push(Relation::cyclic(a1, b1, c1, b2));
+        }
+    }
+
+    new
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5029,5 +5262,132 @@ mod tests {
         state.add_fact(Relation::perpendicular(i, q, b, c));
         let result = rule_incenter_equal_inradii(&state.facts);
         assert!(result.is_empty());
+    }
+
+    // --- AA Similarity tests ---
+
+    #[test]
+    fn test_aa_similarity_basic() {
+        // Two triangles ABC and DEF with two matching angles → similar
+        let mut state = make_state_with_points(&["a", "b", "c", "d", "e", "f"]);
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        let d = state.id("d");
+        let e = state.id("e");
+        let f = state.id("f");
+        // angle(A,B,C) = angle(D,E,F) and angle(B,C,A) = angle(E,F,D)
+        state.add_fact(Relation::equal_angle(a, b, c, d, e, f));
+        state.add_fact(Relation::equal_angle(b, c, a, e, f, d));
+        let result = rule_aa_similarity(&state.facts);
+        // Should produce EqualRatio facts
+        assert!(!result.is_empty(), "AA similarity should produce ratio facts");
+        let has_ratio = result.iter().any(|f| matches!(f, Relation::EqualRatio(..)));
+        assert!(has_ratio, "Should produce EqualRatio facts");
+    }
+
+    #[test]
+    fn test_aa_similarity_insufficient() {
+        // Only one matching angle → no similarity
+        let mut state = make_state_with_points(&["a", "b", "c", "d", "e", "f"]);
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        let d = state.id("d");
+        let e = state.id("e");
+        let f = state.id("f");
+        state.add_fact(Relation::equal_angle(a, b, c, d, e, f));
+        let result = rule_aa_similarity(&state.facts);
+        assert!(result.is_empty(), "One angle match should not trigger similarity");
+    }
+
+    // --- Orthocenter Concurrence tests ---
+
+    #[test]
+    fn test_orthocenter_concurrence() {
+        // AH ⊥ BC and BH ⊥ AC → CH ⊥ AB
+        let mut state = make_state_with_points(&["a", "b", "c", "h"]);
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        let h = state.id("h");
+        state.add_fact(Relation::perpendicular(a, h, b, c));
+        state.add_fact(Relation::perpendicular(b, h, a, c));
+        state.set_goal(Relation::perpendicular(c, h, a, b));
+        assert!(saturate(&mut state), "Orthocenter concurrence should prove CH ⊥ AB");
+    }
+
+    #[test]
+    fn test_orthocenter_concurrence_direct() {
+        let mut state = make_state_with_points(&["a", "b", "c", "h"]);
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        let h = state.id("h");
+        state.add_fact(Relation::perpendicular(a, h, b, c));
+        state.add_fact(Relation::perpendicular(b, h, a, c));
+        let result = rule_orthocenter_concurrence(&state.facts);
+        let target = Relation::perpendicular(c, h, a, b);
+        assert!(result.contains(&target),
+            "Should produce perp(c,h, a,b), got: {:?}", result);
+    }
+
+    #[test]
+    fn test_orthocenter_not_shared_point() {
+        // Two perps that don't share an orthocenter point
+        let mut state = make_state_with_points(&["a", "b", "c", "d", "e"]);
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        let d = state.id("d");
+        let e = state.id("e");
+        state.add_fact(Relation::perpendicular(a, d, b, c));
+        state.add_fact(Relation::perpendicular(b, e, a, c)); // different H points
+        let result = rule_orthocenter_concurrence(&state.facts);
+        assert!(result.is_empty(), "No shared orthocenter → no concurrence");
+    }
+
+    // --- Opposite Angles → Cyclic tests ---
+
+    #[test]
+    fn test_opposite_angles_cyclic() {
+        // angle(A,B,C) = angle(A,D,C) → Cyclic(A,B,C,D)
+        let mut state = make_state_with_points(&["a", "b", "c", "d"]);
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        let d = state.id("d");
+        state.add_fact(Relation::equal_angle(a, b, c, a, d, c));
+        state.set_goal(Relation::cyclic(a, b, c, d));
+        assert!(saturate(&mut state), "Equal inscribed angles should imply concyclic");
+    }
+
+    #[test]
+    fn test_opposite_angles_cyclic_direct() {
+        let mut state = make_state_with_points(&["a", "b", "c", "d"]);
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        let d = state.id("d");
+        state.add_fact(Relation::equal_angle(a, b, c, a, d, c));
+        let result = rule_opposite_angles_cyclic(&state.facts);
+        let target = Relation::cyclic(a, b, c, d);
+        assert!(result.contains(&target),
+            "Should produce cyclic(a,b,c,d), got: {:?}", result);
+    }
+
+    #[test]
+    fn test_opposite_angles_cyclic_not_matching() {
+        // angle(A,B,C) = angle(D,E,F) — different endpoints, not the same arc
+        let mut state = make_state_with_points(&["a", "b", "c", "d", "e", "f"]);
+        let a = state.id("a");
+        let b = state.id("b");
+        let c = state.id("c");
+        let d = state.id("d");
+        let e = state.id("e");
+        let f = state.id("f");
+        state.add_fact(Relation::equal_angle(a, b, c, d, e, f));
+        let result = rule_opposite_angles_cyclic(&state.facts);
+        assert!(result.is_empty(), "Non-matching endpoints should not imply concyclic");
     }
 }

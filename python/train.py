@@ -36,24 +36,25 @@ from orchestrate import (
     MctsConfig,
     TrainingSample,
     load_problems,
+    mcts_search,
     self_play_episode,
     solve_problem,
 )
 
 # Training defaults
-DEFAULT_LR = 1e-4
+DEFAULT_LR = 3e-4
 DEFAULT_WEIGHT_DECAY = 1e-4
-DEFAULT_BATCH_SIZE = 64
+DEFAULT_BATCH_SIZE = 128
 DEFAULT_EPOCHS_PER_ITER = 5
-DEFAULT_REPLAY_SIZE = 50000
+DEFAULT_REPLAY_SIZE = 100000
 DEFAULT_VALUE_WEIGHT = 1.0
 DEFAULT_NUM_ITERATIONS = 10
 DEFAULT_PROBLEMS_FILE = "problems/jgex_ag_231.txt"
 DEFAULT_CHECKPOINT_DIR = "checkpoints"
-DEFAULT_SYNTHETIC_SIZE = 10000
+DEFAULT_SYNTHETIC_SIZE = 50000
 DEFAULT_SYNTHETIC_SEED = 42
-DEFAULT_MAX_SEQ_LEN = 256
-DEFAULT_SELFPLAY_MCTS_ITERS = 50
+DEFAULT_MAX_SEQ_LEN = 128
+DEFAULT_SELFPLAY_MCTS_ITERS = 200
 
 
 class ReplayBuffer:
@@ -96,7 +97,11 @@ class TextGeometryDataset(Dataset):
 
 
 class SyntheticDataset(Dataset):
-    """Dataset from Rust-generated synthetic (state_text, construction_text, goal_text) tuples."""
+    """Dataset from Rust-generated synthetic (state_text, construction_text, goal_text) tuples.
+
+    Handles both positive examples (construction makes goal provable, value=1.0)
+    and negative examples (construction_text prefixed with "NEG:", value=0.0).
+    """
 
     def __init__(self, examples: list[tuple[str, str, str]], max_seq_len: int = DEFAULT_MAX_SEQ_LEN):
         self.examples = examples
@@ -108,25 +113,25 @@ class SyntheticDataset(Dataset):
     def __getitem__(self, idx: int):
         state_text, construction_text, goal_text = self.examples[idx]
 
+        # Detect negative examples (prefixed with "NEG:")
+        is_negative = construction_text.startswith("NEG:")
+        clean_construction = construction_text[4:] if is_negative else construction_text
+
         # State + goal as input: "coll a b c ; cong a b c d ; ? perp a h b c"
-        # The goal becomes the target for the value head (we know it's provable)
         input_text = f"{state_text} ; ? {goal_text}" if state_text else f"? {goal_text}"
         token_ids = tokenize_and_pad(input_text, max_len=self.max_seq_len)
 
         # Policy target: the construction that makes the goal provable
-        # Encode as uniform over valid constructions (we don't have index info)
-        # Instead, use construction_text to create a 1-hot target at the matching index
         policy = torch.zeros(POLICY_SIZE, dtype=torch.float32)
-        # We need construction type and args to compute index, but we only have text
-        # Parse construction text: "mid a b" -> type="Midpoint", args
-        c_type, c_args = _parse_construction_text(construction_text)
-        if c_type is not None:
-            idx_val = construction_to_index(c_type, c_args)
-            policy[idx_val] = 1.0
+        if not is_negative:
+            c_type, c_args = _parse_construction_text(clean_construction)
+            if c_type is not None:
+                idx_val = construction_to_index(c_type, c_args)
+                policy[idx_val] = 1.0
 
-        # Value: 1.0 (the goal is provable with this construction)
-        value = torch.tensor(1.0, dtype=torch.float32)
-        delta_d = torch.tensor(0.0, dtype=torch.float32)  # unknown before construction
+        # Value: 1.0 for positive, 0.0 for negative
+        value = torch.tensor(0.0 if is_negative else 1.0, dtype=torch.float32)
+        delta_d = torch.tensor(0.0, dtype=torch.float32)
 
         return token_ids, policy, value, delta_d
 
@@ -210,16 +215,32 @@ def compute_loss(
 
 def generate_supervised_data(
     problems_file: str,
+    model: GeoTransformer | None = None,
     max_problems: int | None = None,
     max_seq_len: int = DEFAULT_MAX_SEQ_LEN,
+    device: str = "cpu",
 ) -> list[TrainingSample]:
-    """Generate supervised training data from deduction-solvable JGEX problems."""
+    """Generate supervised training data from JGEX problems.
+
+    For deduction-solvable problems: run short MCTS on the pre-saturated state
+    to get visit distributions as policy targets (instead of zero vectors).
+    For MCTS-solvable problems: collect all-node samples from the search tree.
+    """
     problems = load_problems(problems_file)
     if max_problems:
         problems = problems[:max_problems]
 
     samples = []
-    solved = 0
+    deduction_solved = 0
+    mcts_solved = 0
+
+    # Short MCTS config for generating policy targets
+    mcts_config = MctsConfig(
+        num_iterations=50,
+        max_children=20,
+        max_depth=3,
+        max_seq_len=max_seq_len,
+    )
 
     print(f"Generating supervised data from {len(problems)} problems...")
     for name, definition in problems:
@@ -230,22 +251,54 @@ def generate_supervised_data(
             delta_d_before = geoprover.compute_delta_d(state)
 
             proved = geoprover.saturate(state)
-            if not proved:
-                continue
+            if proved:
+                deduction_solved += 1
 
-            solved += 1
-
-            policy_target = [0.0] * POLICY_SIZE
-            samples.append(TrainingSample(
-                state_text=state_text,
-                policy_target=policy_target,
-                value_target=1.0,
-                delta_d=delta_d_before,
-            ))
+                if model is not None:
+                    # Run short MCTS on the pre-saturated state to get policy targets
+                    pre_state = geoprover.parse_problem(problem_text)
+                    result = mcts_search(pre_state, model, mcts_config, device)
+                    if result.samples:
+                        samples.extend(result.samples)
+                    else:
+                        # Fallback: add value-only sample
+                        samples.append(TrainingSample(
+                            state_text=state_text,
+                            policy_target=[0.0] * POLICY_SIZE,
+                            value_target=1.0,
+                            delta_d=delta_d_before,
+                        ))
+                else:
+                    # No model available - generate constructions and uniform policy
+                    pre_state = geoprover.parse_problem(problem_text)
+                    constructions = geoprover.generate_constructions(pre_state)
+                    if constructions:
+                        policy_target = [0.0] * POLICY_SIZE
+                        weight = 1.0 / len(constructions)
+                        for c in constructions:
+                            idx = construction_to_index(c.construction_type(), c.args())
+                            policy_target[idx] = weight
+                    else:
+                        policy_target = [0.0] * POLICY_SIZE
+                    samples.append(TrainingSample(
+                        state_text=state_text,
+                        policy_target=policy_target,
+                        value_target=1.0,
+                        delta_d=delta_d_before,
+                    ))
+            elif model is not None:
+                # Try MCTS on unsolved problems to find MCTS-solvable ones
+                pre_state = geoprover.parse_problem(problem_text)
+                result = mcts_search(pre_state, model, mcts_config, device)
+                if result.solved:
+                    mcts_solved += 1
+                    samples.extend(result.samples)
         except Exception as e:
             print(f"  Skip {name}: {e}")
 
-    print(f"  Generated {len(samples)} samples from {solved}/{len(problems)} solved problems")
+    total_solved = deduction_solved + mcts_solved
+    print(f"  Generated {len(samples)} samples from {total_solved}/{len(problems)} solved "
+          f"(deduction: {deduction_solved}, MCTS: {mcts_solved})")
     return samples
 
 
@@ -393,7 +446,9 @@ def expert_iteration(
     print("=" * 60)
     print("Phase B: JGEX supervised fine-tuning")
     print("=" * 60)
-    supervised_samples = generate_supervised_data(problems_file, max_seq_len=max_seq_len)
+    supervised_samples = generate_supervised_data(
+        problems_file, model=model, max_seq_len=max_seq_len, device=device,
+    )
     if supervised_samples:
         replay.add(supervised_samples)
         dataset = TextGeometryDataset(supervised_samples, max_seq_len=max_seq_len)
@@ -520,7 +575,9 @@ def main():
                 os.path.join(args.checkpoint_dir, "synthetic.pt"),
             )
 
-        samples = generate_supervised_data(args.problems, max_seq_len=args.max_seq_len)
+        samples = generate_supervised_data(
+            args.problems, model=model, max_seq_len=args.max_seq_len, device=device,
+        )
         if samples:
             dataset = TextGeometryDataset(samples, max_seq_len=args.max_seq_len)
             loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)

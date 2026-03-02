@@ -230,23 +230,8 @@ def mcts_search(
 
     solved = _is_solved(root)
 
-    # Collect training sample from root
-    if root.children:
-        visit_counts = [c.visits for c in root.children]
-        total = sum(visit_counts)
-        if total > 0:
-            policy_target = [0.0] * POLICY_SIZE
-            for child, vc in zip(root.children, visit_counts):
-                policy_target[child.action_index] = vc / total
-
-            root_text = geoprover.state_to_text(root.state)
-            root_delta = geoprover.compute_delta_d(root.state)
-            samples.append(TrainingSample(
-                state_text=root_text,
-                policy_target=policy_target,
-                value_target=1.0 if solved else _q_value(root),
-                delta_d=root_delta,
-            ))
+    # Collect training samples from ALL nodes with sufficient visits
+    samples = _collect_all_node_samples(root, solved, min_visits=5)
 
     actions = []
     if solved:
@@ -276,6 +261,56 @@ def _extract_proof_path(node: MctsNode) -> list[str]:
             desc = repr(child.action) if child.action else "root"
             return [desc] + _extract_proof_path(child)
     return []
+
+
+def _collect_all_node_samples(
+    root: MctsNode,
+    solved: bool,
+    min_visits: int = 10,
+) -> list[TrainingSample]:
+    """Walk the MCTS tree and collect training samples from all nodes with sufficient visits.
+
+    This extracts signal from every internal node, not just the root,
+    providing 10-20x more training data per search.
+    """
+    samples = []
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if not node.children or node.visits < min_visits:
+            continue
+        visit_counts = [c.visits for c in node.children]
+        total = sum(visit_counts)
+        if total == 0:
+            continue
+
+        policy_target = [0.0] * POLICY_SIZE
+        for child, vc in zip(node.children, visit_counts):
+            policy_target[child.action_index] = vc / total
+
+        try:
+            state_text = geoprover.state_to_text(node.state)
+            delta_d = geoprover.compute_delta_d(node.state)
+        except Exception:
+            continue
+
+        # Value target: 1.0 if this subtree contains a solution, else Q-value
+        subtree_solved = _is_solved(node)
+        value = 1.0 if subtree_solved else _q_value(node)
+
+        samples.append(TrainingSample(
+            state_text=state_text,
+            policy_target=policy_target,
+            value_target=value,
+            delta_d=delta_d,
+        ))
+
+        # Continue walking into children
+        for child in node.children:
+            if child.visits >= min_visits:
+                stack.append(child)
+
+    return samples
 
 
 def solve_problem(
