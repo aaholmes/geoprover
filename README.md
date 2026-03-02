@@ -83,7 +83,7 @@ Rust extension module (MCTS, deduction engine, state encoding, synthetic data)
 - Backbone: 6-layer transformer encoder, d_model=256, 8 heads, dim_ff=512
 - Custom tokenizer: ~86-token geometry vocabulary (point names, relation/construction keywords)
 - Policy head: 2048 logits over construction index space (7 types x 292 slots)
-- Value head: `V = tanh(v_logit + k * delta_D)` where k is a learned confidence scalar
+- Value head: `V = sigmoid(v_logit)` — single scalar output in [0, 1]
 - ~5M trainable parameters
 
 **Training pipeline (3-phase):**
@@ -162,7 +162,7 @@ web/
 
 - **Select**: Two-phase — visit unvisited children first (by priority), then UCB/PUCT with NN priors
 - **Expand**: Generate constructions, score with NN policy head, create child nodes
-- **Evaluate**: Run `saturate()`. If proved, value=1.0. Otherwise `V = tanh(v_logit + k * delta_D)`
+- **Evaluate**: Run `saturate()`. If proved, value=1.0. Otherwise `V = sigmoid(v_logit)`
 - **Backprop**: Single-player — `total_value += value` at every ancestor (no sign flip)
 
 ### Deduction Rules (52 active)

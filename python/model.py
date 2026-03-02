@@ -3,7 +3,7 @@
 Architecture:
   - Input: text sequence (proof state as relation list + goal)
   - Backbone: 6-layer transformer encoder, d_model=256, 8 heads
-  - Value head: MLP on [CLS] embedding → (v_logit, k)
+  - Value head: MLP on [CLS] embedding → sigmoid(v_logit) ∈ [0, 1]
   - Policy head: dot(state_emb, construction_emb) for each candidate
 
 Replaces the CNN (GeoNet) which suffered from permutation sensitivity.
@@ -12,7 +12,6 @@ The old GeoNet CNN is kept as GeoNetCNN for ablation.
 ~5-8M parameters.
 """
 
-import math
 from typing import Optional
 
 import torch
@@ -143,8 +142,7 @@ class GeoTransformer(nn.Module):
 
     Input: tokenized text sequence of proof state + goal
     Output:
-      - v_logit: (B,) raw value before tanh
-      - k: (B,) confidence scalar for delta_D weighting
+      - value: (B,) sigmoid(v_logit) ∈ [0, 1]
       - policy_logits: (B, N) scores for each candidate construction
 
     For MCTS integration, use score_constructions() to get per-candidate scores.
@@ -183,9 +181,9 @@ class GeoTransformer(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
-        # Value head: [CLS] embedding → (v_logit, k)
+        # Value head: [CLS] embedding → sigmoid(v_logit)
         self.value_fc1 = nn.Linear(d_model, 128)
-        self.value_fc2 = nn.Linear(128, 2)  # (v_logit, k)
+        self.value_fc2 = nn.Linear(128, 1)
 
         # Policy head: state embedding → construction scores
         # Two options:
@@ -215,10 +213,6 @@ class GeoTransformer(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
 
-        # Initialize k bias to 0.5
-        with torch.no_grad():
-            self.value_fc2.bias[1] = 0.5
-
     def encode(self, token_ids: torch.Tensor) -> torch.Tensor:
         """Encode a batch of token sequences into embeddings.
 
@@ -245,7 +239,7 @@ class GeoTransformer(nn.Module):
         self,
         token_ids: torch.Tensor,
         valid_mask: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Forward pass with fixed-size policy output.
 
         Args:
@@ -253,17 +247,14 @@ class GeoTransformer(nn.Module):
             valid_mask: (B, POLICY_SIZE) boolean mask of valid constructions
 
         Returns:
-            v_logit: (B,) raw value
-            k: (B,) delta_D confidence scalar
+            value: (B,) sigmoid(v_logit) ∈ [0, 1]
             policy_logits: (B, POLICY_SIZE) construction logits
         """
         cls_emb = self.encode(token_ids)
 
         # Value head
         v = F.relu(self.value_fc1(cls_emb))
-        v_out = self.value_fc2(v)
-        v_logit = v_out[:, 0]
-        k = v_out[:, 1]
+        value = torch.sigmoid(self.value_fc2(v).squeeze(-1))
 
         # Policy head (fixed-size)
         p = F.relu(self.policy_fc1(cls_emb))
@@ -272,13 +263,13 @@ class GeoTransformer(nn.Module):
         if valid_mask is not None:
             policy_logits = policy_logits.masked_fill(~valid_mask, float("-inf"))
 
-        return v_logit, k, policy_logits
+        return value, policy_logits
 
     def score_constructions(
         self,
         state_ids: torch.Tensor,
         construction_ids_list: list[torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         """Score candidate constructions via dot-product attention.
 
         Args:
@@ -286,17 +277,14 @@ class GeoTransformer(nn.Module):
             construction_ids_list: list of B tensors, each (N_i, L_constr)
 
         Returns:
-            v_logit: (B,)
-            k: (B,)
+            value: (B,) sigmoid(v_logit) ∈ [0, 1]
             scores: list of B tensors, each (N_i,)
         """
         cls_emb = self.encode(state_ids)
 
         # Value head
         v = F.relu(self.value_fc1(cls_emb))
-        v_out = self.value_fc2(v)
-        v_logit = v_out[:, 0]
-        k = v_out[:, 1]
+        value = torch.sigmoid(self.value_fc2(v).squeeze(-1))
 
         # State projection for scoring
         state_vec = self.state_proj(cls_emb)  # (B, d_model)
@@ -314,26 +302,22 @@ class GeoTransformer(nn.Module):
             s = (state_vec[i].unsqueeze(0) * c_proj).sum(dim=-1)  # (N_i,)
             scores.append(s)
 
-        return v_logit, k, scores
+        return value, scores
 
     def predict(
         self,
         token_ids: torch.Tensor,
         valid_mask: Optional[torch.Tensor] = None,
-    ) -> tuple[float, float, torch.Tensor]:
+    ) -> tuple[float, torch.Tensor]:
         """Single-state prediction for inference."""
         self.eval()
         with torch.no_grad():
-            v_logit, k, logits = self.forward(
+            value, logits = self.forward(
                 token_ids.unsqueeze(0),
                 valid_mask.unsqueeze(0) if valid_mask is not None else None,
             )
             policy = F.softmax(logits[0], dim=0)
-            return v_logit.item(), k.item(), policy
-
-    def compute_value(self, v_logit: float, k: float, delta_d: float) -> float:
-        """Compute final value: V = tanh(v_logit + k * delta_D)."""
-        return math.tanh(v_logit + k * delta_d)
+            return value.item(), policy
 
 
 # ============================================================

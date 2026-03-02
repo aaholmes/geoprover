@@ -92,8 +92,7 @@ class TextGeometryDataset(Dataset):
         token_ids = tokenize_and_pad(s.state_text, max_len=self.max_seq_len)
         policy = torch.tensor(s.policy_target, dtype=torch.float32)
         value = torch.tensor(s.value_target, dtype=torch.float32)
-        delta_d = torch.tensor(s.delta_d, dtype=torch.float32)
-        return token_ids, policy, value, delta_d
+        return token_ids, policy, value
 
 
 class SyntheticDataset(Dataset):
@@ -131,9 +130,8 @@ class SyntheticDataset(Dataset):
 
         # Value: 1.0 for positive, 0.0 for negative
         value = torch.tensor(0.0 if is_negative else 1.0, dtype=torch.float32)
-        delta_d = torch.tensor(0.0, dtype=torch.float32)
 
-        return token_ids, policy, value, delta_d
+        return token_ids, policy, value
 
 
 # Map from text keywords to ConstructionType names
@@ -180,11 +178,10 @@ def compute_loss(
     token_ids: torch.Tensor,
     policy_targets: torch.Tensor,
     value_targets: torch.Tensor,
-    delta_d: torch.Tensor,
     value_weight: float = DEFAULT_VALUE_WEIGHT,
 ) -> tuple[torch.Tensor, dict]:
     """Compute combined policy + value loss."""
-    v_logit, k, policy_logits = model(token_ids)
+    value_pred, policy_logits = model(token_ids)
 
     # Policy loss: KL(target || predicted)
     log_probs = F.log_softmax(policy_logits, dim=1)
@@ -196,9 +193,8 @@ def compute_loss(
     else:
         policy_loss = torch.tensor(0.0, device=token_ids.device)
 
-    # Value loss: MSE between tanh(v_logit + k * delta_d) and target
-    predicted_value = torch.tanh(v_logit + k * delta_d)
-    value_loss = F.mse_loss(predicted_value, value_targets)
+    # Value loss: MSE between sigmoid value and target
+    value_loss = F.mse_loss(value_pred, value_targets)
 
     total_loss = policy_loss + value_weight * value_loss
 
@@ -206,9 +202,7 @@ def compute_loss(
         "loss": total_loss.item(),
         "policy_loss": policy_loss.item(),
         "value_loss": value_loss.item(),
-        "mean_v_logit": v_logit.mean().item(),
-        "mean_k": k.mean().item(),
-        "mean_pred_value": predicted_value.mean().item(),
+        "mean_pred_value": value_pred.mean().item(),
     }
     return total_loss, metrics
 
@@ -248,7 +242,6 @@ def generate_supervised_data(
         try:
             state = geoprover.parse_problem(problem_text)
             state_text = geoprover.state_to_text(state)
-            delta_d_before = geoprover.compute_delta_d(state)
 
             proved = geoprover.saturate(state)
             if proved:
@@ -266,7 +259,6 @@ def generate_supervised_data(
                             state_text=state_text,
                             policy_target=[0.0] * POLICY_SIZE,
                             value_target=1.0,
-                            delta_d=delta_d_before,
                         ))
                 else:
                     # No model available - generate constructions and uniform policy
@@ -284,7 +276,6 @@ def generate_supervised_data(
                         state_text=state_text,
                         policy_target=policy_target,
                         value_target=1.0,
-                        delta_d=delta_d_before,
                     ))
             elif model is not None:
                 # Try MCTS on unsolved problems to find MCTS-solvable ones
@@ -314,15 +305,14 @@ def train_epoch(
     total_metrics = {}
     n_batches = 0
 
-    for token_ids, policy_targets, value_targets, delta_d in dataloader:
+    for token_ids, policy_targets, value_targets in dataloader:
         token_ids = token_ids.to(device)
         policy_targets = policy_targets.to(device)
         value_targets = value_targets.to(device)
-        delta_d = delta_d.to(device)
 
         optimizer.zero_grad()
         loss, metrics = compute_loss(
-            model, token_ids, policy_targets, value_targets, delta_d, value_weight
+            model, token_ids, policy_targets, value_targets, value_weight
         )
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)

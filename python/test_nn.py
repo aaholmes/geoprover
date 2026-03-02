@@ -71,11 +71,12 @@ def test_forward_pass():
     t2 = tokenize_and_pad(text2, max_len=64)
     batch = torch.stack([t1, t2])
 
-    v_logit, k, policy = model(batch)
-    assert v_logit.shape == (2,), f"v_logit shape: {v_logit.shape}"
-    assert k.shape == (2,), f"k shape: {k.shape}"
+    value, policy = model(batch)
+    assert value.shape == (2,), f"value shape: {value.shape}"
     assert policy.shape == (2, POLICY_SIZE), f"policy shape: {policy.shape}"
-    print(f"  v_logit={v_logit[0].item():.4f}, k={k[0].item():.4f}")
+    # Value should be in [0, 1] (sigmoid output)
+    assert (value >= 0).all() and (value <= 1).all(), f"Value out of [0,1]: {value}"
+    print(f"  value={value[0].item():.4f}")
     print("  PASS: forward pass")
 
 
@@ -86,7 +87,7 @@ def test_forward_with_mask():
     t = tokenize_and_pad(text, max_len=64).unsqueeze(0)
     mask = torch.zeros(1, POLICY_SIZE, dtype=torch.bool)
     mask[0, [0, 10, 73, 146]] = True
-    v_logit, k, policy = model(t, mask)
+    value, policy = model(t, mask)
     assert policy[0, 1].item() == float("-inf"), "Masked position should be -inf"
     assert policy[0, 0].item() != float("-inf"), "Valid position should not be -inf"
     print("  PASS: forward with mask")
@@ -99,27 +100,29 @@ def test_predict_single():
     t = tokenize_and_pad(text, max_len=64)
     mask = torch.zeros(POLICY_SIZE, dtype=torch.bool)
     mask[[0, 73, 146]] = True
-    v_logit, k, policy = model.predict(t, mask)
-    assert isinstance(v_logit, float)
-    assert isinstance(k, float)
+    value, policy = model.predict(t, mask)
+    assert isinstance(value, float)
+    assert 0.0 <= value <= 1.0, f"Value should be in [0,1], got {value}"
     assert policy.shape == (POLICY_SIZE,)
     valid_sum = policy[[0, 73, 146]].sum().item()
     assert abs(valid_sum - 1.0) < 0.01, f"Policy sum over valid: {valid_sum}"
-    print(f"  v_logit={v_logit:.4f}, k={k:.4f}, policy_sum={valid_sum:.4f}")
+    print(f"  value={value:.4f}, policy_sum={valid_sum:.4f}")
     print("  PASS: predict single")
 
 
-def test_compute_value():
-    """Test value computation."""
+def test_value_range():
+    """Test that value output is in [0, 1] via sigmoid."""
     model = GeoTransformer()
-    val = model.compute_value(v_logit=0.0, k=0.5, delta_d=0.5)
-    expected = 0.24491866  # tanh(0.25)
-    assert abs(val - expected) < 0.01, f"Expected ~{expected}, got {val}"
-    val_proved = model.compute_value(v_logit=0.5, k=0.5, delta_d=1.0)
-    assert val_proved > 0.7, f"Proved state value: {val_proved}"
-    print(f"  V(0.0, 0.5, 0.5) = {val:.4f}")
-    print(f"  V(0.5, 0.5, 1.0) = {val_proved:.4f}")
-    print("  PASS: compute value")
+    texts = [
+        "coll a b c",
+        "cong a b c d ; para a b c d ; perp a c b d ; ? eqangle a b c d e f",
+    ]
+    for text in texts:
+        t = tokenize_and_pad(text, max_len=64)
+        value, _ = model.predict(t)
+        assert 0.0 <= value <= 1.0, f"Value should be in [0,1], got {value}"
+    print(f"  All values in [0, 1]")
+    print("  PASS: value range")
 
 
 def test_construction_to_index():
@@ -196,15 +199,13 @@ def test_integration_with_geoprover():
     mask = build_valid_mask(constructions)
 
     # Predict
-    v_logit, k, policy = model.predict(token_ids, mask)
-    delta_d = geoprover.compute_delta_d(state)
-    value = model.compute_value(v_logit, k, delta_d)
+    value, policy = model.predict(token_ids, mask)
+    assert 0.0 <= value <= 1.0, f"Value should be in [0,1], got {value}"
 
     print(f"  Problem: orthocenter")
     print(f"  Objects: {state.num_objects()}, Facts: {state.num_facts()}")
     print(f"  Text tokens: {(token_ids != PAD_ID).sum().item()}")
     print(f"  Constructions: {len(constructions)}")
-    print(f"  v_logit={v_logit:.4f}, k={k:.4f}, delta_d={delta_d:.4f}")
     print(f"  Value: {value:.4f}")
     print("  PASS: integration with geoprover")
 
@@ -230,11 +231,10 @@ def test_training_step():
         policy_targets[i, active] = torch.rand(5)
         policy_targets[i] /= policy_targets[i].sum()
     value_targets = torch.rand(batch_size)
-    delta_d = torch.rand(batch_size)
 
     from train import compute_loss
     optimizer.zero_grad()
-    loss, metrics = compute_loss(model, token_ids, policy_targets, value_targets, delta_d)
+    loss, metrics = compute_loss(model, token_ids, policy_targets, value_targets)
     loss.backward()
     optimizer.step()
 
@@ -300,7 +300,7 @@ def test_synthetic_dataset():
     dataset = SyntheticDataset(data, max_seq_len=64)
     assert len(dataset) == len(data)
 
-    token_ids, policy, value, delta_d = dataset[0]
+    token_ids, policy, value = dataset[0]
     assert token_ids.shape == (64,)
     assert token_ids.dtype == torch.long
     assert policy.shape == (POLICY_SIZE,)
@@ -318,6 +318,7 @@ def test_legacy_cnn():
     params = count_parameters(model)
     print(f"  GeoNetCNN parameters: {params:,}")
     x = torch.randn(1, 20, 32, 32)
+    # Legacy CNN still outputs (v_logit, k, policy) — kept for ablation
     v_logit, k, policy = model(x)
     assert v_logit.shape == (1,)
     assert k.shape == (1,)
@@ -333,7 +334,7 @@ if __name__ == "__main__":
         test_forward_pass,
         test_forward_with_mask,
         test_predict_single,
-        test_compute_value,
+        test_value_range,
         test_construction_to_index,
         test_state_to_text,
         test_construction_to_text,

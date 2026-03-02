@@ -315,7 +315,7 @@ Tier 2: MCTS Tree Search (200 iterations, depth 3)
 Tier 3: Neural Oracle (GeoTransformer, ~5M params)
   Input: tokenized proof state text
   Output: policy (construction priors) + value (solve probability)
-  V = tanh(v_logit + k * delta_D)
+  V = sigmoid(v_logit)
 
 Training Pipeline:
   Phase A: Synthetic pre-training (50K examples)

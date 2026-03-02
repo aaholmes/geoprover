@@ -10,7 +10,7 @@ Flow:
      a. Generate candidate constructions
      b. Encode state as text, score with NN policy head
      c. Expand best candidates
-     d. Evaluate with NN value head + delta_D
+     d. Evaluate with NN value head (sigmoid)
      e. Backpropagate
   4. Collect (state_text, visit_distribution, outcome) training data
 """
@@ -68,7 +68,6 @@ class TrainingSample:
     state_text: str  # text encoding of the proof state
     policy_target: list[float]  # POLICY_SIZE-element distribution
     value_target: float  # outcome: 1.0 if proved, 0.0 otherwise
-    delta_d: float  # proof-distance at this state
 
 
 @dataclass
@@ -130,7 +129,7 @@ def _expand(node: MctsNode, config: MctsConfig, model: GeoNet, device: str) -> N
 
     model.eval()
     with torch.no_grad():
-        _, _, logits = model(token_ids.unsqueeze(0), mask)
+        _, logits = model(token_ids.unsqueeze(0), mask)
         priors = F.softmax(logits[0], dim=0)
 
     for c in constructions:
@@ -161,18 +160,15 @@ def _evaluate(node: MctsNode, model: GeoNet, config: MctsConfig, device: str) ->
         node.terminal_value = 1.0
         return 1.0
 
-    delta_d = geoprover.compute_delta_d(node.state)
-
     # Encode state as text
     state_text = geoprover.state_to_text(node.state)
     token_ids = tokenize_and_pad(state_text, max_len=config.max_seq_len).to(device)
 
     model.eval()
     with torch.no_grad():
-        v_logit, k, _ = model(token_ids.unsqueeze(0))
-        value = math.tanh(v_logit.item() + k.item() * delta_d)
+        value, _ = model(token_ids.unsqueeze(0))
 
-    return max(0.0, min(1.0, value))
+    return value.item()
 
 
 def _backprop(node: MctsNode, value: float) -> None:
@@ -290,7 +286,6 @@ def _collect_all_node_samples(
 
         try:
             state_text = geoprover.state_to_text(node.state)
-            delta_d = geoprover.compute_delta_d(node.state)
         except Exception:
             continue
 
@@ -302,7 +297,6 @@ def _collect_all_node_samples(
             state_text=state_text,
             policy_target=policy_target,
             value_target=value,
-            delta_d=delta_d,
         ))
 
         # Continue walking into children
