@@ -63,7 +63,7 @@ Geoprover's deduction engine exceeds AlphaGeometry's DD baseline on JGEX-AG-231.
 
 | Phase | Status | Details |
 |-------|--------|---------|
-| 1. Rust core | **Done** | ProofState, parser (231/231 JGEX), deduction (49 rules), construction (16 types) |
+| 1. Rust core | **Done** | ProofState, parser (231/231 JGEX), deduction (49 rules), construction (7 types) |
 | 2. MCTS | **Done** | MctsNode tree, UCB/PUCT selection, expand/evaluate/backprop, classical fallback |
 | 3. PyO3 bridge | **Done** | Text + tensor encoding, full PyO3 API: parse, saturate, encode, construct |
 | 4. NN + training | **Done** | GeoTransformer (~4M params), NN-guided MCTS, 3-phase training pipeline |
@@ -109,7 +109,7 @@ Rust extension module (MCTS, deduction engine, state encoding)
 src/
   proof_state.rs    ProofState, GeoObject, Relation (Zobrist hashing, text serialization)
   deduction.rs      49 forward-chaining rules + degenerate-fact filtering
-  construction.rs   16 construction types with priority classification
+  construction.rs   7 auxiliary construction types with priority classification
   parser.rs         JGEX DSL parser (40+ predicates, 231/231 coverage)
   encoding.rs       state_to_tensor() — 20x32x32 relation adjacency grid (legacy)
   synthetic.rs      Random geometry data generator for pre-training

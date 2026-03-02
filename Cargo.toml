@@ -2,6 +2,10 @@
 name = "geoprover"
 version = "0.1.0"
 edition = "2021"
+authors = ["Adam A. Holmes <adamaholmes@gmail.com>"]
+description = "Neurosymbolic geometry theorem prover using MCTS and a transformer neural network"
+license = "MIT"
+repository = "https://github.com/aaholmes/geoprover"
 
 [lib]
 name = "geoprover"

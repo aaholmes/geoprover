@@ -4,3 +4,16 @@ __pycache__/
 *.egg-info/
 /checkpoints/*.pt
 /results/*.json
+.claude/
+.env
+*.so
+*.dylib
+*.dll
+dist/
+.venv/
+venv/
+.DS_Store
+*.swp
+*.swo
+CLAUDE.md
+GEOPROVER_PLAN.md
