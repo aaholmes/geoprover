@@ -111,6 +111,51 @@ def test_parse_error():
         print(f"Parse error (expected): {e}")
 
 
+def test_saturate_with_trace():
+    """Test that saturate_with_trace returns (bool, PyProofTrace)."""
+    state = geoprover.parse_problem(
+        "orthocenter\n"
+        "a b c = triangle; h = on_tline b a c, on_tline c a b ? perp a h b c"
+    )
+    proved, trace = geoprover.saturate_with_trace(state)
+    assert proved, "Orthocenter should be proved with trace"
+    assert trace.len() > 0, "Trace should have derivations"
+    assert trace.axiom_count() > 0, "Trace should have axioms"
+    print(f"Saturate with trace: proved={proved}, derivations={trace.len()}, axioms={trace.axiom_count()}")
+    print(f"  Repr: {repr(trace)}")
+
+
+def test_proof_trace_extract():
+    """Test extract_proof returns list of derivation steps."""
+    state = geoprover.parse_problem(
+        "midpoint_trace\n"
+        "a b = segment a b; m = midpoint a b ? cong a m m b"
+    )
+    proved, trace = geoprover.saturate_with_trace(state)
+    assert proved
+    proof = trace.extract_proof()
+    assert proof is not None, "Should extract proof"
+    assert len(proof) > 0, "Proof should have steps"
+    print(f"Proof trace extract: {len(proof)} steps")
+    for fact_text, rule_name, premise_texts in proof:
+        print(f"  {fact_text} [{rule_name}] from {premise_texts}")
+
+
+def test_proof_trace_format():
+    """Test format_proof returns readable string."""
+    state = geoprover.parse_problem(
+        "iso_trace\n"
+        "a b c = iso_triangle a b c ? eqangle b a b c c a c b"
+    )
+    proved, trace = geoprover.saturate_with_trace(state)
+    assert proved
+    formatted = trace.format_proof()
+    assert formatted is not None, "Should format proof"
+    assert "Proof" in formatted
+    assert "axiom" in formatted
+    print(f"Formatted proof:\n{formatted}")
+
+
 if __name__ == "__main__":
     test_version()
     test_parse_simple()
@@ -123,4 +168,7 @@ if __name__ == "__main__":
     test_compute_delta_d()
     test_saturate_with_config()
     test_parse_error()
+    test_saturate_with_trace()
+    test_proof_trace_extract()
+    test_proof_trace_format()
     print("\nAll bridge tests passed!")

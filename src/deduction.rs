@@ -1,4 +1,5 @@
 use crate::proof_state::{ProofState, Relation};
+use crate::proof_trace::{ProofTrace, RuleName};
 use std::collections::{HashMap, HashSet};
 
 /// Configuration for the saturate loop.
@@ -222,6 +223,192 @@ pub fn saturate_with_config(state: &mut ProofState, config: &SaturateConfig) -> 
         }
     }
     state.is_proved()
+}
+
+/// Macro to collect facts from a rule call, tagging each with the rule name.
+macro_rules! trace_rule {
+    ($rule_fn:ident, $facts:expr, $rule_name:expr, $tagged:expr) => {
+        for fact in $rule_fn($facts) {
+            $tagged.push((fact, $rule_name));
+        }
+    };
+}
+
+/// Run deduction to fixed point, recording a ProofTrace of all derivations.
+/// Returns (proved, trace). Does NOT modify the existing saturate functions.
+pub fn saturate_with_trace(state: &mut ProofState) -> (bool, ProofTrace) {
+    let config = SaturateConfig::default();
+    let mut trace = ProofTrace::new();
+
+    // Record all initial facts as axioms
+    for fact in state.facts.iter() {
+        trace.add_axiom(fact.clone());
+    }
+
+    let goal_points: HashSet<u16> = state
+        .goal
+        .as_ref()
+        .map(|g| g.point_ids().into_iter().collect())
+        .unwrap_or_default();
+
+    let mut iterations = 0;
+    let mut stall_count = 0;
+
+    loop {
+        if iterations >= config.max_iterations || state.facts.len() >= config.max_facts {
+            break;
+        }
+        iterations += 1;
+        let mut tagged_facts: Vec<(Relation, RuleName)> = Vec::new();
+
+        // Apply all rules, tagging each derived fact with its rule name
+        trace_rule!(rule_transitive_parallel, &state.facts, RuleName::TransitiveParallel, tagged_facts);
+        trace_rule!(rule_perp_to_parallel, &state.facts, RuleName::PerpToParallel, tagged_facts);
+        trace_rule!(rule_midpoint_definition, &state.facts, RuleName::MidpointDefinition, tagged_facts);
+        trace_rule!(rule_transitive_congruent, &state.facts, RuleName::TransitiveCongruent, tagged_facts);
+        trace_rule!(rule_isosceles_base_angles, &state.facts, RuleName::IsoscelesBaseAngles, tagged_facts);
+        trace_rule!(rule_alternate_interior_angles, &state.facts, RuleName::AlternateInteriorAngles, tagged_facts);
+        trace_rule!(rule_corresponding_angles, &state.facts, RuleName::CorrespondingAngles, tagged_facts);
+        trace_rule!(rule_transitive_equal_angle, &state.facts, RuleName::TransitiveEqualAngle, tagged_facts);
+        trace_rule!(rule_perpendicular_angles, &state.facts, RuleName::PerpendicularAngles, tagged_facts);
+        trace_rule!(rule_circle_point_equidistance, &state.facts, RuleName::CirclePointEquidistance, tagged_facts);
+        trace_rule!(rule_midline_parallel, &state.facts, RuleName::MidlineParallel, tagged_facts);
+        trace_rule!(rule_cyclic_from_oncircle, &state.facts, RuleName::CyclicFromOncircle, tagged_facts);
+        trace_rule!(rule_equal_angles_to_parallel, &state.facts, RuleName::EqualAnglesToParallel, tagged_facts);
+        trace_rule!(rule_midpoint_converse, &state.facts, RuleName::MidpointConverse, tagged_facts);
+        trace_rule!(rule_congruent_oncircle, &state.facts, RuleName::CongruentOncircle, tagged_facts);
+        trace_rule!(rule_perpendicular_bisector, &state.facts, RuleName::PerpendicularBisector, tagged_facts);
+        trace_rule!(rule_equidistant_midpoint, &state.facts, RuleName::EquidistantMidpoint, tagged_facts);
+        trace_rule!(rule_perp_parallel_transfer, &state.facts, RuleName::PerpParallelTransfer, tagged_facts);
+        trace_rule!(rule_line_collinear_extension, &state.facts, RuleName::LineCollinearExtension, tagged_facts);
+        trace_rule!(rule_collinear_transitivity, &state.facts, RuleName::CollinearTransitivity, tagged_facts);
+        trace_rule!(rule_cyclic_inscribed_angles, &state.facts, RuleName::CyclicInscribedAngles, tagged_facts);
+        trace_rule!(rule_parallel_shared_point_collinear, &state.facts, RuleName::ParallelSharedPointCollinear, tagged_facts);
+        trace_rule!(rule_thales_theorem, &state.facts, RuleName::ThalesTheorem, tagged_facts);
+        trace_rule!(rule_inscribed_angle_converse, &state.facts, RuleName::InscribedAngleConverse, tagged_facts);
+        trace_rule!(rule_isosceles_converse, &state.facts, RuleName::IsoscelesConverse, tagged_facts);
+        trace_rule!(rule_perp_midpoint_congruent, &state.facts, RuleName::PerpMidpointCongruent, tagged_facts);
+        trace_rule!(rule_two_equidistant_perp, &state.facts, RuleName::TwoEquidistantPerp, tagged_facts);
+        trace_rule!(rule_midpoint_diagonal_parallelogram, &state.facts, RuleName::MidpointDiagonalParallelogram, tagged_facts);
+        trace_rule!(rule_cyclic_equal_angle_congruent, &state.facts, RuleName::CyclicEqualAngleCongruent, tagged_facts);
+        trace_rule!(rule_cyclic_parallel_eqangle, &state.facts, RuleName::CyclicParallelEqangle, tagged_facts);
+        trace_rule!(rule_equidistant_cyclic_perp, &state.facts, RuleName::EquidistantCyclicPerp, tagged_facts);
+        trace_rule!(rule_midpoint_parallelogram, &state.facts, RuleName::MidpointParallelogram, tagged_facts);
+        trace_rule!(rule_eqangle_perp_to_perp, &state.facts, RuleName::EqanglePerpToPerp, tagged_facts);
+        trace_rule!(rule_sas_congruence, &state.facts, RuleName::SasCongruence, tagged_facts);
+        trace_rule!(rule_asa_congruence, &state.facts, RuleName::AsaCongruence, tagged_facts);
+        trace_rule!(rule_sss_congruence, &state.facts, RuleName::SssCongruence, tagged_facts);
+        trace_rule!(rule_transitive_ratio, &state.facts, RuleName::TransitiveRatio, tagged_facts);
+        trace_rule!(rule_ratio_one_congruence, &state.facts, RuleName::RatioOneCongruence, tagged_facts);
+        trace_rule!(rule_midpoint_ratio, &state.facts, RuleName::MidpointRatio, tagged_facts);
+        trace_rule!(rule_parallel_collinear_ratio, &state.facts, RuleName::ParallelCollinearRatio, tagged_facts);
+        trace_rule!(rule_congruent_ratio, &state.facts, RuleName::CongruentRatio, tagged_facts);
+        trace_rule!(rule_ratio_collinear_parallel, &state.facts, RuleName::RatioCollinearParallel, tagged_facts);
+        trace_rule!(rule_parallelogram_opposite_angles, &state.facts, RuleName::ParallelogramOppositeAngles, tagged_facts);
+        trace_rule!(rule_isosceles_trapezoid_base_angles, &state.facts, RuleName::IsoscelesTrapezoidBaseAngles, tagged_facts);
+        trace_rule!(rule_trapezoid_midsegment, &state.facts, RuleName::TrapezoidMidsegment, tagged_facts);
+        trace_rule!(rule_parallel_base_ratio, &state.facts, RuleName::ParallelBaseRatio, tagged_facts);
+        trace_rule!(rule_equal_tangent_lengths, &state.facts, RuleName::EqualTangentLengths, tagged_facts);
+        trace_rule!(rule_tangent_chord_angle, &state.facts, RuleName::TangentChordAngle, tagged_facts);
+        trace_rule!(rule_angle_bisector_ratio, &state.facts, RuleName::AngleBisectorRatio, tagged_facts);
+        trace_rule!(rule_incenter_equal_inradii, &state.facts, RuleName::IncenterEqualInradii, tagged_facts);
+        trace_rule!(rule_aa_similarity, &state.facts, RuleName::AaSimilarity, tagged_facts);
+        trace_rule!(rule_orthocenter_concurrence, &state.facts, RuleName::OrthocenterConcurrence, tagged_facts);
+        trace_rule!(rule_opposite_angles_cyclic, &state.facts, RuleName::OppositeAnglesCyclic, tagged_facts);
+        // Parallel projection (guarded)
+        {
+            let has_parallel = state.facts.iter().any(|f| matches!(f, Relation::Parallel(..)));
+            let has_collinear = state.facts.iter().any(|f| matches!(f, Relation::Collinear(..)));
+            if has_parallel && has_collinear {
+                trace_rule!(rule_parallel_projection, &state.facts, RuleName::ParallelProjection, tagged_facts);
+            }
+        }
+
+        // Filter degenerate and already-known facts
+        tagged_facts.retain(|(f, _)| {
+            match f {
+                Relation::Parallel(a, b, c, d) => {
+                    if a == c || a == d || b == c || b == d {
+                        return false;
+                    }
+                }
+                Relation::Perpendicular(a, b, c, d) => {
+                    if a == b || c == d || (a == c && b == d) || (a == d && b == c) {
+                        return false;
+                    }
+                }
+                Relation::EqualAngle(a, b, c, d, e, f) => {
+                    if a == b || b == c || d == e || e == f {
+                        return false;
+                    }
+                }
+                Relation::EqualRatio(a, b, c, d, e, f, g, h) => {
+                    if a == b || c == d || e == f || g == h {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+            !state.facts.contains(f)
+        });
+
+        if tagged_facts.is_empty() {
+            break;
+        }
+
+        // Goal-relevance tracking
+        let goal_relevant_count = if !goal_points.is_empty() {
+            tagged_facts
+                .iter()
+                .filter(|(f, _)| f.point_ids().iter().any(|p| goal_points.contains(p)))
+                .count()
+        } else {
+            tagged_facts.len()
+        };
+
+        if goal_relevant_count > 0 {
+            stall_count = 0;
+        } else {
+            stall_count += 1;
+            if stall_count >= config.stall_limit {
+                break;
+            }
+        }
+
+        // Batch cap
+        if tagged_facts.len() > config.max_new_per_iteration {
+            let (mut relevant, mut other): (Vec<_>, Vec<_>) = if !goal_points.is_empty() {
+                tagged_facts.into_iter().partition(|(f, _)| {
+                    f.point_ids().iter().any(|p| goal_points.contains(p))
+                })
+            } else {
+                (tagged_facts, Vec::new())
+            };
+            let remaining = config.max_new_per_iteration.saturating_sub(relevant.len());
+            other.truncate(remaining);
+            relevant.extend(other);
+            relevant.truncate(config.max_new_per_iteration);
+            tagged_facts = relevant;
+        }
+
+        // Add facts to state and record derivations (premises resolved lazily)
+        for (fact, rule) in tagged_facts {
+            if state.add_fact(fact.clone()) {
+                trace.add_derivation(fact, rule, vec![]);
+            }
+        }
+
+        if state.facts.len() >= config.max_facts {
+            break;
+        }
+
+        if state.is_proved() {
+            trace.set_all_facts(state.facts.clone());
+            return (true, trace);
+        }
+    }
+    trace.set_all_facts(state.facts.clone());
+    (state.is_proved(), trace)
 }
 
 // --- Rule 20: Transitive Parallel ---

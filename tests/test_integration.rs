@@ -1,5 +1,5 @@
 use geoprover::parser::parse_problem;
-use geoprover::deduction::saturate;
+use geoprover::deduction::{saturate, saturate_with_trace};
 use geoprover::construction::{generate_constructions, apply_construction};
 use geoprover::mcts::{mcts_search, MctsConfig};
 
@@ -396,4 +396,143 @@ fn test_count_jgex_solvable_by_mcts() {
     for name in &solved_names {
         println!("  {}", name);
     }
+}
+
+// ============================
+// Proof Trace integration tests
+// ============================
+
+#[test]
+fn test_trace_midpoint_proof() {
+    // Midpoint(m,a,b) → saturate → proves Cong(a,m,m,b)
+    let input = "midpoint_trace\na b = segment a b; m = midpoint a b ? cong a m m b";
+    let mut state = parse_problem(input).unwrap();
+    let (proved, trace) = saturate_with_trace(&mut state);
+    assert!(proved, "Midpoint congruence should be proved with trace");
+    assert!(trace.axiom_count() > 0, "Should have axioms");
+    assert!(trace.len() > trace.axiom_count(), "Should have derived facts beyond axioms");
+
+    // Extract proof for the goal
+    let goal = state.goal.as_ref().unwrap();
+    let proof = trace.extract_proof(goal);
+    assert!(proof.is_some(), "Should extract proof for goal");
+    let steps = proof.unwrap();
+    assert!(!steps.is_empty(), "Proof should have steps");
+    // Goal should appear in the proof
+    assert!(steps.iter().any(|d| &d.fact == goal), "Goal should be in proof");
+}
+
+#[test]
+fn test_trace_matches_saturate() {
+    // For several JGEX problems, both functions should agree on proved/not-proved
+    let content = std::fs::read_to_string("problems/jgex_ag_231.txt").unwrap();
+    let lines: Vec<&str> = content.lines().collect();
+    let mut checked = 0;
+    let mut mismatches = 0;
+
+    for chunk in lines.chunks(2) {
+        if chunk.len() == 2 && checked < 10 {
+            let problem = format!("{}\n{}", chunk[0], chunk[1]);
+            if let Ok(state) = parse_problem(&problem) {
+                checked += 1;
+                let mut state1 = state.clone();
+                let mut state2 = state;
+                let proved_normal = saturate(&mut state1);
+                let (proved_trace, _trace) = saturate_with_trace(&mut state2);
+                if proved_normal != proved_trace {
+                    mismatches += 1;
+                    println!("MISMATCH: {} normal={} trace={}", chunk[0], proved_normal, proved_trace);
+                }
+            }
+        }
+    }
+    println!("Checked {} problems, {} mismatches", checked, mismatches);
+    assert_eq!(mismatches, 0, "saturate_with_trace should agree with saturate");
+}
+
+#[test]
+fn test_trace_orthocenter() {
+    // Full problem: triangle orthocenter
+    let input = "ortho_trace\na b c = triangle a b c; h = orthocenter a b c ? perp b h a c";
+    let mut state = parse_problem(input).unwrap();
+    let (proved, trace) = saturate_with_trace(&mut state);
+    assert!(proved, "Orthocenter perpendicularity should be proved");
+
+    let goal = state.goal.as_ref().unwrap();
+    let proof = trace.extract_proof(goal).unwrap();
+    assert!(!proof.is_empty());
+    // Verify chain: all premises should exist in the proof or be axioms
+    for step in &proof {
+        for premise in &step.premises {
+            assert!(
+                proof.iter().any(|s| &s.fact == premise),
+                "Premise {:?} not found in proof", premise
+            );
+        }
+    }
+}
+
+#[test]
+fn test_trace_isosceles() {
+    let input = "iso_trace\na b c = iso_triangle a b c ? eqangle b a b c c a c b";
+    let mut state = parse_problem(input).unwrap();
+    let (proved, trace) = saturate_with_trace(&mut state);
+    assert!(proved, "Isosceles base angles should be proved");
+
+    let goal = state.goal.as_ref().unwrap();
+    let proof = trace.extract_proof(goal).unwrap();
+    // All premises should exist in the proof
+    for step in &proof {
+        for premise in &step.premises {
+            assert!(
+                proof.iter().any(|s| &s.fact == premise),
+                "Premise {:?} not found in proof", premise
+            );
+        }
+    }
+}
+
+#[test]
+fn test_trace_format_readable() {
+    let input = "format_trace\na b c = triangle a b c; h = orthocenter a b c ? perp b h a c";
+    let mut state = parse_problem(input).unwrap();
+    let (proved, trace) = saturate_with_trace(&mut state);
+    assert!(proved);
+
+    let goal = state.goal.as_ref().unwrap();
+    let formatted = trace.format_proof(goal, &state);
+    assert!(formatted.is_some(), "Should produce formatted proof");
+    let text = formatted.unwrap();
+    println!("{}", text);
+    assert!(text.contains("Proof"), "Should start with Proof header");
+    assert!(text.contains("axiom"), "Should mention axioms");
+    assert!(text.lines().count() >= 2, "Should have at least header + steps");
+}
+
+#[test]
+fn test_trace_transitive_parallel() {
+    // Simple: AB ∥ CD, CD ∥ EF → AB ∥ EF
+    use geoprover::proof_state::{ProofState, ObjectType, Relation};
+    let mut state = ProofState::new();
+    let a = state.add_object("a", ObjectType::Point);
+    let b = state.add_object("b", ObjectType::Point);
+    let c = state.add_object("c", ObjectType::Point);
+    let d = state.add_object("d", ObjectType::Point);
+    let e = state.add_object("e", ObjectType::Point);
+    let f = state.add_object("f", ObjectType::Point);
+    state.add_fact(Relation::parallel(a, b, c, d));
+    state.add_fact(Relation::parallel(c, d, e, f));
+    state.set_goal(Relation::parallel(a, b, e, f));
+
+    let (proved, trace) = saturate_with_trace(&mut state);
+    assert!(proved);
+    assert_eq!(trace.axiom_count(), 2);
+
+    let goal = state.goal.as_ref().unwrap();
+    let proof = trace.extract_proof(goal).unwrap();
+    assert_eq!(proof.len(), 3); // 2 axioms + 1 derived
+
+    let formatted = trace.format_proof(goal, &state).unwrap();
+    println!("{}", formatted);
+    assert!(formatted.contains("TransitiveParallel"));
 }

@@ -9,6 +9,7 @@ pub mod parser;
 pub mod encoding;
 pub mod mcts;
 pub mod synthetic;
+pub mod proof_trace;
 
 // --- PyO3 wrapper types ---
 
@@ -89,6 +90,66 @@ impl PyConstruction {
     }
 }
 
+/// Python-visible wrapper around ProofTrace.
+#[pyclass(unsendable)]
+#[derive(Clone)]
+struct PyProofTrace {
+    inner: proof_trace::ProofTrace,
+    state: proof_state::ProofState,
+}
+
+#[pymethods]
+impl PyProofTrace {
+    /// Number of derivation entries (axioms + derived).
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Number of axioms.
+    fn axiom_count(&self) -> usize {
+        self.inner.axiom_count()
+    }
+
+    /// Extract the proof chain for the goal as a list of (fact_text, rule_name, premise_texts).
+    #[allow(clippy::type_complexity)]
+    fn extract_proof(&self) -> PyResult<Option<Vec<(String, String, Vec<String>)>>> {
+        let goal = self.state.goal.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err("No goal set")
+        })?;
+        Ok(self.inner.extract_proof(goal).map(|steps| {
+            steps
+                .iter()
+                .map(|d| {
+                    let fact_text = self.state.relation_to_text_pub(&d.fact);
+                    let rule_name = format!("{}", d.rule);
+                    let premise_texts: Vec<String> = d
+                        .premises
+                        .iter()
+                        .map(|p| self.state.relation_to_text_pub(p))
+                        .collect();
+                    (fact_text, rule_name, premise_texts)
+                })
+                .collect()
+        }))
+    }
+
+    /// Format a human-readable proof string.
+    fn format_proof(&self) -> PyResult<Option<String>> {
+        let goal = self.state.goal.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err("No goal set")
+        })?;
+        Ok(self.inner.format_proof(goal, &self.state))
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "PyProofTrace(derivations={}, axioms={})",
+            self.inner.len(),
+            self.inner.axiom_count()
+        )
+    }
+}
+
 // --- PyO3 exposed functions ---
 
 /// Parse a JGEX DSL problem string into a PyProofState.
@@ -118,6 +179,19 @@ fn saturate_with_config(
         ..deduction::SaturateConfig::default()
     };
     Ok(deduction::saturate_with_config(&mut state.inner, &config))
+}
+
+/// Run deduction with proof trace. Returns (proved, PyProofTrace).
+#[pyfunction]
+fn saturate_with_trace(state: &mut PyProofState) -> PyResult<(bool, PyProofTrace)> {
+    let (proved, trace) = deduction::saturate_with_trace(&mut state.inner);
+    Ok((
+        proved,
+        PyProofTrace {
+            inner: trace,
+            state: state.inner.clone(),
+        },
+    ))
 }
 
 /// Encode a ProofState as a flat f32 tensor of shape (20, 32, 32).
@@ -177,9 +251,11 @@ fn geoprover(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", "0.1.0")?;
     m.add_class::<PyProofState>()?;
     m.add_class::<PyConstruction>()?;
+    m.add_class::<PyProofTrace>()?;
     m.add_function(wrap_pyfunction!(parse_problem, m)?)?;
     m.add_function(wrap_pyfunction!(saturate, m)?)?;
     m.add_function(wrap_pyfunction!(saturate_with_config, m)?)?;
+    m.add_function(wrap_pyfunction!(saturate_with_trace, m)?)?;
     m.add_function(wrap_pyfunction!(encode_state, m)?)?;
     m.add_function(wrap_pyfunction!(generate_constructions, m)?)?;
     m.add_function(wrap_pyfunction!(apply_construction, m)?)?;
