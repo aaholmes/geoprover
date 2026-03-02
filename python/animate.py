@@ -122,30 +122,24 @@ def render_proof_animation(
                                     linewidth=0.8, linestyle="--")
                 ax.add_patch(circle)
 
-        # Draw initial edges
-        initial = sorted(coords.initial_points & visible_pts)
-        if len(initial) >= 3:
-            for i in range(len(initial)):
-                j = (i + 1) % len(initial)
-                p1 = coords.get(initial[i])
-                p2 = coords.get(initial[j])
-                if p1 and p2:
-                    ax.plot([p1[0], p2[0]], [p1[1], p2[1]], "k-", linewidth=1.5, zorder=1)
-
-        # Draw construction lines for visible points
-        for pname in visible_pts:
-            if pname not in coords.construction_points:
+        # Draw edges (only between visible points)
+        drawn_edges = set()
+        for e1, e2, style in coords.edges:
+            if e1 not in visible_pts or e2 not in visible_pts:
                 continue
-            # Draw lines to referenced visible points
-            for other in visible_pts:
-                if other == pname:
-                    continue
-                p1 = coords.get(pname)
-                p2 = coords.get(other)
-                if p1 and p2 and other in coords.construction_points:
+            key = (min(e1, e2), max(e1, e2))
+            if key in drawn_edges:
+                continue
+            drawn_edges.add(key)
+            p1 = coords.get(e1)
+            p2 = coords.get(e2)
+            if p1 and p2:
+                if style == "initial":
+                    ax.plot([p1[0], p2[0]], [p1[1], p2[1]], "k-", linewidth=1.5, zorder=1)
+                else:
                     ax.plot([p1[0], p2[0]], [p1[1], p2[1]],
-                            color="#4488cc", linewidth=0.5, linestyle="--",
-                            alpha=0.3, zorder=0)
+                            color="#4488cc", linewidth=1.0, linestyle="--",
+                            alpha=0.7, zorder=0)
 
         # Goal highlight
         goal_color = "#22aa22" if show_goal_highlight and solved else "#cc4444"
