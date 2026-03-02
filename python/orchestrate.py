@@ -68,6 +68,8 @@ class TrainingSample:
     state_text: str  # text encoding of the proof state
     policy_target: list[float]  # POLICY_SIZE-element distribution
     value_target: float  # outcome: 1.0 if proved, 0.0 otherwise
+    # Sparse construction info for augmentation: list of (type_name, args, weight)
+    policy_constructions: list[tuple[str, list[int], float]] | None = None
 
 
 @dataclass
@@ -281,8 +283,16 @@ def _collect_all_node_samples(
             continue
 
         policy_target = [0.0] * POLICY_SIZE
+        policy_constructions = []
         for child, vc in zip(node.children, visit_counts):
             policy_target[child.action_index] = vc / total
+            if vc > 0 and child.action is not None:
+                weight = vc / total
+                policy_constructions.append((
+                    child.action.construction_type(),
+                    child.action.args(),
+                    weight,
+                ))
 
         try:
             state_text = geoprover.state_to_text(node.state)
@@ -297,6 +307,7 @@ def _collect_all_node_samples(
             state_text=state_text,
             policy_target=policy_target,
             value_target=value,
+            policy_constructions=policy_constructions if policy_constructions else None,
         ))
 
         # Continue walking into children

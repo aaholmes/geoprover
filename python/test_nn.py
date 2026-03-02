@@ -18,7 +18,9 @@ from model import (
     build_valid_mask, constructions_to_policy_target,
     count_parameters, POLICY_SIZE, VOCAB_SIZE, MAX_SEQ_LEN,
     PAD_ID, CLS_ID, GOAL_ID, SEP_ID,
-    CONSTRUCTION_TYPES, TOKEN_TO_ID,
+    CONSTRUCTION_TYPES, TOKEN_TO_ID, POINT_NAMES, POINT_NAME_SET,
+    make_augmentation_perm, permute_text, shuffle_facts,
+    augment_state_text, permute_point_ids,
 )
 
 
@@ -326,6 +328,106 @@ def test_legacy_cnn():
     print("  PASS: legacy CNN")
 
 
+def test_permute_text():
+    """Test that permute_text changes point names but preserves keywords and structure."""
+    perm = {"a": "c", "b": "d", "c": "a", "d": "b", "h": "h"}
+    text = "coll a b c ; para a b c d ; ? perp a h b c"
+    result = permute_text(text, perm)
+    tokens = result.split()
+    # Keywords should be unchanged
+    assert "coll" in tokens
+    assert "para" in tokens
+    assert "perp" in tokens
+    assert ";" in tokens
+    assert "?" in tokens
+    # Point names should be permuted
+    assert result == "coll c d a ; para c d a b ; ? perp c h d a"
+    print(f"  Original: {text}")
+    print(f"  Permuted: {result}")
+    print("  PASS: permute_text")
+
+
+def test_shuffle_facts():
+    """Test that shuffle_facts reorders facts but preserves goal at end."""
+    text = "coll a b c ; para a b c d ; cong a b c d ; ? perp a h b c"
+    import random
+    rng = random.Random(42)
+    result = shuffle_facts(text, rng)
+    # Goal should still be at the end
+    assert "; ? perp a h b c" in result or "? perp a h b c" in result, \
+        f"Goal missing from: {result}"
+    # All facts should still be present (as a set)
+    orig_facts = {"coll a b c", "para a b c d", "cong a b c d"}
+    # Extract facts from result (everything before " ; ? ")
+    facts_part = result.split(" ; ? ")[0]
+    result_facts = set(facts_part.split(" ; "))
+    assert result_facts == orig_facts, f"Facts differ: {result_facts} != {orig_facts}"
+    print(f"  Original: {text}")
+    print(f"  Shuffled: {result}")
+    print("  PASS: shuffle_facts")
+
+
+def test_permute_policy_reconstruction():
+    """Test that policy index changes consistently with text permutation."""
+    # Original construction: Midpoint of a(0) and b(1)
+    orig_args = [0, 1]  # a=0, b=1
+    orig_idx = construction_to_index("Midpoint", orig_args)
+
+    # Permutation swaps a<->c: a→c(2), b→d(3)
+    perm = {"a": "c", "b": "d", "c": "a", "d": "b"}
+    permuted_args = permute_point_ids(orig_args, perm)
+    permuted_idx = construction_to_index("Midpoint", permuted_args)
+
+    # After permutation, args should be [2, 3] (c=2, d=3)
+    assert permuted_args == [2, 3], f"Expected [2, 3], got {permuted_args}"
+    # Index should be different (different args)
+    assert orig_idx != permuted_idx, f"Indices should differ: {orig_idx} == {permuted_idx}"
+    # But if we manually compute Midpoint([2,3]), we should get permuted_idx
+    manual_idx = construction_to_index("Midpoint", [2, 3])
+    assert permuted_idx == manual_idx, f"Mismatch: {permuted_idx} != {manual_idx}"
+    print(f"  Original: Midpoint([0,1]) -> idx {orig_idx}")
+    print(f"  Permuted: Midpoint([2,3]) -> idx {permuted_idx}")
+    print("  PASS: permute_policy_reconstruction")
+
+
+def test_augmentation_deterministic():
+    """Test that same (epoch, idx) gives same result; different epoch gives different."""
+    text = "coll a b c ; para a b c d ; ? perp a h b c"
+    aug1, perm1 = augment_state_text(text, epoch=0, idx=5, dataset_len=100)
+    aug2, perm2 = augment_state_text(text, epoch=0, idx=5, dataset_len=100)
+    assert aug1 == aug2, "Same seed should give same result"
+    assert perm1 == perm2, "Same seed should give same perm"
+
+    aug3, perm3 = augment_state_text(text, epoch=1, idx=5, dataset_len=100)
+    assert aug3 != aug1, "Different epoch should give different result"
+    print(f"  epoch=0: {aug1}")
+    print(f"  epoch=1: {aug3}")
+    print("  PASS: augmentation deterministic")
+
+
+def test_augmented_synthetic_dataset():
+    """Test that augmented SyntheticDataset produces different tokens per epoch."""
+    from train import SyntheticDataset
+    data = geoprover.generate_synthetic_data(5, 42)
+    if len(data) == 0:
+        print("  SKIP: no synthetic data generated")
+        return
+
+    ds0 = SyntheticDataset(data, max_seq_len=64, augment=True, epoch=0)
+    ds1 = SyntheticDataset(data, max_seq_len=64, augment=True, epoch=1)
+
+    t0, p0, v0 = ds0[0]
+    t1, p1, v1 = ds1[0]
+
+    # Value should be the same (same underlying example)
+    assert v0.item() == v1.item(), f"Values differ: {v0} vs {v1}"
+    # Token IDs should differ (different permutation)
+    assert not torch.equal(t0, t1), "Token IDs should differ between epochs"
+    print(f"  epoch 0 tokens[:8]: {t0[:8].tolist()}")
+    print(f"  epoch 1 tokens[:8]: {t1[:8].tolist()}")
+    print("  PASS: augmented synthetic dataset")
+
+
 if __name__ == "__main__":
     tests = [
         test_tokenizer,
@@ -345,6 +447,11 @@ if __name__ == "__main__":
         test_mcts_search_basic,
         test_synthetic_dataset,
         test_legacy_cnn,
+        test_permute_text,
+        test_shuffle_facts,
+        test_permute_policy_reconstruction,
+        test_augmentation_deterministic,
+        test_augmented_synthetic_dataset,
     ]
 
     passed = 0

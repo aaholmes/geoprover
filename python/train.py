@@ -30,6 +30,10 @@ from model import (
     construction_to_index,
     count_parameters,
     tokenize_and_pad,
+    augment_state_text,
+    permute_text,
+    permute_point_ids,
+    make_augmentation_perm,
     MAX_SEQ_LEN,
 )
 from orchestrate import (
@@ -80,17 +84,44 @@ class ReplayBuffer:
 class TextGeometryDataset(Dataset):
     """PyTorch dataset from text-based training samples."""
 
-    def __init__(self, samples: list[TrainingSample], max_seq_len: int = DEFAULT_MAX_SEQ_LEN):
+    def __init__(
+        self,
+        samples: list[TrainingSample],
+        max_seq_len: int = DEFAULT_MAX_SEQ_LEN,
+        augment: bool = False,
+        epoch: int = 0,
+    ):
         self.samples = samples
         self.max_seq_len = max_seq_len
+        self.augment = augment
+        self.epoch = epoch
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int):
         s = self.samples[idx]
-        token_ids = tokenize_and_pad(s.state_text, max_len=self.max_seq_len)
-        policy = torch.tensor(s.policy_target, dtype=torch.float32)
+
+        if self.augment:
+            aug_text, perm = augment_state_text(
+                s.state_text, self.epoch, idx, len(self.samples)
+            )
+            token_ids = tokenize_and_pad(aug_text, max_len=self.max_seq_len)
+
+            # Rebuild policy from sparse constructions if available
+            if s.policy_constructions is not None:
+                policy = torch.zeros(POLICY_SIZE, dtype=torch.float32)
+                for type_name, args, weight in s.policy_constructions:
+                    new_args = permute_point_ids(args, perm)
+                    new_idx = construction_to_index(type_name, new_args)
+                    policy[new_idx] += weight
+            else:
+                # Value-only sample, keep zero policy
+                policy = torch.tensor(s.policy_target, dtype=torch.float32)
+        else:
+            token_ids = tokenize_and_pad(s.state_text, max_len=self.max_seq_len)
+            policy = torch.tensor(s.policy_target, dtype=torch.float32)
+
         value = torch.tensor(s.value_target, dtype=torch.float32)
         return token_ids, policy, value
 
@@ -102,9 +133,17 @@ class SyntheticDataset(Dataset):
     and negative examples (construction_text prefixed with "NEG:", value=0.0).
     """
 
-    def __init__(self, examples: list[tuple[str, str, str]], max_seq_len: int = DEFAULT_MAX_SEQ_LEN):
+    def __init__(
+        self,
+        examples: list[tuple[str, str, str]],
+        max_seq_len: int = DEFAULT_MAX_SEQ_LEN,
+        augment: bool = False,
+        epoch: int = 0,
+    ):
         self.examples = examples
         self.max_seq_len = max_seq_len
+        self.augment = augment
+        self.epoch = epoch
 
     def __len__(self) -> int:
         return len(self.examples)
@@ -116,8 +155,21 @@ class SyntheticDataset(Dataset):
         is_negative = construction_text.startswith("NEG:")
         clean_construction = construction_text[4:] if is_negative else construction_text
 
+        if self.augment:
+            perm = make_augmentation_perm(self.epoch, idx, len(self.examples))
+            state_text = permute_text(state_text, perm)
+            goal_text = permute_text(goal_text, perm)
+            clean_construction = permute_text(clean_construction, perm)
+
         # State + goal as input: "coll a b c ; cong a b c d ; ? perp a h b c"
         input_text = f"{state_text} ; ? {goal_text}" if state_text else f"? {goal_text}"
+
+        if self.augment:
+            import random as _random
+            rng = _random.Random(self.epoch * len(self.examples) + idx)
+            from model import shuffle_facts
+            input_text = shuffle_facts(input_text, rng)
+
         token_ids = tokenize_and_pad(input_text, max_len=self.max_seq_len)
 
         # Policy target: the construction that makes the goal provable
@@ -267,15 +319,19 @@ def generate_supervised_data(
                     if constructions:
                         policy_target = [0.0] * POLICY_SIZE
                         weight = 1.0 / len(constructions)
+                        pc_list = []
                         for c in constructions:
                             idx = construction_to_index(c.construction_type(), c.args())
                             policy_target[idx] = weight
+                            pc_list.append((c.construction_type(), c.args(), weight))
                     else:
                         policy_target = [0.0] * POLICY_SIZE
+                        pc_list = None
                     samples.append(TrainingSample(
                         state_text=state_text,
                         policy_target=policy_target,
                         value_target=1.0,
+                        policy_constructions=pc_list,
                     ))
             elif model is not None:
                 # Try MCTS on unsolved problems to find MCTS-solvable ones
@@ -299,8 +355,12 @@ def train_epoch(
     optimizer: torch.optim.Optimizer,
     device: str,
     value_weight: float = DEFAULT_VALUE_WEIGHT,
+    epoch: int = 0,
 ) -> dict:
     """Train for one epoch. Returns average metrics."""
+    # Update dataset epoch for augmentation
+    if hasattr(dataloader.dataset, 'epoch'):
+        dataloader.dataset.epoch = epoch
     model.train()
     total_metrics = {}
     n_batches = 0
@@ -372,6 +432,7 @@ def expert_iteration(
     synthetic_size: int = DEFAULT_SYNTHETIC_SIZE,
     synthetic_seed: int = DEFAULT_SYNTHETIC_SEED,
     max_seq_len: int = DEFAULT_MAX_SEQ_LEN,
+    augment: bool = True,
 ) -> GeoTransformer:
     """Run expert iteration training loop.
 
@@ -418,10 +479,10 @@ def expert_iteration(
     print(f"  Generated {len(synthetic_data)} examples in {elapsed:.1f}s")
 
     if synthetic_data:
-        dataset = SyntheticDataset(synthetic_data, max_seq_len=max_seq_len)
+        dataset = SyntheticDataset(synthetic_data, max_seq_len=max_seq_len, augment=augment)
         loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
         for epoch in range(epochs_per_iter * 2):  # more epochs for synthetic
-            metrics = train_epoch(model, loader, optimizer, device, value_weight)
+            metrics = train_epoch(model, loader, optimizer, device, value_weight, epoch=epoch)
             scheduler.step()
             print(f"  Synthetic epoch {epoch+1}: "
                   f"loss={metrics['loss']:.4f} "
@@ -441,10 +502,10 @@ def expert_iteration(
     )
     if supervised_samples:
         replay.add(supervised_samples)
-        dataset = TextGeometryDataset(supervised_samples, max_seq_len=max_seq_len)
+        dataset = TextGeometryDataset(supervised_samples, max_seq_len=max_seq_len, augment=augment)
         loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
         for epoch in range(epochs_per_iter):
-            metrics = train_epoch(model, loader, optimizer, device, value_weight)
+            metrics = train_epoch(model, loader, optimizer, device, value_weight, epoch=epoch)
             scheduler.step()
             print(f"  Supervised epoch {epoch+1}: "
                   f"loss={metrics['loss']:.4f} "
@@ -477,10 +538,10 @@ def expert_iteration(
 
         if len(replay) >= batch_size:
             train_samples = replay.all()
-            dataset = TextGeometryDataset(train_samples, max_seq_len=max_seq_len)
+            dataset = TextGeometryDataset(train_samples, max_seq_len=max_seq_len, augment=augment)
             loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
             for epoch in range(epochs_per_iter):
-                metrics = train_epoch(model, loader, optimizer, device, value_weight)
+                metrics = train_epoch(model, loader, optimizer, device, value_weight, epoch=epoch)
                 scheduler.step()
             print(f"  Train: loss={metrics['loss']:.4f} "
                   f"policy={metrics['policy_loss']:.4f} "
@@ -513,6 +574,8 @@ def main():
     parser.add_argument("--synthetic-size", type=int, default=DEFAULT_SYNTHETIC_SIZE)
     parser.add_argument("--synthetic-seed", type=int, default=DEFAULT_SYNTHETIC_SEED)
     parser.add_argument("--max-seq-len", type=int, default=DEFAULT_MAX_SEQ_LEN)
+    parser.add_argument("--no-augment", action="store_true",
+                        help="Disable data augmentation (label permutation + fact shuffling)")
     args = parser.parse_args()
 
     device = args.device
@@ -550,11 +613,12 @@ def main():
             optimizer, T_max=total_epochs, eta_min=args.lr * 0.01,
         )
 
+        augment = not args.no_augment
         if synthetic_data:
-            dataset = SyntheticDataset(synthetic_data, max_seq_len=args.max_seq_len)
+            dataset = SyntheticDataset(synthetic_data, max_seq_len=args.max_seq_len, augment=augment)
             loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)
             for epoch in range(num_synthetic_epochs):
-                metrics = train_epoch(model, loader, optimizer, device)
+                metrics = train_epoch(model, loader, optimizer, device, epoch=epoch)
                 scheduler.step()
                 print(f"Synthetic epoch {epoch+1}/{num_synthetic_epochs}: "
                       f"loss={metrics['loss']:.4f} "
@@ -569,10 +633,10 @@ def main():
             args.problems, model=model, max_seq_len=args.max_seq_len, device=device,
         )
         if samples:
-            dataset = TextGeometryDataset(samples, max_seq_len=args.max_seq_len)
+            dataset = TextGeometryDataset(samples, max_seq_len=args.max_seq_len, augment=augment)
             loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)
             for epoch in range(num_supervised_epochs):
-                metrics = train_epoch(model, loader, optimizer, device)
+                metrics = train_epoch(model, loader, optimizer, device, epoch=epoch)
                 scheduler.step()
                 print(f"Supervised epoch {epoch+1}/{num_supervised_epochs}: "
                       f"loss={metrics['loss']:.4f} "
@@ -597,6 +661,7 @@ def main():
             synthetic_size=args.synthetic_size,
             synthetic_seed=args.synthetic_seed,
             max_seq_len=args.max_seq_len,
+            augment=not args.no_augment,
         )
 
 

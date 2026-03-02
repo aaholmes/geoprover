@@ -12,6 +12,7 @@ The old GeoNet CNN is kept as GeoNetCNN for ablation.
 ~5-8M parameters.
 """
 
+import random
 from typing import Optional
 
 import torch
@@ -131,6 +132,95 @@ def construction_to_index(type_name: str, args: list[int]) -> int:
     for a in canonical:
         h = h * 37 + a + 1
     return type_id * SLOTS_PER_TYPE + (h % SLOTS_PER_TYPE)
+
+
+# ============================================================
+# Data augmentation: label permutation + fact shuffling
+# ============================================================
+
+POINT_NAME_SET = set(POINT_NAMES)
+
+# Reverse lookup: name -> sequential ID (a=0, b=1, ..., aux_0=26, ...)
+_NAME_TO_ID = {name: i for i, name in enumerate(POINT_NAMES)}
+
+
+def make_augmentation_perm(epoch: int, idx: int, dataset_len: int) -> dict[str, str]:
+    """Create a deterministic label permutation for a given (epoch, idx).
+
+    Returns a dict mapping original point name -> permuted point name.
+    Uses seed = epoch * dataset_len + idx for reproducibility.
+    """
+    seed = epoch * dataset_len + idx
+    rng = random.Random(seed)
+    shuffled = list(POINT_NAMES)
+    rng.shuffle(shuffled)
+    return dict(zip(POINT_NAMES, shuffled))
+
+
+def permute_text(text: str, perm: dict[str, str]) -> str:
+    """Apply a label permutation to a geometry text string.
+
+    Point-name tokens are remapped via perm; keywords and special tokens pass through.
+    """
+    tokens = text.split()
+    out = []
+    for tok in tokens:
+        if tok in POINT_NAME_SET:
+            out.append(perm.get(tok, tok))
+        else:
+            out.append(tok)
+    return " ".join(out)
+
+
+def shuffle_facts(text: str, rng: random.Random) -> str:
+    """Shuffle the order of facts in a geometry text, keeping goal at end.
+
+    Input: "fact1 ; fact2 ; ? goal"
+    Output: "fact2 ; fact1 ; ? goal"  (random order, goal always last)
+    """
+    # Split off goal — handle both "fact ; ? goal" and "fact ? goal" formats
+    if " ; ? " in text:
+        facts_part, goal_part = text.split(" ; ? ", 1)
+    elif " ? " in text:
+        facts_part, goal_part = text.split(" ? ", 1)
+    else:
+        return text  # no goal marker, nothing to shuffle
+
+    facts = [f for f in facts_part.split(" ; ") if f.strip()]
+    rng.shuffle(facts)
+    return " ; ".join(facts) + " ; ? " + goal_part
+
+
+def augment_state_text(
+    text: str, epoch: int, idx: int, dataset_len: int
+) -> tuple[str, dict[str, str]]:
+    """Apply label permutation + fact shuffling to state text.
+
+    Returns (augmented_text, perm) so caller can reuse perm for policy remapping.
+    """
+    seed = epoch * dataset_len + idx
+    rng = random.Random(seed)
+
+    perm = make_augmentation_perm(epoch, idx, dataset_len)
+    result = permute_text(text, perm)
+    result = shuffle_facts(result, rng)
+    return result, perm
+
+
+def permute_point_ids(args: list[int], perm: dict[str, str]) -> list[int]:
+    """Remap integer point IDs through a name permutation.
+
+    ID -> name -> perm[name] -> ID
+    """
+    out = []
+    for pid in args:
+        if 0 <= pid < len(POINT_NAMES):
+            orig_name = POINT_NAMES[pid]
+            new_name = perm.get(orig_name, orig_name)
+            out.append(_NAME_TO_ID.get(new_name, pid))
+        else:
+            out.append(pid)
+    return out
 
 
 # ============================================================
