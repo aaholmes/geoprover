@@ -8,7 +8,7 @@ Neurosymbolic geometry theorem prover using a three-tier MCTS architecture adapt
 
 | Method | Solved | Rate | Mean Time | Notes |
 |--------|--------|------|-----------|-------|
-| Deduction only | 181/231 | 78.4% | 428ms | 52 rules, pure symbolic |
+| Deduction only | 181/231 | 78.4% | 428ms | 54 rules, pure symbolic |
 | MCTS + random NN | 187/231 | 81.0% | 3.6s | Untrained transformer baseline |
 | **MCTS + trained NN** | **189/231** | **81.8%** | **2.7s** | Synthetic + supervised pre-training |
 
@@ -59,6 +59,43 @@ Geoprover's deduction engine exceeds AlphaGeometry's DD baseline on JGEX-AG-231.
 | IMO 2012 P1 (excircle tangent) | 1 | 43.7s |
 | IMO 2019 P2 (cyclic quadrilateral) | 1 | 73.2s |
 
+## Proof Output
+
+`saturate_with_trace()` records derivation provenance during deduction, producing human-readable proofs that trace each step from axioms to the goal.
+
+**Circumcenter equidistance** — circumcenter O of triangle ABC is equidistant from A and C:
+```
+Proof (3 steps):
+  1. cong a o b o [axiom]
+  2. cong b o c o [axiom]
+  3. cong a o c o [TransitiveCongruent from 1, 2]
+```
+
+**Isosceles base angles** — if |AB| = |AC|, then angle ABC = angle ACB:
+```
+Proof (2 steps):
+  1. cong a b a c [axiom]
+  2. eqangle a b c a c b [IsoscelesBaseAngles from 1]
+```
+
+**Two altitudes imply the third** — perpendicular from A to BC via the orthocenter:
+```
+Proof (3 steps):
+  1. perp b c b e [ThalesTheorem]
+  2. perp a d b c [axiom]
+  3. para a d b e [PerpToParallel from 2, 1]
+```
+
+Proofs are extracted by backward BFS from the goal through the derivation DAG, then topologically sorted so axioms appear first.
+
+```python
+import geoprover
+
+state = geoprover.parse_problem("iso\na b c = iso_triangle a b c ? eqangle b a b c c a c b")
+proved, trace = geoprover.saturate_with_trace(state)
+print(trace.format_proof())
+```
+
 ## Architecture
 
 Hybrid Rust/Python via PyO3 (in-process, no subprocess overhead):
@@ -74,7 +111,7 @@ Rust extension module (MCTS, deduction engine, state encoding, synthetic data)
 
 | Tier | Role | Geometry equivalent |
 |------|------|-------------------|
-| 1 | Symbolic deduction | `saturate()` -- 52 rules to fixed point |
+| 1 | Symbolic deduction | `saturate()` — 54 rules to fixed point |
 | 2 | MCTS tree search | Search over auxiliary constructions (~20-30 candidates/step) |
 | 3 | Neural oracle | GeoTransformer (~5M params), dual-head: policy + value |
 
@@ -120,12 +157,13 @@ Features: problem browser with search/filter, ablation comparison charts (Plotly
 ```
 src/
   proof_state.rs    ProofState, GeoObject, Relation (Zobrist hashing, text serialization)
-  deduction.rs      52 forward-chaining rules + degenerate-fact filtering
+  deduction.rs      54 forward-chaining rules + saturate_with_trace() for proof output
   construction.rs   7 auxiliary construction types with priority classification
   parser.rs         JGEX DSL parser (40+ predicates, 231/231 coverage)
-  encoding.rs       state_to_tensor() -- 20x32x32 relation adjacency grid (legacy)
+  proof_trace.rs    RuleName, Derivation, ProofTrace, identify_premises (provenance tracking)
+  encoding.rs       state_to_tensor() — 20x32x32 relation adjacency grid (legacy)
   synthetic.rs      Random geometry data generator: multi-point, multi-step, negative examples
-  lib.rs            PyO3 bridge (PyProofState, PyConstruction, 10 exposed functions)
+  lib.rs            PyO3 bridge (PyProofState, PyConstruction, PyProofTrace, 12 functions)
   mcts/
     mod.rs          Module re-exports
     node.rs         MctsNode (Rc<RefCell> tree), expand, evaluate, backprop, UCB/PUCT
@@ -138,7 +176,7 @@ python/
   visualize.py      Coordinate synthesis + static proof diagram rendering
   animate.py        Animated proof walkthroughs + MCTS tree visualization
   test_nn.py        17 end-to-end tests for NN modules
-  test_bridge.py    11 PyO3 bridge smoke tests
+  test_bridge.py    14 PyO3 bridge smoke tests
 web/
   index.html        Interactive dashboard: problem browser, charts, IMO comparison
 ```
@@ -165,7 +203,7 @@ web/
 - **Evaluate**: Run `saturate()`. If proved, value=1.0. Otherwise `V = sigmoid(v_logit)`
 - **Backprop**: Single-player — `total_value += value` at every ancestor (no sign flip)
 
-### Deduction Rules (52 active)
+### Deduction Rules (54 active)
 
 **Parallel/perpendicular**: transitive parallel, perp-to-parallel, perp+parallel transfer, parallel+collinear extension, perp+collinear extension, parallel shared point collinear, two equidistant points perpendicular, equidistant+cyclic perpendicular (AG25), eqangle+perp transfer (AG31)
 
@@ -173,19 +211,21 @@ web/
 
 **Triangle congruence**: SAS (side-angle-side), ASA (angle-side-angle), SSS (side-side-side) — all with non-collinear guards
 
-**Angles**: isosceles base angles, alternate interior angles, corresponding angles (AG9, two perps), transitive equal angle, perpendicular right angles, equal angles to parallel, cyclic inscribed angles, inscribed angle converse, cyclic+parallel base angles (AG22), **AA similarity** (new)
+**Angles**: isosceles base angles, alternate interior angles, corresponding angles (AG9, two perps), transitive equal angle, perpendicular right angles, equal angles to parallel, cyclic inscribed angles, inscribed angle converse, cyclic+parallel base angles (AG22), AA similarity
 
 **Ratios**: transitive ratio, ratio=1 to congruence, midpoint to ratio, Thales (parallel+collinear to ratio), congruent to ratio, converse Thales (ratio+collinear to parallel), parallel base ratio (|AB|/|CD| from transversals)
 
 **Quadrilaterals**: parallelogram opposite angles, isosceles trapezoid base angles, trapezoid midsegment
 
-**Circles**: circle-point equidistance, congruent to OnCircle, cyclic from OnCircle, Thales' theorem, equal tangent lengths, tangent-chord angle, **opposite angles to cyclic** (new)
+**Circles**: circle-point equidistance, congruent to OnCircle, cyclic from OnCircle, Thales' theorem, equal tangent lengths, tangent-chord angle, opposite angles to cyclic
 
 **Angle bisector**: angle bisector ratio (bisector theorem), incenter equal inradii
 
-**Concurrence**: **orthocenter concurrence** (new) — two altitudes imply the third
+**Concurrence**: orthocenter concurrence — two altitudes imply the third
 
 **Collinearity**: collinear transitivity, midline parallel
+
+**Projection**: parallel projection (two parallel pencils through concurrent collinear lines)
 
 ## Problem Format (AlphaGeometry JGEX DSL)
 
@@ -203,12 +243,12 @@ a b c = triangle; h = on_tline b a c, on_tline c a b ? perp a h b c
 ## Build & Test
 
 ```bash
-cargo test                                          # 393+ Rust tests
+cargo test                                          # 399 Rust tests
 cargo clippy                                        # lint
 cargo test --test test_integration -- --nocapture   # integration tests with output
 maturin develop                                     # build PyO3 extension
-python python/test_bridge.py                        # PyO3 bridge smoke tests
-python python/test_nn.py                            # NN module tests
+python python/test_bridge.py                        # PyO3 bridge smoke tests (14 tests)
+python python/test_nn.py                            # NN module tests (17 tests)
 ```
 
 ## Training
