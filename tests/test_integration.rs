@@ -160,6 +160,7 @@ fn test_construction_then_saturate() {
 // ============================
 
 #[test]
+#[ignore] // Slow benchmark (~2 min). Run with: cargo test -- --ignored
 fn test_count_jgex_solvable_by_deduction() {
     let content = std::fs::read_to_string("problems/jgex_ag_231.txt").unwrap();
     let lines: Vec<&str> = content.lines().collect();
@@ -348,6 +349,7 @@ fn test_mcts_solves_circumcenter_equidistance() {
 }
 
 #[test]
+#[ignore] // Slow benchmark (~10 min). Run with: cargo test -- --ignored
 fn test_count_jgex_solvable_by_mcts() {
     let content = std::fs::read_to_string("problems/jgex_ag_231.txt").unwrap();
     let lines: Vec<&str> = content.lines().collect();

@@ -254,6 +254,7 @@ class SummarizerDataset(Dataset):
     and score all facts against it, avoiding redundant context encoding.
 
     With augment=True, applies label permutation + fact shuffling per epoch.
+    max_negatives caps random negatives per problem to keep training fast.
     """
 
     def __init__(
@@ -263,12 +264,14 @@ class SummarizerDataset(Dataset):
         fact_max_len: int = 32,
         augment: bool = False,
         epoch: int = 0,
+        max_negatives: int = 500,
     ):
         self.samples = samples
         self.context_max_len = context_max_len
         self.fact_max_len = fact_max_len
         self.augment = augment
         self.epoch = epoch
+        self.max_negatives = max_negatives
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -279,6 +282,17 @@ class SummarizerDataset(Dataset):
         goal_text = s.goal_text
         deduced_facts = list(s.deduced_facts)
         labels = list(s.labels)
+
+        # Subsample: keep all positives, cap negatives
+        if self.max_negatives > 0:
+            pos_indices = [i for i, l in enumerate(labels) if l > 0.5]
+            neg_indices = [i for i, l in enumerate(labels) if l <= 0.5]
+            if len(neg_indices) > self.max_negatives:
+                rng = random.Random(self.epoch * len(self.samples) + idx)
+                neg_indices = rng.sample(neg_indices, self.max_negatives)
+            keep = sorted(pos_indices + neg_indices)
+            deduced_facts = [deduced_facts[i] for i in keep]
+            labels = [labels[i] for i in keep]
 
         if self.augment:
             perm = make_augmentation_perm(self.epoch, idx, len(self.samples))
@@ -311,10 +325,21 @@ def train_summarizer(
     against that single context encoding. Facts from multiple problems are
     accumulated into mini-batches of ~batch_size fact-level examples.
     """
-    dataset = SummarizerDataset(samples, augment=augment)
+    dataset = SummarizerDataset(samples, augment=augment, max_negatives=500)
     total_facts = sum(len(s.deduced_facts) for s in samples)
-    print(f"  Summarizer dataset: {len(dataset)} problems, {total_facts} fact-level examples "
-          f"(augment={augment})")
+    total_pos = sum(sum(1 for l in s.labels if l > 0.5) for s in samples)
+    total_neg = total_facts - total_pos
+    # Compute class weight for capped dataset
+    capped_neg = sum(
+        min(sum(1 for l in s.labels if l <= 0.5), 500)
+        for s in samples
+    )
+    pos_weight_val = capped_neg / max(total_pos, 1)
+    pos_weight_val = min(pos_weight_val, 10.0)
+    pos_weight = torch.tensor([pos_weight_val], device=device)
+    print(f"  Summarizer dataset: {len(dataset)} problems, {total_facts} total facts "
+          f"(pos={total_pos}, capped_neg={capped_neg}, pos_weight={pos_weight_val:.1f}), "
+          f"augment={augment}")
 
     if len(dataset) == 0:
         print("  No training data, skipping Summarizer training")
@@ -343,7 +368,10 @@ def train_summarizer(
         optimizer.zero_grad()
         acc_facts_since_step = 0
 
-        for problem_idx in indices:
+        import time as _time
+        epoch_t0 = _time.time()
+
+        for pi, problem_idx in enumerate(indices):
             ctx_ids, fact_ids, labels = dataset[problem_idx]
             # ctx_ids: (L_ctx,), fact_ids: (N_facts, L_fact), labels: (N_facts,)
             n_facts = fact_ids.shape[0]
@@ -356,7 +384,9 @@ def train_summarizer(
 
             # NNUE trick: encode context once (1, d), score all N facts
             scores = summarizer.score_facts(ctx_ids, fact_ids)  # (N_facts,)
-            loss = F.binary_cross_entropy_with_logits(scores, labels)
+            loss = F.binary_cross_entropy_with_logits(
+                scores, labels, pos_weight=pos_weight
+            )
             # Scale loss by number of facts so gradient magnitude is consistent
             (loss * n_facts / batch_size).backward()
 
@@ -372,6 +402,14 @@ def train_summarizer(
                 optimizer.zero_grad()
                 acc_facts_since_step = 0
                 n_steps += 1
+
+            # Progress every 20 problems
+            if (pi + 1) % 20 == 0:
+                elapsed = _time.time() - epoch_t0
+                avg_l = total_loss / max(total_items, 1)
+                acc = total_correct / max(total_items, 1)
+                print(f"    [{pi+1}/{len(indices)}] loss={avg_l:.4f} acc={acc:.3f} "
+                      f"facts={total_items} ({elapsed:.0f}s)", flush=True)
 
         # Flush remaining gradients
         if acc_facts_since_step > 0:
