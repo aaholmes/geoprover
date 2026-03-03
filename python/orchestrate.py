@@ -30,6 +30,7 @@ from model import (
     construction_to_index,
     tokenize_and_pad,
 )
+from summarizer import FactSummarizer, filter_facts, build_summarized_text
 
 
 @dataclass
@@ -44,6 +45,9 @@ class MctsConfig:
     saturate_max_facts: int = 5000
     # Sequence length for tokenizer
     max_seq_len: int = 256
+    # Summarizer: if set, filter deduced facts before feeding to GeoTransformer
+    use_summarizer: bool = False
+    summarizer_k: int | None = None  # None = adaptive (|initial| + |constructions| + 1)
 
 
 @dataclass
@@ -60,6 +64,7 @@ class MctsNode:
     terminal_value: float | None = None
     expanded: bool = False
     depth: int = 0
+    pre_facts: set = field(default_factory=set)  # Facts before saturation (for Summarizer)
 
 
 @dataclass
@@ -81,6 +86,36 @@ class SearchResult:
     samples: list[TrainingSample]
     actions: list[str]  # construction descriptions for proof trace
     elapsed_ms: float
+
+
+def _get_state_text(
+    state: object,
+    config: MctsConfig,
+    summarizer: FactSummarizer | None,
+    pre_facts: set[str] | None,
+    device: str,
+) -> str:
+    """Get state text, optionally filtering deduced facts through the Summarizer."""
+    if summarizer is None or not config.use_summarizer or pre_facts is None:
+        return geoprover.state_to_text(state)
+
+    post_facts = set(state.facts_as_text_list())
+    initial_facts = sorted(pre_facts)
+    deduced_facts = sorted(post_facts - pre_facts)
+
+    if not deduced_facts:
+        return geoprover.state_to_text(state)
+
+    goal_text = state.goal_as_text()
+    k = config.summarizer_k
+    if k is None:
+        k = len(initial_facts) + 1
+
+    filtered = filter_facts(
+        summarizer, initial_facts, deduced_facts, goal_text,
+        k=k, device=device,
+    )
+    return build_summarized_text(initial_facts, filtered, goal_text)
 
 
 def _q_value(node: MctsNode) -> float:
@@ -113,7 +148,13 @@ def _select_leaf(root: MctsNode, c_puct: float) -> MctsNode:
     return node
 
 
-def _expand(node: MctsNode, config: MctsConfig, model: GeoNet, device: str) -> None:
+def _expand(
+    node: MctsNode,
+    config: MctsConfig,
+    model: GeoNet,
+    device: str,
+    summarizer: FactSummarizer | None = None,
+) -> None:
     """Expand a leaf node: generate children with NN priors."""
     if node.depth >= config.max_depth:
         return
@@ -124,8 +165,8 @@ def _expand(node: MctsNode, config: MctsConfig, model: GeoNet, device: str) -> N
 
     constructions = constructions[:config.max_children]
 
-    # Encode state as text and tokenize
-    state_text = geoprover.state_to_text(node.state)
+    # Encode state as text (with optional Summarizer filtering)
+    state_text = _get_state_text(node.state, config, summarizer, node.pre_facts, device)
     token_ids = tokenize_and_pad(state_text, max_len=config.max_seq_len).to(device)
     mask = build_valid_mask(constructions, device=device).unsqueeze(0)
 
@@ -137,6 +178,8 @@ def _expand(node: MctsNode, config: MctsConfig, model: GeoNet, device: str) -> N
     for c in constructions:
         idx = construction_to_index(c.construction_type(), c.args())
         child_state = geoprover.apply_construction(node.state, c)
+        # Snapshot pre-saturation facts for the child
+        child_pre_facts = set(child_state.facts_as_text_list()) if config.use_summarizer else set()
         child = MctsNode(
             state=child_state,
             action=c,
@@ -144,13 +187,20 @@ def _expand(node: MctsNode, config: MctsConfig, model: GeoNet, device: str) -> N
             parent=node,
             prior=priors[idx].item(),
             depth=node.depth + 1,
+            pre_facts=child_pre_facts,
         )
         node.children.append(child)
 
     node.expanded = True
 
 
-def _evaluate(node: MctsNode, model: GeoNet, config: MctsConfig, device: str) -> float:
+def _evaluate(
+    node: MctsNode,
+    model: GeoNet,
+    config: MctsConfig,
+    device: str,
+    summarizer: FactSummarizer | None = None,
+) -> float:
     """Evaluate a node: run deduction, then NN value if not terminal."""
     proved = geoprover.saturate_with_config(
         node.state,
@@ -162,8 +212,8 @@ def _evaluate(node: MctsNode, model: GeoNet, config: MctsConfig, device: str) ->
         node.terminal_value = 1.0
         return 1.0
 
-    # Encode state as text
-    state_text = geoprover.state_to_text(node.state)
+    # Encode state as text (with optional Summarizer filtering)
+    state_text = _get_state_text(node.state, config, summarizer, node.pre_facts, device)
     token_ids = tokenize_and_pad(state_text, max_len=config.max_seq_len).to(device)
 
     model.eval()
@@ -186,6 +236,7 @@ def mcts_search(
     model: GeoNet,
     config: MctsConfig | None = None,
     device: str = "cpu",
+    summarizer: FactSummarizer | None = None,
 ) -> SearchResult:
     """Run NN-guided MCTS on a proof state."""
     if config is None:
@@ -194,8 +245,10 @@ def mcts_search(
     start = time.time()
     samples: list[TrainingSample] = []
 
-    root = MctsNode(state=state)
-    root_value = _evaluate(root, model, config, device)
+    # Snapshot pre-saturation facts for root (if Summarizer enabled)
+    root_pre_facts = set(state.facts_as_text_list()) if config.use_summarizer else set()
+    root = MctsNode(state=state, pre_facts=root_pre_facts)
+    root_value = _evaluate(root, model, config, device, summarizer)
 
     if root.terminal_value == 1.0:
         elapsed = (time.time() - start) * 1000
@@ -204,7 +257,7 @@ def mcts_search(
             samples=[], actions=[], elapsed_ms=elapsed,
         )
 
-    _expand(root, config, model, device)
+    _expand(root, config, model, device, summarizer)
 
     for _ in range(config.num_iterations):
         leaf = _select_leaf(root, config.c_puct)
@@ -215,14 +268,14 @@ def mcts_search(
                 break
             continue
 
-        value = _evaluate(leaf, model, config, device)
+        value = _evaluate(leaf, model, config, device, summarizer)
 
         if leaf.terminal_value == 1.0:
             _backprop(leaf, 1.0)
             break
 
         if leaf.depth < config.max_depth:
-            _expand(leaf, config, model, device)
+            _expand(leaf, config, model, device, summarizer)
 
         _backprop(leaf, value)
 
@@ -323,6 +376,7 @@ def solve_problem(
     model: GeoNet,
     config: MctsConfig | None = None,
     device: str = "cpu",
+    summarizer: FactSummarizer | None = None,
 ) -> SearchResult:
     """Parse, saturate, and optionally MCTS-search a problem."""
     state = geoprover.parse_problem(problem_text)
@@ -334,7 +388,7 @@ def solve_problem(
             samples=[], actions=["deduction"], elapsed_ms=0.0,
         )
 
-    return mcts_search(state, model, config, device)
+    return mcts_search(state, model, config, device, summarizer)
 
 
 def load_problems(path: str) -> list[tuple[str, str]]:
@@ -354,6 +408,7 @@ def self_play_episode(
     model: GeoNet,
     config: MctsConfig | None = None,
     device: str = "cpu",
+    summarizer: FactSummarizer | None = None,
 ) -> list[TrainingSample]:
     """Run one self-play episode over all problems, collecting training data."""
     all_samples = []
@@ -365,7 +420,7 @@ def self_play_episode(
     for i, (name, definition) in enumerate(problems):
         problem_text = f"{name}\n{definition}"
         try:
-            result = solve_problem(problem_text, model, config, device)
+            result = solve_problem(problem_text, model, config, device, summarizer)
             if result.solved:
                 solved_count += 1
                 if result.actions == ["deduction"]:

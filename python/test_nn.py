@@ -428,6 +428,123 @@ def test_augmented_synthetic_dataset():
     print("  PASS: augmented synthetic dataset")
 
 
+def test_summarizer_architecture():
+    """Test FactSummarizer model creation and parameter count."""
+    from summarizer import FactSummarizer, count_summarizer_parameters
+    model = FactSummarizer()
+    n_params = count_summarizer_parameters(model)
+    assert n_params > 0, "Model should have parameters"
+    assert n_params < 5_000_000, f"Model too large: {n_params}"
+    print(f"  FactSummarizer params: {n_params:,}")
+    print("  PASS: summarizer architecture")
+
+
+def test_summarizer_forward():
+    """Test FactSummarizer forward pass and scoring."""
+    from summarizer import (
+        FactSummarizer, build_context_tokens, build_fact_tokens,
+    )
+    model = FactSummarizer()
+    model.eval()
+
+    ctx = build_context_tokens(["coll a b c", "para a b c d"], "perp a h b c", max_len=64)
+    facts = build_fact_tokens(["cong a b c d", "eqangle a b c d e f"], max_len=16)
+
+    with torch.no_grad():
+        scores = model.score_facts(ctx.unsqueeze(0), facts)
+
+    assert scores.shape == (2,), f"Expected (2,), got {scores.shape}"
+    assert scores.dtype == torch.float32
+    print(f"  Scores: {scores.tolist()}")
+    print("  PASS: summarizer forward")
+
+
+def test_summarizer_training_step():
+    """Test one training step of the Summarizer."""
+    from summarizer import FactSummarizer, build_context_tokens, build_fact_tokens
+    model = FactSummarizer()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+    ctx = build_context_tokens(["coll a b c"], "perp a h b c", max_len=64)
+    facts = build_fact_tokens(["cong a b c d", "eqangle a b c d e f"], max_len=16)
+    labels = torch.tensor([1.0, 0.0])
+
+    model.train()
+    scores = model.score_facts(ctx.unsqueeze(0).expand(2, -1), facts)
+    loss = torch.nn.functional.binary_cross_entropy_with_logits(scores, labels)
+    loss.backward()
+    optimizer.step()
+
+    assert loss.item() > 0, "Loss should be positive"
+    print(f"  Loss: {loss.item():.4f}")
+    print("  PASS: summarizer training step")
+
+
+def test_summarizer_filter_facts():
+    """Test fact filtering with FactSummarizer."""
+    from summarizer import FactSummarizer, filter_facts
+    model = FactSummarizer()
+    model.eval()
+
+    initial_facts = ["coll a b c", "para a b c d"]
+    deduced_facts = ["cong a b c d", "eqangle a b c d e f", "perp a b c d",
+                     "mid a b c", "oncirc a b c"]
+    goal_text = "perp a h b c"
+
+    # K=3: keep top 3 of 5
+    result = filter_facts(model, initial_facts, deduced_facts, goal_text, k=3)
+    assert len(result) == 3, f"Expected 3 filtered facts, got {len(result)}"
+    assert all(f in deduced_facts for f in result), "Filtered facts should be from deduced"
+    print(f"  Filtered: {result}")
+    print("  PASS: summarizer filter facts")
+
+
+def test_summarizer_data_generation():
+    """Test Summarizer training data generation on a real problem."""
+    # Use facts_as_text_list and proof_path_facts directly
+    state = geoprover.parse_problem(
+        'test\na b c = triangle a b c; o = circle o a b c; '
+        'h = midpoint h c b; d = on_line d o h, on_line d a b; '
+        'e = on_tline e c c o, on_tline e a a o ? cyclic a o e d'
+    )
+    pre_facts = set(state.facts_as_text_list())
+    assert len(pre_facts) > 0, "Should have initial facts"
+
+    proved, trace = geoprover.saturate_with_trace(state)
+    assert proved, "Problem should be solvable"
+
+    post_facts = set(state.facts_as_text_list())
+    deduced = post_facts - pre_facts
+    assert len(deduced) > 0, "Should have deduced facts"
+
+    proof_path = trace.proof_path_facts()
+    assert proof_path is not None, "Should have proof path"
+    assert len(proof_path) > 0, "Proof path should be non-empty"
+
+    axioms = trace.axiom_facts()
+    assert len(axioms) > 0, "Should have axioms"
+
+    print(f"  Initial: {len(pre_facts)}, Deduced: {len(deduced)}, "
+          f"Proof path: {len(proof_path)}, Axioms: {len(axioms)}")
+    print("  PASS: summarizer data generation")
+
+
+def test_build_summarized_text():
+    """Test compact text building from filtered facts."""
+    from summarizer import build_summarized_text
+    result = build_summarized_text(
+        initial_facts=["coll a b c", "para a b c d"],
+        filtered_deduced=["cong a b c d"],
+        goal_text="perp a h b c",
+    )
+    assert "coll a b c" in result
+    assert "para a b c d" in result
+    assert "cong a b c d" in result
+    assert "? perp a h b c" in result
+    print(f"  Text: {result}")
+    print("  PASS: build summarized text")
+
+
 if __name__ == "__main__":
     tests = [
         test_tokenizer,
@@ -452,6 +569,12 @@ if __name__ == "__main__":
         test_permute_policy_reconstruction,
         test_augmentation_deterministic,
         test_augmented_synthetic_dataset,
+        test_summarizer_architecture,
+        test_summarizer_forward,
+        test_summarizer_training_step,
+        test_summarizer_filter_facts,
+        test_summarizer_data_generation,
+        test_build_summarized_text,
     ]
 
     passed = 0

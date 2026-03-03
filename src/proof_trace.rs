@@ -145,6 +145,11 @@ impl ProofTrace {
         self.derivations.get(fact)
     }
 
+    /// Iterate over axiom facts.
+    pub fn axioms_iter(&self) -> impl Iterator<Item = &Relation> {
+        self.axioms.iter()
+    }
+
     /// Resolve premises for a derivation, using lazy identification if needed.
     fn resolve_premises(&self, deriv: &Derivation) -> Vec<Relation> {
         if deriv.rule == RuleName::Axiom {

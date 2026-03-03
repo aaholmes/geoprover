@@ -48,6 +48,21 @@ impl PyProofState {
         self.inner.goal.as_ref().map(|g| format!("{:?}", g))
     }
 
+    /// Return each fact as an individual text string, sorted deterministically.
+    fn facts_as_text_list(&self) -> Vec<String> {
+        let mut sorted_facts: Vec<&proof_state::Relation> = self.inner.facts.iter().collect();
+        sorted_facts.sort_by(|a, b| format!("{:?}", a).cmp(&format!("{:?}", b)));
+        sorted_facts
+            .iter()
+            .map(|f| self.inner.relation_to_text_pub(f))
+            .collect()
+    }
+
+    /// Return the goal as text, or None if no goal set.
+    fn goal_as_text(&self) -> Option<String> {
+        self.inner.goal.as_ref().map(|g| self.inner.relation_to_text_pub(g))
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "PyProofState(objects={}, facts={}, proved={})",
@@ -139,6 +154,32 @@ impl PyProofTrace {
             pyo3::exceptions::PyValueError::new_err("No goal set")
         })?;
         Ok(self.inner.format_proof(goal, &self.state))
+    }
+
+    /// Return the set of fact texts that lie on the proof path (non-axiom derived facts only).
+    /// Returns None if the goal has no proof.
+    fn proof_path_facts(&self) -> PyResult<Option<Vec<String>>> {
+        let goal = self.state.goal.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err("No goal set")
+        })?;
+        Ok(self.inner.extract_proof(goal).map(|steps| {
+            steps
+                .iter()
+                .filter(|d| d.rule != proof_trace::RuleName::Axiom)
+                .map(|d| self.state.relation_to_text_pub(&d.fact))
+                .collect()
+        }))
+    }
+
+    /// Return the set of axiom fact texts.
+    fn axiom_facts(&self) -> Vec<String> {
+        let mut facts: Vec<String> = self
+            .inner
+            .axioms_iter()
+            .map(|f| self.state.relation_to_text_pub(f))
+            .collect();
+        facts.sort();
+        facts
     }
 
     fn __repr__(&self) -> String {

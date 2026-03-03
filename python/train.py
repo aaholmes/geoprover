@@ -1,6 +1,7 @@
 """Training loop for GeoTransformer: synthetic pre-training + expert iteration.
 
 Phases:
+  0. (Optional) Summarizer pre-training: train FactSummarizer on proof traces
   A. Synthetic pre-training: train on Rust-generated synthetic data (100K+ examples)
   B. JGEX supervised fine-tuning on deduction-solvable problems
   C. Expert iteration: MCTS self-play -> collect data -> train -> repeat
@@ -43,6 +44,15 @@ from orchestrate import (
     mcts_search,
     self_play_episode,
     solve_problem,
+)
+from summarizer import (
+    FactSummarizer,
+    SummarizerSample,
+    build_context_tokens,
+    build_fact_tokens,
+    count_summarizer_parameters,
+    generate_summarizer_data,
+    SUMMARIZER_MAX_SEQ_LEN,
 )
 
 # Training defaults
@@ -223,6 +233,121 @@ def _parse_construction_text(text: str) -> tuple[str | None, list[int]]:
         else:
             args.append(0)
     return c_type, args
+
+
+# ============================================================
+# Summarizer training
+# ============================================================
+
+class SummarizerDataset(Dataset):
+    """PyTorch dataset for Summarizer training.
+
+    Each item returns:
+      - context_ids: (L_ctx,) token IDs for initial facts + goal
+      - fact_ids: (L_fact,) token IDs for one deduced fact
+      - label: 1.0 if on proof path, 0.0 otherwise
+    """
+
+    def __init__(
+        self,
+        samples: list[SummarizerSample],
+        context_max_len: int = SUMMARIZER_MAX_SEQ_LEN,
+        fact_max_len: int = 32,
+    ):
+        # Flatten: one (context, fact, label) per deduced fact
+        self.items: list[tuple[list[str], str | None, str, float]] = []
+        for s in samples:
+            for fact, label in zip(s.deduced_facts, s.labels):
+                self.items.append((s.initial_facts, s.goal_text, fact, label))
+        self.context_max_len = context_max_len
+        self.fact_max_len = fact_max_len
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, idx: int):
+        initial_facts, goal_text, fact, label = self.items[idx]
+        ctx_ids = build_context_tokens(initial_facts, goal_text, self.context_max_len)
+        fact_ids = build_fact_tokens([fact], self.fact_max_len).squeeze(0)
+        return ctx_ids, fact_ids, torch.tensor(label, dtype=torch.float32)
+
+
+def train_summarizer(
+    summarizer: FactSummarizer,
+    samples: list[SummarizerSample],
+    num_epochs: int = 10,
+    batch_size: int = 256,
+    lr: float = 1e-3,
+    device: str = "cpu",
+    checkpoint_dir: str = DEFAULT_CHECKPOINT_DIR,
+) -> FactSummarizer:
+    """Train the Summarizer on proof trace labels with BCE loss."""
+    dataset = SummarizerDataset(samples)
+    print(f"  Summarizer dataset: {len(dataset)} fact-level examples "
+          f"from {len(samples)} problems")
+
+    if len(dataset) == 0:
+        print("  No training data, skipping Summarizer training")
+        return summarizer
+
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+    optimizer = torch.optim.Adam(summarizer.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=num_epochs, eta_min=lr * 0.01,
+    )
+
+    summarizer.to(device)
+    for epoch in range(num_epochs):
+        summarizer.train()
+        total_loss = 0.0
+        total_correct = 0
+        total_items = 0
+        n_batches = 0
+
+        for ctx_ids, fact_ids, labels in loader:
+            ctx_ids = ctx_ids.to(device)
+            fact_ids = fact_ids.to(device)
+            labels = labels.to(device)
+
+            optimizer.zero_grad()
+            scores = summarizer.score_facts(ctx_ids, fact_ids)
+            loss = F.binary_cross_entropy_with_logits(scores, labels)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(summarizer.parameters(), max_norm=1.0)
+            optimizer.step()
+
+            total_loss += loss.item()
+            preds = (scores > 0).float()
+            total_correct += (preds == labels).sum().item()
+            total_items += labels.numel()
+            n_batches += 1
+
+        scheduler.step()
+        avg_loss = total_loss / max(n_batches, 1)
+        accuracy = total_correct / max(total_items, 1)
+        print(f"  Summarizer epoch {epoch+1}/{num_epochs}: "
+              f"loss={avg_loss:.4f} acc={accuracy:.3f}")
+
+    # Save checkpoint
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    path = os.path.join(checkpoint_dir, "summarizer.pt")
+    torch.save({
+        "model_state_dict": summarizer.state_dict(),
+        "num_epochs": num_epochs,
+    }, path)
+    print(f"  Saved Summarizer checkpoint: {path}")
+
+    return summarizer
+
+
+def load_summarizer_checkpoint(
+    summarizer: FactSummarizer,
+    path: str,
+    device: str,
+) -> None:
+    """Load a Summarizer checkpoint."""
+    checkpoint = torch.load(path, map_location=device, weights_only=True)
+    summarizer.load_state_dict(checkpoint["model_state_dict"])
 
 
 def compute_loss(
@@ -433,9 +558,12 @@ def expert_iteration(
     synthetic_seed: int = DEFAULT_SYNTHETIC_SEED,
     max_seq_len: int = DEFAULT_MAX_SEQ_LEN,
     augment: bool = True,
+    train_summarizer_flag: bool = False,
+    summarizer_epochs: int = 10,
 ) -> GeoTransformer:
     """Run expert iteration training loop.
 
+    0. (Optional) Train Summarizer on proof traces
     1. Generate synthetic pre-training data (from Rust engine)
     2. Pre-train on synthetic data
     3. Fine-tune on JGEX supervised data
@@ -456,6 +584,34 @@ def expert_iteration(
     if resume_from and os.path.exists(resume_from):
         start_iter = load_checkpoint(model, optimizer, resume_from, device)
         print(f"Resumed from iteration {start_iter}")
+
+    # Phase 0: Summarizer pre-training (optional)
+    summarizer = None
+    if train_summarizer_flag:
+        print("=" * 60)
+        print("Phase 0: Summarizer pre-training")
+        print("=" * 60)
+        summarizer_path = os.path.join(checkpoint_dir, "summarizer.pt")
+        summarizer = FactSummarizer().to(device)
+        print(f"FactSummarizer parameters: {count_summarizer_parameters(summarizer):,}")
+
+        if os.path.exists(summarizer_path):
+            load_summarizer_checkpoint(summarizer, summarizer_path, device)
+            print(f"  Loaded existing Summarizer from {summarizer_path}")
+        else:
+            print("  Generating Summarizer training data from proof traces...")
+            summ_samples = generate_summarizer_data(problems_file)
+            if summ_samples:
+                summarizer = train_summarizer(
+                    summarizer, summ_samples,
+                    num_epochs=summarizer_epochs,
+                    batch_size=256,
+                    device=device,
+                    checkpoint_dir=checkpoint_dir,
+                )
+            else:
+                print("  No Summarizer data, skipping")
+                summarizer = None
 
     # Phase A: Synthetic pre-training
     print("=" * 60)
@@ -525,6 +681,7 @@ def expert_iteration(
         max_children=20,
         max_depth=3,
         max_seq_len=max_seq_len,
+        use_summarizer=summarizer is not None,
     )
 
     for iteration in range(start_iter, num_iterations):
@@ -532,7 +689,7 @@ def expert_iteration(
         t0 = time.time()
 
         print("  Self-play...")
-        new_samples = self_play_episode(problems, model, mcts_config, device)
+        new_samples = self_play_episode(problems, model, mcts_config, device, summarizer)
         replay.add(new_samples)
         print(f"  Collected {len(new_samples)} samples (buffer: {len(replay)})")
 
@@ -576,6 +733,12 @@ def main():
     parser.add_argument("--max-seq-len", type=int, default=DEFAULT_MAX_SEQ_LEN)
     parser.add_argument("--no-augment", action="store_true",
                         help="Disable data augmentation (label permutation + fact shuffling)")
+    parser.add_argument("--train-summarizer", action="store_true",
+                        help="Train FactSummarizer on proof traces (Phase 0)")
+    parser.add_argument("--summarizer-epochs", type=int, default=10,
+                        help="Number of epochs for Summarizer training")
+    parser.add_argument("--summarizer-only", action="store_true",
+                        help="Only train the Summarizer, skip GeoTransformer training")
     args = parser.parse_args()
 
     device = args.device
@@ -584,6 +747,24 @@ def main():
         device = "cpu"
 
     print(f"Device: {device}")
+
+    # Summarizer-only mode: train just the Summarizer and exit
+    if args.summarizer_only:
+        summarizer = FactSummarizer().to(device)
+        print(f"FactSummarizer parameters: {count_summarizer_parameters(summarizer):,}")
+        print("Generating Summarizer training data from proof traces...")
+        summ_samples = generate_summarizer_data(args.problems)
+        if summ_samples:
+            train_summarizer(
+                summarizer, summ_samples,
+                num_epochs=args.summarizer_epochs,
+                batch_size=args.batch_size,
+                device=device,
+                checkpoint_dir=args.checkpoint_dir,
+            )
+        else:
+            print("No Summarizer data available")
+        return
 
     model = GeoTransformer().to(device)
     print(f"GeoTransformer parameters: {count_parameters(model):,}")
@@ -662,6 +843,8 @@ def main():
             synthetic_seed=args.synthetic_seed,
             max_seq_len=args.max_seq_len,
             augment=not args.no_augment,
+            train_summarizer_flag=args.train_summarizer,
+            summarizer_epochs=args.summarizer_epochs,
         )
 
 

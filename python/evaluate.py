@@ -18,7 +18,8 @@ import torch
 import geoprover
 from model import GeoNet, GeoTransformer, count_parameters
 from orchestrate import MctsConfig, SearchResult, load_problems, solve_problem
-from train import load_checkpoint
+from summarizer import FactSummarizer, count_summarizer_parameters
+from train import load_checkpoint, load_summarizer_checkpoint
 
 
 @dataclass
@@ -81,6 +82,7 @@ def evaluate_mcts_nn(
     model: GeoTransformer,
     config: MctsConfig,
     device: str = "cpu",
+    summarizer: FactSummarizer | None = None,
 ) -> list[ProblemResult]:
     """Evaluate NN-guided MCTS solving."""
     results = []
@@ -88,7 +90,7 @@ def evaluate_mcts_nn(
         problem_text = f"{name}\n{definition}"
         t0 = time.time()
         try:
-            result = solve_problem(problem_text, model, config, device)
+            result = solve_problem(problem_text, model, config, device, summarizer)
             elapsed = (time.time() - t0) * 1000
             state = geoprover.parse_problem(problem_text)
             geoprover.saturate(state)
@@ -185,6 +187,8 @@ def main():
     parser.add_argument("--output", default="results/evaluation.json")
     parser.add_argument("--deduction-only", action="store_true",
                         help="Only run deduction evaluation")
+    parser.add_argument("--summarizer-checkpoint", default=None,
+                        help="Summarizer checkpoint path (enables fact filtering)")
     args = parser.parse_args()
 
     device = args.device
@@ -217,15 +221,28 @@ def main():
 
     print(f"GeoTransformer parameters: {count_parameters(model):,}")
 
+    # Load Summarizer if checkpoint provided
+    summarizer = None
+    use_summarizer = False
+    if args.summarizer_checkpoint and os.path.exists(args.summarizer_checkpoint):
+        summarizer = FactSummarizer().to(device)
+        load_summarizer_checkpoint(summarizer, args.summarizer_checkpoint, device)
+        summarizer.eval()
+        use_summarizer = True
+        print(f"Loaded Summarizer from {args.summarizer_checkpoint}")
+        print(f"FactSummarizer parameters: {count_summarizer_parameters(summarizer):,}")
+
     config = MctsConfig(
         num_iterations=args.mcts_iterations,
         max_children=args.max_children,
         max_depth=args.max_depth,
+        use_summarizer=use_summarizer,
     )
 
-    print(f"\nEvaluating: MCTS + NN (iterations={config.num_iterations}, "
+    mode_label = "MCTS + NN + Summarizer" if use_summarizer else "MCTS + NN"
+    print(f"\nEvaluating: {mode_label} (iterations={config.num_iterations}, "
           f"depth={config.max_depth})")
-    mcts_results = evaluate_mcts_nn(problems, model, config, device)
+    mcts_results = evaluate_mcts_nn(problems, model, config, device, summarizer)
     all_results["mcts_nn"] = mcts_results
     mcts_bench = summarize(mcts_results, "mcts_nn")
     print_summary(mcts_bench)
