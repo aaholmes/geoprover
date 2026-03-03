@@ -929,8 +929,16 @@ class SetGeoTransformerV2(nn.Module):
             for _ in range(num_fusion_layers)
         ])
 
-        # Stage 3: Joint-Query-to-Facts Cross-Attention
-        self.query_layers = nn.ModuleList([
+        # Stage 3a: Policy Query-to-Facts Cross-Attention
+        # Used by policy: fused goal+construction queries facts
+        self.policy_query_layers = nn.ModuleList([
+            CrossAttentionBlock(d_model, nhead, dim_feedforward, dropout)
+            for _ in range(num_query_layers)
+        ])
+
+        # Stage 3b: Value Query-to-Facts Cross-Attention (separate weights)
+        # Used by value: raw goal queries facts — different question, different weights
+        self.value_query_layers = nn.ModuleList([
             CrossAttentionBlock(d_model, nhead, dim_feedforward, dropout)
             for _ in range(num_query_layers)
         ])
@@ -1077,7 +1085,7 @@ class SetGeoTransformerV2(nn.Module):
         # fact_mask: True = real, need to invert for key_padding_mask (True = ignore)
         pad_mask = ~fact_mask if fact_mask is not None else None
 
-        for layer in self.query_layers:
+        for layer in self.policy_query_layers:
             joint_q = layer(
                 query=joint_q, kv=fact_kv,
                 key_padding_mask=pad_mask,
@@ -1144,7 +1152,7 @@ class SetGeoTransformerV2(nn.Module):
         fact_pad_flat = ~fact_mask_expanded.reshape(B * K, N)
 
         state_repr = joint_q
-        for layer in self.query_layers:
+        for layer in self.policy_query_layers:
             state_repr = layer(query=state_repr, kv=fact_embs_flat, key_padding_mask=fact_pad_flat)
         state_repr = state_repr.squeeze(1)  # (B*K, D)
 
@@ -1158,7 +1166,7 @@ class SetGeoTransformerV2(nn.Module):
         # Value: use goal querying facts directly (no construction)
         goal_q = goal_emb.unsqueeze(1)  # (B, 1, D)
         fact_pad = ~fact_mask
-        for layer in self.query_layers:
+        for layer in self.value_query_layers:
             goal_q = layer(query=goal_q, kv=fact_embs, key_padding_mask=fact_pad)
         value_repr = goal_q.squeeze(1)  # (B, D)
 
@@ -1202,7 +1210,7 @@ class SetGeoTransformerV2(nn.Module):
         fact_pad = (~fact_mask).unsqueeze(0).expand(K, -1)  # (K, N)
 
         state_repr = goal_q
-        for layer in self.query_layers:
+        for layer in self.policy_query_layers:
             state_repr = layer(query=state_repr, kv=fact_kv_exp, key_padding_mask=fact_pad)
         state_repr = state_repr.squeeze(1)  # (K, D)
 
@@ -1230,7 +1238,7 @@ class SetGeoTransformerV2(nn.Module):
         fkv = fact_kv.unsqueeze(0)  # (1, N, D)
         fpad = (~fact_mask).unsqueeze(0)  # (1, N)
 
-        for layer in self.query_layers:
+        for layer in self.value_query_layers:
             goal_q = layer(query=goal_q, kv=fkv, key_padding_mask=fpad)
 
         value_repr = goal_q.squeeze(1).squeeze(0)  # (D,)

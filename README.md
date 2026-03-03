@@ -114,11 +114,56 @@ Rust extension module (MCTS, deduction engine, state encoding, synthetic data)
 |------|------|-------------------|
 | 1 | Symbolic deduction | `saturate()` — 54 rules to fixed point |
 | 2 | MCTS tree search | Search over auxiliary constructions (~20-30 candidates/step) |
-| 3 | Neural oracle | GeoTransformer (~5M params), dual-head: policy + value |
+| 3 | Neural oracle | SetGeoTransformer (~3-4M params), dual-head: policy + value |
 
-**Two neural architectures** (selectable via `--model-type`):
+**Three neural architectures** (selectable via `--model-type`):
 
-**SetGeoTransformer** (`--model-type set`, ~3.9M params) — set-equivariant, permutation invariant by construction:
+**SetGeoTransformerV2** (`--model-type set_v2`, ~3.2M params) — 3-way attention with deferred saturation:
+
+```
+                    ┌─────────────────────────────────────────────┐
+                    │           Stage 1: Per-Statement Encoding   │
+                    │         (shared 2-layer transformer)        │
+                    │         intra-fact positional embeddings     │
+                    └──────┬──────────────┬──────────────┬────────┘
+                           │              │              │
+                    fact [CLS] embs  goal [CLS] emb  constr full seq
+                     (N, 256)         (1, 256)        (L_c, 256)
+                     CACHED/node      CACHED/root      per candidate
+                           │              │              │
+                           │    ┌─────────┴──────────────┴────────┐
+                           │    │  Stage 2: Goal-Construction     │
+                           │    │  Fusion (2-layer cross-attn)    │
+                           │    │  goal attends to constr tokens  │
+                           │    └─────────────┬───────────────────┘
+                           │                  │
+                           │            joint_query
+                           │             (1, 256)
+                           │                  │
+                    ┌──────┴──────────────────┴───────────────────┐
+                    │    Stage 3: Query-to-Facts Cross-Attention  │
+                    │    (2-layer cross-attn: joint_q → facts)   │
+                    │    O(N) per construction — no N² attention  │
+                    └──────────────────────┬──────────────────────┘
+                                           │
+                                     state_repr
+                                      (1, 256)
+                                      ┌────┴────┐
+                              ┌───────┴──┐  ┌───┴────────┐
+                              │  Value   │  │  Policy    │
+                              │  FC→sig  │  │  Linear→1  │
+                              │  [0, 1]  │  │  (scalar)  │
+                              └──────────┘  └────────────┘
+```
+
+Key properties:
+- **O(N) per construction**: No fact-to-fact attention; joint query attends to N facts once per candidate
+- **KV caching**: Fact embeddings computed once per node and inherited by children; goal embedding cached at root
+- **Deferred saturation**: During MCTS expand, children are scored *before* saturation; only the PUCT-selected child gets saturated
+- **Per-construction policy**: Each construction gets a scalar logit (no fixed 2048-slot index space)
+- **Permutation invariant**: Same Stage 1 encoding as V1, no inter-fact positional embeddings
+
+**SetGeoTransformerV1** (`--model-type set`, ~3.9M params) — set-equivariant with fact self-attention:
 
 ```
                     ┌─────────────────────────────────────────────┐
@@ -156,11 +201,7 @@ Rust extension module (MCTS, deduction engine, state encoding, synthetic data)
                               └──────────┘  └────────────┘
 ```
 
-Key properties:
-- **Permutation invariant**: No cross-fact positional embeddings; reordering facts produces identical output
-- **Goal isolation**: Goal uses same encoder but separate cross-attention projections as the "query" into facts
-- **Subsumes FactSummarizer**: Stage 3 attention weights implicitly learn fact relevance (no separate model needed)
-- **Eliminates fact-order sensitivity**: The +/-2 solve-count variation from `HashSet` iteration order is architecturally eliminated
+V1 has O(N²) fact-to-fact self-attention in Stage 2, which limits scalability for large post-saturation fact sets.
 
 **GeoTransformer** (`--model-type transformer`, ~4M params) — the original flat-sequence model:
 - Input: tokenized text sequence (proof state as relation list + goal)
@@ -174,7 +215,7 @@ Key properties:
 2. Supervised fine-tuning on JGEX problems with MCTS-derived policy targets (not zeros) + all-node sample collection
 3. Expert iteration: MCTS self-play -> collect visit distributions from all tree nodes -> train -> repeat
 
-The SetGeoTransformer trains fully end-to-end — Stage 3 cross-attention learns fact relevance implicitly from the policy+value loss, eliminating the separate FactSummarizer pre-training step. The GeoTransformer optionally uses a pretrained FactSummarizer (frozen during RL) to filter post-saturation facts.
+Both SetGeoTransformer variants train fully end-to-end — cross-attention learns fact relevance implicitly from the policy+value loss, eliminating the separate FactSummarizer pre-training step. V2 additionally uses per-construction logits instead of the fixed 2048-slot policy space, and defers saturation during MCTS expansion for efficiency. The GeoTransformer optionally uses a pretrained FactSummarizer (frozen during RL) to filter post-saturation facts.
 
 ## Visualization
 
@@ -217,14 +258,14 @@ src/
     node.rs         MctsNode (Rc<RefCell> tree), expand, evaluate, backprop, UCB/PUCT
     search.rs       mcts_search() loop, select_leaf, proof path extraction
 python/
-  model.py          SetGeoTransformer, GeoTransformer, GeoNetCNN (legacy), tokenizer
+  model.py          SetGeoTransformerV1/V2, GeoTransformer, GeoNetCNN (legacy), tokenizer
   orchestrate.py    NN-guided MCTS (Python-side tree), all-node sample collection
   train.py          3-phase training: synthetic -> supervised -> expert iteration
   evaluate.py       Benchmark suite: deduction vs MCTS+NN, comparison reports
   summarizer.py     FactSummarizer: cross-attention fact relevance scoring
   visualize.py      Coordinate synthesis + static proof diagram rendering
   animate.py        Animated proof walkthroughs + MCTS tree visualization
-  test_nn.py        36 end-to-end tests for NN modules
+  test_nn.py        42 end-to-end tests for NN modules
   test_bridge.py    14 PyO3 bridge smoke tests
 web/
   index.html        Interactive dashboard: problem browser, charts, IMO comparison
@@ -297,26 +338,29 @@ cargo clippy                                        # lint
 cargo test --test test_integration -- --nocapture   # integration tests with output
 maturin develop                                     # build PyO3 extension
 python python/test_bridge.py                        # PyO3 bridge smoke tests (14 tests)
-python python/test_nn.py                            # NN module tests (36 tests)
+python python/test_nn.py                            # NN module tests (42 tests)
 ./scripts/test-fast.sh                              # Full fast suite (~20s)
 ```
 
 ## Training
 
 ```bash
-# Train SetGeoTransformer (set-equivariant, recommended)
+# Train SetGeoTransformerV2 (3-way attention + deferred saturation, recommended)
+python python/train.py --model-type set_v2 --supervised-only --synthetic-size 50000
+
+# Train SetGeoTransformerV1 (fact self-attention)
 python python/train.py --model-type set --supervised-only --synthetic-size 50000
 
 # Train GeoTransformer (original flat-sequence model)
 python python/train.py --model-type transformer --supervised-only --synthetic-size 50000
 
 # Full pipeline: synthetic + supervised + expert iteration
-python python/train.py --model-type set --iterations 10 --synthetic-size 50000
+python python/train.py --model-type set_v2 --iterations 10 --synthetic-size 50000
 
 # Resume expert iteration from checkpoint
-python python/train.py --model-type set --resume checkpoints/supervised.pt --iterations 10
+python python/train.py --model-type set_v2 --resume checkpoints/supervised.pt --iterations 10
 
 # Evaluate
-python python/evaluate.py --model-type set --checkpoint checkpoints/iter_005.pt
+python python/evaluate.py --model-type set_v2 --checkpoint checkpoints/iter_005.pt
 python python/evaluate.py --deduction-only
 ```

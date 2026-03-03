@@ -142,45 +142,9 @@ The GeoTransformer solved the point-labeling sensitivity of the CNN, but introdu
 2. **Augmentation tax**: We needed fact-shuffling augmentation during training to teach the model that order doesn't matter — wasting capacity learning something the architecture should guarantee.
 3. **Separate FactSummarizer**: A second model (~500K params) was needed to filter deduced facts because the flat sequence couldn't efficiently attend over hundreds of facts.
 
-### Architecture: facts as a permutable set
+### Architecture: facts as a permutable set (V1)
 
-The SetGeoTransformer treats the proof state as a **set of statements** with a distinguished **goal element**, achieving permutation invariance by construction:
-
-```
-                    ┌─────────────────────────────────────────────┐
-                    │           Stage 1: Per-Statement Encoding   │
-                    │         (shared 2-layer transformer)        │
-                    │         intra-fact positional embeddings     │
-                    └──────────────┬──────────────────┬───────────┘
-                                   │                  │
-                         fact [CLS] embs        goal [CLS] emb
-                          (B, N, 256)             (B, 1, 256)
-                                   │                  │
-                    ┌──────────────┴──────────────┐   │
-                    │  Stage 2: Fact Self-Attention│   │
-                    │  (2-layer transformer)       │   │
-                    │  NO positional embeddings    │   │
-                    │  → permutation equivariant   │   │
-                    └──────────────┬───────────────┘   │
-                                   │                   │
-                         enriched facts          goal query
-                          (B, N, 256)           (B, 1, 256)
-                                   │                   │
-                    ┌──────────────┴───────────────────┴──────────┐
-                    │    Stage 3: Goal-Conditioned Aggregation    │
-                    │    (2-layer cross-attention: goal → facts)  │
-                    │    + mean-pool residual                     │
-                    └──────────────────────┬──────────────────────┘
-                                           │
-                                     state_repr
-                                      (B, 256)
-                                      ┌────┴────┐
-                              ┌───────┴──┐  ┌───┴────────┐
-                              │  Value   │  │   Policy   │
-                              │  FC→sig  │  │  FC→2048   │
-                              │  [0, 1]  │  │  logits    │
-                              └──────────┘  └────────────┘
-```
+The SetGeoTransformerV1 treats the proof state as a **set of statements** with a distinguished **goal element**, achieving permutation invariance by construction. See the architecture diagram in README.md.
 
 **Stage 1 (Per-Statement Encoding)**: Each fact (e.g., `"coll a b c"`) and the goal are independently tokenized into short sequences (max 16 tokens) and encoded through a shared 2-layer transformer. Positional embeddings exist *within* each statement — distinguishing keyword from arguments — but NOT *between* statements. The [CLS] token of each statement becomes its embedding.
 
@@ -231,6 +195,68 @@ All three phases use the combined KL(policy) + MSE(value) loss via `compute_set_
 - Stage 4 (value + policy heads): ~0.6M
 
 The two models are close enough in size for fair A/B comparison.
+
+## SetGeoTransformerV2: Eliminating O(N²) and Deferring Saturation
+
+### The scaling problem with V1
+
+V1's Stage 2 (fact self-attention) is O(N²) in the number of facts. Post-saturation fact counts are median ~4,020 (max 51,094 on complex problems). At N=4000, self-attention requires 16M attention entries per layer — prohibitively expensive for real-time MCTS where the model runs at every node expansion.
+
+Additionally, V1's fixed 2048-slot policy head was poorly suited to the actual problem: only ~20-30 constructions are generated per state, but they're scattered across 2048 bins via hashing. The policy head contributed only +2 problems over a random baseline.
+
+### Architecture: 3-way attention (goal × construction × facts)
+
+V2 eliminates fact-to-fact attention entirely. See the architecture diagram in README.md. The key insight: instead of building a rich fact representation and then scoring constructions against it, V2 builds a *joint goal-construction query* and then asks "how well does this (goal, construction) pair fit the current facts?"
+
+**Stage 1 (Per-Statement Encoding)**: Same shared intra-encoder as V1. The critical difference: fact [CLS] embeddings are **cached per MCTS node** and inherited by children. Goal embedding is cached once at the root. Construction tokens return the **full sequence** (not just [CLS]) so that Stage 2 can attend to individual tokens.
+
+**Stage 2 (Goal-Construction Fusion)**: 2-layer cross-attention where the goal embedding (query) attends to the construction's full token sequence (key/value). This produces a `joint_query` that captures "what is this construction in the context of what we want to prove?" Each construction type (midpoint, altitude, circumcenter...) produces different attention patterns, letting the model learn type-specific reasoning.
+
+**Stage 3 (Joint-Query-to-Facts Cross-Attention)**: The joint query (1 vector) attends to all N fact embeddings. This is **O(N) per construction**, not O(N²). The model learns to find facts relevant to the specific (goal, construction) pair — e.g., for a circumcenter construction targeting a perpendicularity goal, it attends to congruence and on-circle facts.
+
+**Stage 4 (Per-Construction Policy)**: Each construction gets its own scalar logit via `Linear(d_model, 1)`. No fixed index space, no hashing collisions. Value head uses a direct goal→facts query path (bypassing Stage 2) since value doesn't depend on which construction is being considered.
+
+### Deferred saturation in MCTS
+
+V1 saturates every child node during expansion. With 30 children, that's 30 saturation calls per expand — expensive when saturation takes ~400ms.
+
+V2 flips the order: **score first, saturate later**. During expansion, constructions are scored against the parent's cached fact embeddings (no saturation needed). PUCT selection picks one child. Only that child gets saturated. This reduces saturation calls from O(branching_factor) to O(1) per MCTS iteration.
+
+```
+V1: Expand → saturate ALL children → score with NN → select via PUCT
+V2: Expand → score with cached KV → select via PUCT → saturate ONE child
+```
+
+The trade-off: V2's policy priors are computed on pre-saturation state (the parent's facts). This means the policy doesn't see what new facts each construction would produce. In practice this is fine — the policy's job is to suggest *which* construction to try, not to predict its downstream effects. The value head still sees the full post-saturation state of the selected child.
+
+### KV cache design
+
+Each MCTS node stores `fact_kv_cache: Tensor (N, d_model)` — the Stage 1 [CLS] embeddings of its facts. These are pre-projection embeddings; Stages 2 and 3 apply their own K/V projections internally (different weights per stage).
+
+- **Root node**: Encode all initial facts (post-first-saturation). Store fact_kv and goal_emb.
+- **Children**: After saturation, encode only new facts, concatenate with parent_kv. Goal_emb inherited from root.
+- **Memory**: N × 256 × 4 bytes per node. At N=5000, ~5MB per node. With typical MCTS tree sizes (~200 expanded nodes), ~1GB total.
+
+### Per-construction policy vs fixed-size policy
+
+V1 maps constructions to a 2048-slot index via `construction_to_index()` — a hash function that occasionally collides (two different constructions mapping to the same slot). V2 gives each construction its own logit by encoding it through Stage 1 and computing a scalar score via the full 3-way attention pipeline.
+
+This has three advantages:
+1. **No collisions**: Every construction gets a distinct score
+2. **Compositional**: The model sees the construction's text ("mid a b", "alt c a b"), not an opaque index — it can reason about what the construction *does*
+3. **Variable-size**: Works naturally with any number of candidate constructions, no fixed policy size
+
+The training loss changes from KL-div over 2048 logits to KL-div over K logits (where K = number of constructions per sample). `compute_v2_loss()` handles the variable-K case with construction masking.
+
+### Parameter budget
+
+~3.2M parameters (room to grow within the 4M budget):
+- Stage 1 (shared intra-encoder): ~790K
+- Stage 2 (fusion cross-attention, 2 layers): ~790K
+- Stage 3 (fact cross-attention, 2 layers): ~790K
+- Heads (value FC + policy linear): ~100K
+
+The reduction from V1's ~3.9M comes from removing the fact self-attention layers and the fixed-size policy head.
 
 ## Phase 5: Training Pipeline
 
@@ -421,6 +447,6 @@ We got to 228/231 parseable (3 problems use predicates we haven't implemented: `
 - **MCTS** (10 iterations, depth 1): ~2-3s per problem
 - **Synthetic data generation**: ~42 examples/sec in Rust
 - **Training**: ~3 min/epoch for 10K examples at seq_len=128 (CPU-only)
-- **Test suite**: 399 Rust tests in ~90s (dominated by one MCTS timeout test)
+- **Test suite**: 404 Rust tests + 42 Python NN tests in ~30s
 
 The main bottleneck is CPU-only training. GPU training would likely 10x throughput and enable larger synthetic datasets.
