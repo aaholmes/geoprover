@@ -308,7 +308,8 @@ def test_synthetic_dataset():
     assert token_ids.dtype == torch.long
     assert policy.shape == (POLICY_SIZE,)
     assert policy.sum().item() > 0, "Policy should have at least one non-zero entry"
-    assert value.item() == 1.0, "Value should be 1.0 (provable)"
+    from orchestrate import GAMMA
+    assert abs(value.item() - GAMMA) < 1e-6, f"Value should be {GAMMA} (1 step from proof), got {value.item()}"
     print(f"  Dataset size: {len(dataset)}")
     print(f"  Token IDs shape: {token_ids.shape}")
     print(f"  Policy nonzero: {(policy > 0).sum().item()}")
@@ -958,6 +959,132 @@ def test_v2_training_step():
     print("  PASS: v2 training step")
 
 
+def test_backprop_discount():
+    """Test that _backprop applies gamma discount per level."""
+    from orchestrate import MctsNode, _backprop, GAMMA
+
+    # Build 3-node chain: root -> parent -> leaf
+    root = MctsNode(state=None)
+    parent = MctsNode(state=None, parent=root, depth=1)
+    root.children.append(parent)
+    leaf = MctsNode(state=None, parent=parent, depth=2)
+    parent.children.append(leaf)
+
+    _backprop(leaf, 1.0)
+
+    assert leaf.best_value == 1.0, f"leaf.best_value={leaf.best_value}"
+    assert abs(parent.best_value - GAMMA) < 1e-9, f"parent.best_value={parent.best_value}"
+    assert abs(root.best_value - GAMMA * GAMMA) < 1e-9, f"root.best_value={root.best_value}"
+    assert leaf.visits == 1
+    assert parent.visits == 1
+    assert root.visits == 1
+    print(f"  leaf={leaf.best_value}, parent={parent.best_value}, root={root.best_value}")
+    print("  PASS: backprop discount")
+
+
+def test_backprop_max_semantics():
+    """Test that _backprop uses max (not sum) for best_value."""
+    from orchestrate import MctsNode, _backprop, GAMMA
+
+    root = MctsNode(state=None)
+    leaf = MctsNode(state=None, parent=root, depth=1)
+    root.children.append(leaf)
+
+    # First backprop: 0.8 from leaf -> root gets 0.8 * GAMMA
+    _backprop(leaf, 0.8)
+    assert abs(root.best_value - 0.8 * GAMMA) < 1e-9
+
+    # Second backprop: 0.3 from leaf -> root should keep max
+    _backprop(leaf, 0.3)
+    assert abs(root.best_value - 0.8 * GAMMA) < 1e-9, \
+        f"Should be max, got {root.best_value}"
+    # leaf.best_value should be max(0.8, 0.3) = 0.8
+    assert abs(leaf.best_value - 0.8) < 1e-9
+    assert root.visits == 2
+    print("  PASS: backprop max semantics")
+
+
+def test_find_proof_path_nodes():
+    """Test _find_proof_path_nodes returns correct depth mapping."""
+    from orchestrate import MctsNode, _find_proof_path_nodes
+
+    root = MctsNode(state=None)
+    root.expanded = True
+    child_a = MctsNode(state=None, parent=root, depth=1)
+    child_b = MctsNode(state=None, parent=root, depth=1)
+    root.children = [child_a, child_b]
+
+    # child_b is solved
+    child_b.terminal_value = 1.0
+
+    mapping = _find_proof_path_nodes(root)
+    assert id(child_b) in mapping, "Solved child should be in mapping"
+    assert mapping[id(child_b)] == 0, "Terminal node depth_to_terminal=0"
+    assert id(root) in mapping, "Root should be in mapping"
+    assert mapping[id(root)] == 1, "Root is 1 step from terminal"
+    assert id(child_a) not in mapping, "Non-solving child should not be in mapping"
+    print(f"  Mapping: {len(mapping)} nodes")
+    print("  PASS: find proof path nodes")
+
+
+def test_td_value_targets():
+    """Test _collect_all_node_samples produces TD-style value targets."""
+    from orchestrate import MctsNode, _collect_all_node_samples, GAMMA
+
+    # Build tree: root -> [child_a (solved), child_b (not solved)]
+    root = MctsNode(state=None)
+    root.visits = 10
+    root.expanded = True
+    root.best_value = GAMMA  # from solved child
+
+    child_a = MctsNode(state=None, parent=root, depth=1, action_index=0)
+    child_a.terminal_value = 1.0
+    child_a.visits = 5
+    child_a.best_value = 1.0
+
+    child_b = MctsNode(state=None, parent=root, depth=1, action_index=1)
+    child_b.visits = 5
+    child_b.nn_value = 0.3  # NN estimate for off-path
+    child_b.best_value = 0.3
+
+    root.children = [child_a, child_b]
+
+    # Need state_to_text to work - use a real state
+    state = geoprover.parse_problem("test\na b c = triangle ? perp a b b c")
+    root.state = state
+    child_a.state = state
+    child_b.state = state
+
+    samples = _collect_all_node_samples(root, solved=True, min_visits=1)
+    assert len(samples) >= 1, f"Expected >=1 samples, got {len(samples)}"
+
+    # Root sample: on winning path, 1 step from terminal -> gamma^1
+    root_sample = samples[0]
+    expected = GAMMA ** 1  # root is 1 step from terminal
+    assert abs(root_sample.value_target - expected) < 1e-9, \
+        f"Root value_target={root_sample.value_target}, expected {expected}"
+    print(f"  Root value_target={root_sample.value_target}")
+    print("  PASS: td value targets")
+
+
+def test_synthetic_value_discount():
+    """Test V2SyntheticDataset returns GAMMA for positive, 0.0 for negative."""
+    from train import V2SyntheticDataset
+    from orchestrate import GAMMA
+
+    data = geoprover.generate_synthetic_data(5, 42)
+    if len(data) == 0:
+        print("  SKIP: no synthetic data generated")
+        return
+    dataset = V2SyntheticDataset(data)
+
+    _, _, _, _, value, is_pos = dataset[0]
+    assert abs(value.item() - GAMMA) < 1e-6, \
+        f"Positive value should be {GAMMA}, got {value.item()}"
+    print(f"  Positive value: {value.item()}")
+    print("  PASS: synthetic value discount")
+
+
 def test_v2_construction_scoring():
     """Test individual construction scores are sensible."""
     model = SetGeoTransformerV2()
@@ -1029,6 +1156,12 @@ FAST_TESTS = [
     test_set_predict_single,
     test_create_model_factory,
     test_set_training_step,
+    # TD-style value learning tests
+    test_backprop_discount,
+    test_backprop_max_semantics,
+    test_find_proof_path_nodes,
+    test_td_value_targets,
+    test_synthetic_value_discount,
     # SetGeoTransformerV2 tests
     test_v2_architecture,
     test_v2_forward_pass,

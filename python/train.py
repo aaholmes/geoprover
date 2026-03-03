@@ -47,6 +47,7 @@ from model import (
     PAD_ID,
 )
 from orchestrate import (
+    GAMMA,
     MctsConfig,
     TrainingSample,
     load_problems,
@@ -203,7 +204,7 @@ class SyntheticDataset(Dataset):
                 policy[idx_val] = 1.0
 
         # Value: 1.0 for positive, 0.0 for negative
-        value = torch.tensor(0.0 if is_negative else 1.0, dtype=torch.float32)
+        value = torch.tensor(0.0 if is_negative else GAMMA, dtype=torch.float32)
 
         return token_ids, policy, value
 
@@ -265,7 +266,7 @@ class SetSyntheticDataset(Dataset):
                 idx_val = construction_to_index(c_type, c_args)
                 policy[idx_val] = 1.0
 
-        value = torch.tensor(0.0 if is_negative else 1.0, dtype=torch.float32)
+        value = torch.tensor(0.0 if is_negative else GAMMA, dtype=torch.float32)
         return fact_ids, goal_ids, fact_mask, policy, value
 
 
@@ -400,7 +401,7 @@ class V2SyntheticDataset(Dataset):
             dtype=torch.long,
         )
 
-        value = torch.tensor(0.0 if is_negative else 1.0, dtype=torch.float32)
+        value = torch.tensor(0.0 if is_negative else GAMMA, dtype=torch.float32)
         is_pos = torch.tensor(0.0 if is_negative else 1.0, dtype=torch.float32)
 
         return fact_ids, goal_ids, fact_mask, constr_ids, value, is_pos

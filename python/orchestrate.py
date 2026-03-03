@@ -37,6 +37,10 @@ from model import (
 )
 from summarizer import FactSummarizer, filter_facts, build_summarized_text
 
+# Discount factor: value halves per construction step
+# V = gamma^D where D = number of construction steps to proof
+GAMMA = 0.5
+
 
 @dataclass
 class MctsConfig:
@@ -67,6 +71,8 @@ class MctsNode:
     children: list = field(default_factory=list)
     visits: int = 0
     total_value: float = 0.0
+    best_value: float = 0.0  # Max discounted value from any descendant
+    nn_value: float | None = None  # Raw NN prediction for off-path TD training
     prior: float = 0.0  # NN policy prior
     terminal_value: float | None = None
     expanded: bool = False
@@ -128,9 +134,7 @@ def _get_state_text(
 
 
 def _q_value(node: MctsNode) -> float:
-    if node.visits == 0:
-        return 0.0
-    return node.total_value / node.visits
+    return node.best_value
 
 
 def _ucb_score(child: MctsNode, parent_visits: int, c_puct: float) -> float:
@@ -249,7 +253,9 @@ def _evaluate(
         with torch.no_grad():
             value, _ = model(token_ids.unsqueeze(0))
 
-    return value.item()
+    val = value.item()
+    node.nn_value = val
+    return val
 
 
 def _expand_v2(
@@ -360,14 +366,18 @@ def _evaluate_v2(
             node.fact_kv_cache, node._fact_mask, node.goal_emb_cache,
         )
 
+    node.nn_value = value
     return value
 
 
 def _backprop(node: MctsNode, value: float) -> None:
     current = node
+    v = value
     while current is not None:
         current.visits += 1
-        current.total_value += value
+        current.best_value = max(current.best_value, v)
+        current.total_value += v
+        v *= GAMMA
         current = current.parent
 
 
@@ -469,6 +479,34 @@ def _extract_proof_path(node: MctsNode) -> list[str]:
     return []
 
 
+def _find_proof_path_nodes(root: MctsNode) -> dict[int, int]:
+    """Find the solved branch via DFS and return {id(node): depth_to_terminal}.
+
+    Terminal node has depth 0, its parent has depth 1, etc.
+    """
+    # DFS to find the winning path
+    path: list[MctsNode] = []
+
+    def _dfs(node: MctsNode) -> bool:
+        path.append(node)
+        if node.terminal_value == 1.0:
+            return True
+        for child in node.children:
+            if _dfs(child):
+                return True
+        path.pop()
+        return False
+
+    if not _dfs(root):
+        return {}
+
+    # path[-1] is the terminal node (depth_to_terminal = 0)
+    result = {}
+    for i, node in enumerate(path):
+        result[id(node)] = len(path) - 1 - i
+    return result
+
+
 def _collect_all_node_samples(
     root: MctsNode,
     solved: bool,
@@ -476,9 +514,14 @@ def _collect_all_node_samples(
 ) -> list[TrainingSample]:
     """Walk the MCTS tree and collect training samples from all nodes with sufficient visits.
 
-    This extracts signal from every internal node, not just the root,
-    providing 10-20x more training data per search.
+    Uses TD-style value targets:
+    - Winning path nodes: value = GAMMA^depth_to_terminal (ground truth)
+    - Off-path nodes: value = nn_value (bootstrapped NN estimate)
+    - Fallback: node.best_value if nn_value is None
     """
+    # Build proof path mapping if solved
+    proof_path = _find_proof_path_nodes(root) if solved else {}
+
     samples = []
     stack = [root]
     while stack:
@@ -507,9 +550,17 @@ def _collect_all_node_samples(
         except Exception:
             continue
 
-        # Value target: 1.0 if this subtree contains a solution, else Q-value
-        subtree_solved = _is_solved(node)
-        value = 1.0 if subtree_solved else _q_value(node)
+        # TD-style value target
+        node_id = id(node)
+        if node_id in proof_path:
+            # On winning path: ground truth gamma^depth_to_terminal
+            value = GAMMA ** proof_path[node_id]
+        elif node.nn_value is not None:
+            # Off-path: bootstrapped NN estimate
+            value = node.nn_value
+        else:
+            # Fallback: best observed value
+            value = node.best_value
 
         samples.append(TrainingSample(
             state_text=state_text,
