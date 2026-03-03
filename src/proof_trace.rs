@@ -166,7 +166,7 @@ impl ProofTrace {
         // Also record a derivation entry for axioms
         self.derivations
             .entry(fact.clone())
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(Derivation {
                 fact,
                 rule: RuleName::Axiom,
@@ -180,7 +180,7 @@ impl ProofTrace {
         let alts = self
             .derivations
             .entry(fact.clone())
-            .or_insert_with(Vec::new);
+            .or_default();
         // Dedup: skip if same rule + same premise set already recorded
         let dominated = alts.iter().any(|d| {
             d.rule == rule && d.premises.len() == premises.len() && {
