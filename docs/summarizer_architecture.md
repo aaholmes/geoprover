@@ -37,15 +37,15 @@ All encoder components are **bidirectional transformer encoders** (BERT-style,
 full self-attention with no causal mask). The model reads a proof state and makes
 a judgment — there is no autoregressive generation.
 
-### encode(): Context Encoder (2-3 layers)
+### encode(): Context Encoder (2 layers)
 
-Bidirectional encoder over a multi-fact token sequence. Produces a fixed-size
-context vector from the [CLS] token.
+Bidirectional encoder over a multi-fact token sequence. Produces per-token
+representations used as the KV cache for cross-attention scoring.
 
 ```
 Input:  [CLS] fact₁ ; fact₂ ; ... ; ? goal     (tokenized)
-Output: H = encoder_output[CLS] ∈ R^d
-Depth:  2-3 bidirectional transformer layers
+Output: context_tokens ∈ R^(L_ctx × d)
+Depth:  2 bidirectional transformer layers
 ```
 
 The encoder treats all facts uniformly — it does not distinguish whether a fact
@@ -63,53 +63,56 @@ arguments), so one layer suffices. Shares the token embedding table with encode(
 
 ```
 Input:  [CLS] perp a h b c                      (single fact, tokenized)
-Output: f_emb = encoder_output[CLS] ∈ R^d
+Output: fact_tokens ∈ R^(L_fact × d)
 Depth:  1 bidirectional transformer layer
 ```
 
-### Why 1 Layer Suffices for embed()
+### Summarizer Head (cross-attention, default)
 
-The relevance judgment doesn't happen inside embed() — it happens in the dot
-product with the context vector H. embed() only needs to produce a faithful
-fingerprint that distinguishes one fact from another in a way that correlates
-with relevance. The context vector H (built by the deeper encode()) encodes
-"what I'm looking for," and the dot product asks "does this fact match?"
-
-A 1-layer bidirectional encoder provides:
-- Token embeddings: distinguishes `eqangle` from `perp`, point `a` from `b`
-- One round of self-attention: captures positional structure within a fact
-  (e.g., "b is the vertex in `eqangle a b c d e f`")
-
-Single facts are short (3-8 tokens) and structurally simple — a relation keyword
-plus its arguments. Multi-hop reasoning within a single fact is unnecessary. If
-this becomes a bottleneck, bumping to 2 layers is straightforward.
-
-### Summarizer Head (NNUE-style)
-
-After encoding the context and each candidate fact, scoring uses projected
-dot products:
+The fact encoder's output tokens cross-attend into the context's KV cache,
+producing **context-dependent** fact representations. This allows the model
+to learn that a fact is *necessary* for the proof (e.g., an angle equality
+that bridges two disconnected subgraphs toward the goal), not just that it
+is semantically similar to the context.
 
 ```
-H = encode(initial facts + constructions + goal)       # computed once
+# Computed once (expensive):
+context_tokens = encode(initial facts + constructions + goal)  # (L_ctx, d)
+K = W_k · context_tokens                                       # (L_ctx, d)
+V = W_v · context_tokens                                       # (L_ctx, d)
 
-# Project context embedding (once):
-h = W_ctx · H                                          # (d,) vector
-
-# Score each candidate (project + dot product per fact):
+# Per candidate fact (cheap):
 for each candidate fact f in saturated_facts - initial_facts:
-    f_emb = embed(f)                                    # 1-layer encoder
-    f = W_fact · f_emb                                  # (d,) vector
-    score_f = sigmoid(dot(h, f))                        # scalar
+    fact_tokens = embed(f)                             # (L_fact, d)
+    Q = fact_tokens                                    # queries from fact
+    attended = softmax(Q · K^T / √d) · V              # cross-attention
+    fact_tokens = LayerNorm(fact_tokens + attended)    # residual + norm
+    score_f = MLP(fact_tokens[CLS])                    # scalar from [CLS]
 
 keep top-K facts by score, where K = |initial| + |constructions| + 1
 ```
 
-Both the context and fact encoders have learned linear projections (W_ctx, W_fact)
-that map their [CLS] embeddings into a shared scoring space. The relevance score
-is the dot product of these projections. The NNUE insight: the expensive context
-encoding and projection happens once. Each candidate fact requires only a shallow
-encode (1 layer), a projection, and a dot product. Evaluating 200 candidates is
-nearly as fast as evaluating 1.
+The KV cache from the context is computed once. Each candidate fact does one
+small cross-attention operation (L_fact is 3-8 tokens against L_ctx of ~50-100
+context tokens) followed by an MLP on the [CLS] token. This is more expensive
+per fact than the dot-product variant, but the cost is dominated by the
+one-time context encoding. The key advantage: the same fact gets different
+scores depending on the context, since its representation is shaped by what
+it attends to in the KV cache.
+
+### Legacy: Dot-Product Scoring (DotProductSummarizer)
+
+Available as a faster but less expressive alternative. Context and facts are
+encoded independently, scored via projected dot product:
+
+```
+h = W_ctx · encode(context)[CLS]    # (d,) computed once
+f = W_fact · embed(fact)[CLS]       # (d,) per candidate
+score = dot(h, f)                    # scalar
+```
+
+Fact embeddings are context-independent, limiting the model to semantic
+similarity rather than logical necessity. Use via `DotProductSummarizer`.
 
 ### Value/Policy Network (Layers 2-N)
 

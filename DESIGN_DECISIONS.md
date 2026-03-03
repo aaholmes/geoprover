@@ -185,6 +185,58 @@ The `identify_premises` function matches on `RuleName` and searches the fact set
 
 **Fallback**: For complex rules where precise identification is hard, we use a "point overlap" heuristic — find facts of the right type whose points overlap with the derived fact's points. This is occasionally imprecise (may return extra premises) but never misses the real ones.
 
+## FactSummarizer: Filtering Post-Saturation Facts
+
+### The problem: fact explosion
+
+After `saturate()`, a proof state may contain hundreds of deduced facts, but only a handful are relevant to the goal. Feeding all facts to the Value/Policy transformer is wasteful (attention cost, truncation risk) and noisy. Feeding none starves the value head of progress signal.
+
+Key observation: saturated facts are a deterministic function of initial facts + constructions. They don't enable new constructions (only new points do). Their only role is informing the neural network about which constructions to try next and how close we are to a proof.
+
+### Two-stage architecture
+
+We split the problem into two stages:
+1. **Summarizer** (pretrained, frozen during RL): scores each deduced fact for relevance, keeps top-K
+2. **Value/Policy** (trained during RL): sees initial facts + constructions + summarized deductions + goal
+
+Both share the same token embedding and first-layer context encoder. During RL, only the Value/Policy layers train; the shared encoder and Summarizer head remain frozen.
+
+### Adaptive K
+
+The number of summarized deductions scales with problem complexity: `K = |initial_facts| + |constructions| + 1`. Harder problems with more constructions automatically get a richer summary.
+
+### Cross-attention over dot-product
+
+Our first Summarizer variant used projected dot-product scoring: `score = dot(W_ctx · H, W_fact · f_emb)`. This is essentially semantic search — it scores facts that "look like" the context highly, but the fact embedding is computed in isolation. A fact involving seemingly unrelated points could be the critical stepping stone, but the dot product can't discover this because `embed(fact)` never sees the context.
+
+**Solution**: Cross-attention. The context encoder produces a KV cache (computed once). Each candidate fact's tokens cross-attend into this cache, producing context-dependent representations. The same fact gets different scores depending on the context, since its representation is shaped by what it attends to.
+
+```
+# Computed once:
+K, V = W_k · context_tokens, W_v · context_tokens
+
+# Per candidate fact (cheap — L_fact is 3-8 tokens):
+attended = softmax(Q · K^T / √d) · V
+score = MLP(LayerNorm(fact_tokens + attended)[CLS])
+```
+
+The KV cache reuse keeps per-fact cost low while allowing the model to learn logical necessity, not just similarity.
+
+The dot-product variant is preserved as `DotProductSummarizer` for ablation.
+
+### Training from proof traces
+
+Summarizer training data comes from proof traces on solved problems. For each deduction-solved problem:
+1. Snapshot initial facts, run `saturate_with_trace()`
+2. Label deduced facts: 1 if on the proof path (backward BFS from goal), 0 otherwise
+3. Train with BCE loss
+
+This is clean supervised learning — no RL needed. Proof traces provide direct positive labels. We cache computed traces to `data/proof_cache.json` to avoid re-running saturation each training run.
+
+### Data augmentation for the Summarizer
+
+The Summarizer benefits from the same label permutation + fact shuffling augmentation as the main transformer. Each epoch sees a different random relabeling of every training example, preventing overfitting to specific point name patterns.
+
 ## What Didn't Work
 
 ### Grid-based tensor encoding

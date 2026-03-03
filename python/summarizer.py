@@ -1,9 +1,13 @@
-"""FactSummarizer: NNUE-style learned filter for post-saturation deduced facts.
+"""FactSummarizer: learned filter for post-saturation deduced facts.
 
-Architecture (two-stage NNUE decomposition):
-  - Context encoder: 2-layer transformer encodes initial facts + constructions + goal (expensive, once)
-  - Fact encoder: 1-layer transformer encodes each candidate deduced fact (cheap, N times)
-  - Score: dot(context_embedding, fact_embedding) → relevance score per fact
+Two variants:
+  - FactSummarizer (default, cross-attention): fact tokens attend into precomputed
+    context KV cache, producing context-dependent fact representations. Can learn
+    that a fact is *necessary* for the proof, not just semantically similar.
+  - DotProductSummarizer (legacy): dot(context_proj, fact_proj) scoring. Faster but
+    fact embeddings are context-independent, limiting to semantic similarity.
+
+Both share the same interface (score_facts, encode_context) and are interchangeable.
 
 Training:
   - Labels from proof traces: 1 = fact on proof path, 0 = not
@@ -17,8 +21,6 @@ Usage at MCTS time:
   4. Score each deduced fact with Summarizer
   5. Keep top-K deduced facts (K = |initial| + |constructions| + 1)
   6. Build compact text = initial facts + top-K deduced + goal → feed to GeoTransformer
-
-~1.5M parameters (context encoder dominates).
 """
 
 from dataclasses import dataclass
@@ -47,10 +49,175 @@ SUMMARIZER_DROPOUT = 0.1
 
 
 class FactSummarizer(nn.Module):
-    """NNUE-style fact relevance scorer.
+    """Cross-attention fact relevance scorer (default).
 
-    Encodes context (initial facts + goal) once with a deep encoder,
-    then scores each candidate deduced fact cheaply via dot product.
+    Context KV cache is computed once from the context encoder. Each candidate
+    fact's tokens then cross-attend into this cache, producing context-dependent
+    representations. The [CLS] token of the attended output is scored via an MLP.
+
+    This allows the model to learn that a fact is *necessary* for the proof
+    (e.g., an angle fact that bridges two subgraphs toward the goal), not just
+    semantically similar to the context.
+    """
+
+    def __init__(
+        self,
+        vocab_size: int = VOCAB_SIZE,
+        d_model: int = SUMMARIZER_D_MODEL,
+        nhead: int = SUMMARIZER_NHEAD,
+        context_layers: int = SUMMARIZER_CONTEXT_LAYERS,
+        fact_layers: int = SUMMARIZER_FACT_LAYERS,
+        dim_feedforward: int = SUMMARIZER_DIM_FF,
+        max_seq_len: int = SUMMARIZER_MAX_SEQ_LEN,
+        dropout: float = SUMMARIZER_DROPOUT,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.max_seq_len = max_seq_len
+
+        # Shared token + position embeddings
+        self.token_emb = nn.Embedding(vocab_size, d_model, padding_idx=PAD_ID)
+        self.pos_emb = nn.Embedding(max_seq_len, d_model)
+        self.emb_dropout = nn.Dropout(dropout)
+        self.emb_norm = nn.LayerNorm(d_model)
+
+        # Context encoder: deeper (encodes initial facts + goal once)
+        context_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.context_encoder = nn.TransformerEncoder(
+            context_layer, num_layers=context_layers
+        )
+
+        # KV projection for cross-attention (computed once from context)
+        self.context_k_proj = nn.Linear(d_model, d_model)
+        self.context_v_proj = nn.Linear(d_model, d_model)
+
+        # Fact encoder: shallow self-attention over fact tokens
+        fact_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.fact_encoder = nn.TransformerEncoder(
+            fact_layer, num_layers=fact_layers
+        )
+
+        # Cross-attention: fact queries attend into context KV
+        self.cross_attn = nn.MultiheadAttention(
+            d_model, nhead, dropout=dropout, batch_first=True,
+        )
+        self.cross_norm = nn.LayerNorm(d_model)
+
+        # Score head: MLP on [CLS] after cross-attention
+        self.score_head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, 1),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.normal_(self.token_emb.weight, std=0.02)
+        nn.init.normal_(self.pos_emb.weight, std=0.02)
+        with torch.no_grad():
+            self.token_emb.weight[PAD_ID].zero_()
+        for m in [self.context_k_proj, self.context_v_proj]:
+            nn.init.xavier_uniform_(m.weight)
+            nn.init.constant_(m.bias, 0)
+        for m in self.score_head:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=0.01)
+                nn.init.constant_(m.bias, 0)
+
+    def _embed(self, token_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Shared embedding: tokens + positions → embeddings + padding mask."""
+        B, L = token_ids.shape
+        positions = torch.arange(L, device=token_ids.device).unsqueeze(0).expand(B, L)
+        x = self.token_emb(token_ids) + self.pos_emb(positions)
+        x = self.emb_norm(self.emb_dropout(x))
+        padding_mask = token_ids == PAD_ID
+        return x, padding_mask
+
+    def encode_context(self, context_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Encode context → KV cache for cross-attention.
+
+        Args:
+            context_ids: (B, L_ctx) token IDs
+        Returns:
+            (K, V, key_padding_mask) where K, V are (B, L_ctx, d_model)
+        """
+        x, mask = self._embed(context_ids)
+        x = self.context_encoder(x, src_key_padding_mask=mask)
+        K = self.context_k_proj(x)  # (B, L_ctx, d)
+        V = self.context_v_proj(x)  # (B, L_ctx, d)
+        return K, V, mask
+
+    def score_facts(
+        self,
+        context_ids: torch.Tensor,
+        fact_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Score each candidate fact against the context.
+
+        Args:
+            context_ids: (1, L_ctx) or (B, L_ctx) context token IDs
+            fact_ids: (N, L_fact) candidate fact token IDs
+
+        Returns:
+            (N,) relevance scores (logits, not sigmoided)
+        """
+        K, V, ctx_mask = self.encode_context(context_ids)  # (B, L_ctx, d)
+        N = fact_ids.shape[0]
+
+        # Expand context KV to match N facts if single context
+        if K.shape[0] == 1 and N > 1:
+            K = K.expand(N, -1, -1)
+            V = V.expand(N, -1, -1)
+            ctx_mask = ctx_mask.expand(N, -1)
+
+        # Encode facts with self-attention
+        fact_x, fact_mask = self._embed(fact_ids)       # (N, L_fact, d)
+        fact_x = self.fact_encoder(fact_x, src_key_padding_mask=fact_mask)
+
+        # Cross-attention: fact tokens query into context KV
+        # Q = fact_x (N, L_fact, d), K/V from context (N, L_ctx, d)
+        attended, _ = self.cross_attn(
+            query=fact_x, key=K, value=V,
+            key_padding_mask=ctx_mask,
+        )
+        # Residual + norm
+        fact_x = self.cross_norm(fact_x + attended)
+
+        # Score from [CLS] position
+        cls_emb = fact_x[:, 0, :]  # (N, d)
+        scores = self.score_head(cls_emb).squeeze(-1)  # (N,)
+        return scores
+
+    def forward(
+        self,
+        context_ids: torch.Tensor,
+        fact_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Forward pass: score facts against context."""
+        return self.score_facts(context_ids, fact_ids)
+
+
+class DotProductSummarizer(nn.Module):
+    """Dot-product fact relevance scorer (legacy).
+
+    Encodes context and facts independently, scores via projected dot product.
+    Faster than cross-attention but fact embeddings are context-independent,
+    limiting the model to semantic similarity rather than logical necessity.
     """
 
     def __init__(
@@ -125,35 +292,17 @@ class FactSummarizer(nn.Module):
         return x, padding_mask
 
     def encode_context(self, context_ids: torch.Tensor) -> torch.Tensor:
-        """Encode context (initial facts + goal) → (B, d_model) embedding.
-
-        Args:
-            context_ids: (B, L_ctx) token IDs for "[CLS] fact1 ; fact2 ; ? goal"
-        Returns:
-            (B, d_model) context embedding from [CLS] position
-        """
+        """Encode context → (B, d_model) projected embedding."""
         x, mask = self._embed(context_ids)
         x = self.context_encoder(x, src_key_padding_mask=mask)
-        return self.context_proj(x[:, 0, :])  # [CLS] embedding
-
-    def encode_facts(self, fact_ids: torch.Tensor) -> torch.Tensor:
-        """Encode candidate facts → (B, d_model) embeddings.
-
-        Args:
-            fact_ids: (N, L_fact) token IDs for individual facts (each prepended with [CLS])
-        Returns:
-            (N, d_model) fact embeddings from [CLS] position
-        """
-        x, mask = self._embed(fact_ids)
-        x = self.fact_encoder(x, src_key_padding_mask=mask)
-        return self.fact_proj(x[:, 0, :])  # [CLS] embedding
+        return self.context_proj(x[:, 0, :])
 
     def score_facts(
         self,
         context_ids: torch.Tensor,
         fact_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """Score each candidate fact against the context.
+        """Score each candidate fact against the context via dot product.
 
         Args:
             context_ids: (1, L_ctx) or (B, L_ctx) context token IDs
@@ -163,13 +312,16 @@ class FactSummarizer(nn.Module):
             (N,) relevance scores (logits, not sigmoided)
         """
         ctx_emb = self.encode_context(context_ids)  # (B, d_model)
-        fact_emb = self.encode_facts(fact_ids)  # (N, d_model)
 
-        # If batch context, expand to match facts
+        # Encode facts independently
+        x, mask = self._embed(fact_ids)
+        x = self.fact_encoder(x, src_key_padding_mask=mask)
+        fact_emb = self.fact_proj(x[:, 0, :])  # (N, d_model)
+
+        # Expand context if needed
         if ctx_emb.shape[0] == 1 and fact_emb.shape[0] > 1:
             ctx_emb = ctx_emb.expand(fact_emb.shape[0], -1)
 
-        # Dot product scores
         scores = (ctx_emb * fact_emb).sum(dim=-1)  # (N,)
         return scores
 
@@ -178,16 +330,7 @@ class FactSummarizer(nn.Module):
         context_ids: torch.Tensor,
         fact_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """Forward pass: score facts against context.
-
-        Args:
-            context_ids: (B, L_ctx) context token IDs
-            fact_ids: (B, N, L_fact) padded fact token IDs per example
-                      OR (N, L_fact) for single-context scoring
-
-        Returns:
-            scores: same shape as fact_ids batch dims
-        """
+        """Forward pass: score facts against context."""
         return self.score_facts(context_ids, fact_ids)
 
 
@@ -322,6 +465,44 @@ def generate_summarizer_data(problems_file: str) -> list[SummarizerSample]:
             skipped += 1
 
     print(f"Summarizer data: {len(samples)} samples from {solved} solved problems "
+          f"({skipped} skipped)")
+    return samples
+
+
+def load_summarizer_data_from_cache(cache_path: str) -> list[SummarizerSample]:
+    """Load Summarizer training data from a cached proof trace JSON file.
+
+    Expects the format produced by cache_proofs.py.
+    """
+    import json
+
+    with open(cache_path) as f:
+        entries = json.load(f)
+
+    samples = []
+    skipped = 0
+    for entry in entries:
+        deduced_facts = entry["deduced_facts"]
+        if not deduced_facts:
+            skipped += 1
+            continue
+
+        proof_path_set = set(entry["proof_path_facts"])
+        labels = [1.0 if f in proof_path_set else 0.0 for f in deduced_facts]
+
+        # Skip if all labels are 0 or all are 1 (no signal)
+        if sum(labels) == 0 or sum(labels) == len(labels):
+            skipped += 1
+            continue
+
+        samples.append(SummarizerSample(
+            initial_facts=entry["initial_facts"],
+            goal_text=entry.get("goal") or "",
+            deduced_facts=deduced_facts,
+            labels=labels,
+        ))
+
+    print(f"Summarizer data from cache: {len(samples)} samples from {len(entries)} entries "
           f"({skipped} skipped)")
     return samples
 

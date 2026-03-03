@@ -52,8 +52,11 @@ from summarizer import (
     build_fact_tokens,
     count_summarizer_parameters,
     generate_summarizer_data,
+    load_summarizer_data_from_cache,
     SUMMARIZER_MAX_SEQ_LEN,
 )
+
+DEFAULT_PROOF_CACHE = "data/proof_cache.json"
 
 # Training defaults
 DEFAULT_LR = 3e-4
@@ -654,8 +657,15 @@ def expert_iteration(
             load_summarizer_checkpoint(summarizer, summarizer_path, device)
             print(f"  Loaded existing Summarizer from {summarizer_path}")
         else:
-            print("  Generating Summarizer training data from proof traces...")
-            summ_samples = generate_summarizer_data(problems_file)
+            proof_cache = os.path.join(os.path.dirname(problems_file) or ".", "..", DEFAULT_PROOF_CACHE)
+            if os.path.exists(DEFAULT_PROOF_CACHE):
+                proof_cache = DEFAULT_PROOF_CACHE
+            if os.path.exists(proof_cache):
+                print(f"  Loading proof traces from cache: {proof_cache}")
+                summ_samples = load_summarizer_data_from_cache(proof_cache)
+            else:
+                print("  Generating Summarizer training data from proof traces...")
+                summ_samples = generate_summarizer_data(problems_file)
             if summ_samples:
                 summarizer = train_summarizer(
                     summarizer, summ_samples,
@@ -807,8 +817,12 @@ def main():
     if args.summarizer_only:
         summarizer = FactSummarizer().to(device)
         print(f"FactSummarizer parameters: {count_summarizer_parameters(summarizer):,}")
-        print("Generating Summarizer training data from proof traces...")
-        summ_samples = generate_summarizer_data(args.problems)
+        if os.path.exists(DEFAULT_PROOF_CACHE):
+            print(f"Loading proof traces from cache: {DEFAULT_PROOF_CACHE}")
+            summ_samples = load_summarizer_data_from_cache(DEFAULT_PROOF_CACHE)
+        else:
+            print("Generating Summarizer training data from proof traces...")
+            summ_samples = generate_summarizer_data(args.problems)
         if summ_samples:
             train_summarizer(
                 summarizer, summ_samples,
