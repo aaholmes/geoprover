@@ -418,4 +418,71 @@ mod tests {
         });
         assert!(has_large, "Hard difficulty should generate states with 5+ points");
     }
+
+    #[test]
+    fn test_seed_produces_same_count() {
+        // Same seed should produce the same number of examples
+        let batch1 = generate_batch(10, 42);
+        let batch2 = generate_batch(10, 42);
+        assert_eq!(batch1.len(), batch2.len(), "Same seed should produce same count");
+    }
+
+    #[test]
+    fn test_different_seeds_differ() {
+        // Different seeds should produce different results (with high probability)
+        let batch1 = generate_batch(20, 100);
+        let batch2 = generate_batch(20, 200);
+        assert!(batch1.len() > 0 && batch2.len() > 0);
+        // At least some examples should differ
+        let differ = batch1.iter().zip(batch2.iter())
+            .any(|(a, b)| a.1 != b.1);
+        assert!(differ, "Different seeds should produce different constructions");
+    }
+
+    #[test]
+    fn test_generate_batch_zero() {
+        // Generating 0 examples should return empty vec
+        let examples = generate_batch(0, 42);
+        assert!(examples.is_empty(), "0 examples should return empty vec");
+    }
+
+    #[test]
+    fn test_state_text_has_facts() {
+        // Each state text should contain relation keywords
+        let examples = generate_batch(10, 77);
+        for (state, _, _) in &examples {
+            assert!(!state.is_empty(), "State text should not be empty");
+            // State text should contain at least one relation keyword
+            let has_relation = ["coll", "para", "perp", "cong", "eqangle", "mid",
+                "oncirc", "cyclic", "eqratio"]
+                .iter().any(|kw| state.contains(kw));
+            assert!(has_relation, "State text should contain relation keywords: {}", state);
+        }
+    }
+
+    #[test]
+    fn test_goal_text_has_relation() {
+        // Goal text should contain a relation keyword
+        let examples = generate_batch(10, 88);
+        for (_, _, goal) in &examples {
+            assert!(!goal.is_empty(), "Goal text should not be empty");
+            let has_relation = ["coll", "para", "perp", "cong", "eqangle", "mid",
+                "oncirc", "cyclic", "eqratio"]
+                .iter().any(|kw| goal.contains(kw));
+            assert!(has_relation, "Goal text should contain a relation keyword: {}", goal);
+        }
+    }
+
+    #[test]
+    fn test_construction_text_nonempty() {
+        let examples = generate_batch(10, 55);
+        for (_, constr, _) in &examples {
+            assert!(!constr.is_empty(), "Construction text should not be empty");
+            // Should contain a known construction keyword
+            let has_keyword = ["mid", "alt", "circumcenter", "orthocenter", "incenter",
+                "pthrough", "tthrough", "reflect", "extend"]
+                .iter().any(|kw| constr.contains(kw));
+            assert!(has_keyword, "Construction should contain a known keyword: {}", constr);
+        }
+    }
 }

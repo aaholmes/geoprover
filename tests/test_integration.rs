@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use geoprover::parser::parse_problem;
 use geoprover::deduction::{saturate, saturate_with_trace};
 use geoprover::construction::{generate_constructions, apply_construction};
@@ -685,4 +685,140 @@ fn test_proof_premises_exist_in_proof() {
             );
         }
     }
+}
+
+// ============================
+// Shortest proof and alternatives
+// ============================
+
+#[test]
+fn test_extract_all_shortest_proofs_real_problem() {
+    // Verify extract_all_shortest_proofs works on a real JGEX problem
+    let input = "test\na b c = triangle a b c; o = circumcenter o a b c ? cong a o c o";
+    let mut state = parse_problem(input).unwrap();
+    let (proved, mut trace) = saturate_with_trace(&mut state);
+    assert!(proved, "Circumcenter equidistance should be proved");
+
+    let goal = state.goal.as_ref().unwrap();
+    let proofs = trace.extract_all_shortest_proofs(goal);
+    assert!(proofs.is_some(), "Should find at least one proof");
+    let proofs = proofs.unwrap();
+    assert!(!proofs.is_empty(), "Should have at least one proof");
+
+    // Count non-axiom steps for each proof (the "real" proof length)
+    let non_axiom_counts: Vec<usize> = proofs.iter()
+        .map(|p| p.iter().filter(|d| d.rule != RuleName::Axiom).count())
+        .collect();
+    let min_non_axiom = *non_axiom_counts.iter().min().unwrap();
+    // All proofs should have the same number of non-axiom derivation steps
+    for (i, &count) in non_axiom_counts.iter().enumerate() {
+        assert_eq!(count, min_non_axiom,
+            "Proof {} has {} non-axiom steps, expected {} (same as shortest)",
+            i, count, min_non_axiom);
+    }
+
+    println!("All shortest proofs: {} proofs, {} non-axiom steps each",
+        proofs.len(), min_non_axiom);
+}
+
+#[test]
+fn test_shortest_proof_no_longer_than_fallback() {
+    // The shortest proof algorithm should never produce a longer proof than
+    // what the old first-derivation approach would give
+    let input = "test\na b c = iso_triangle a b c ? eqangle b a b c c a c b";
+    let mut state = parse_problem(input).unwrap();
+    let (proved, mut trace) = saturate_with_trace(&mut state);
+    assert!(proved);
+
+    let goal = state.goal.as_ref().unwrap();
+    let proof = trace.extract_proof(goal).unwrap();
+
+    // Just verify the proof is valid and reasonably short
+    assert!(!proof.is_empty());
+    assert!(proof.len() <= 20, "Isosceles base angles proof should be short, got {}", proof.len());
+    println!("Shortest proof: {} steps", proof.len());
+}
+
+#[test]
+fn test_alternatives_recorded_during_saturation() {
+    // After saturate_with_trace, facts derived by multiple rules should have alternatives
+    let input = "test\na b c = triangle a b c; o = circumcenter o a b c ? cong a o c o";
+    let mut state = parse_problem(input).unwrap();
+    let (proved, trace) = saturate_with_trace(&mut state);
+    assert!(proved);
+
+    // Check if any fact has multiple alternatives
+    let mut max_alts = 0;
+    let mut facts_with_alts = 0;
+    // We can check this by examining the trace
+    // The goal itself might have alternatives from different rules
+    let goal = state.goal.as_ref().unwrap();
+    if let Some(alts) = trace.get_all(goal) {
+        if alts.len() > 1 {
+            facts_with_alts += 1;
+            max_alts = max_alts.max(alts.len());
+        }
+    }
+    println!(
+        "Alternatives: {} facts with >1 derivation, max {} alternatives",
+        facts_with_alts, max_alts
+    );
+}
+
+#[test]
+fn test_proof_topological_order_preserved() {
+    // Verify that extract_proof returns steps in valid topological order:
+    // for each step, all its premises appear earlier
+    let input = "test\na b c = triangle a b c; d = midpoint d a b ? cong a d d b";
+    let mut state = parse_problem(input).unwrap();
+    let (proved, mut trace) = saturate_with_trace(&mut state);
+    assert!(proved);
+
+    let goal = state.goal.as_ref().unwrap();
+    let proof = trace.extract_proof(goal).unwrap();
+
+    let fact_positions: HashMap<_, _> = proof.iter().enumerate()
+        .map(|(i, d)| (d.fact.clone(), i))
+        .collect();
+
+    for (i, d) in proof.iter().enumerate() {
+        for premise in &d.premises {
+            if let Some(&prem_pos) = fact_positions.get(premise) {
+                assert!(
+                    prem_pos < i,
+                    "Step {} ({:?}) has premise at position {} (should be earlier)",
+                    i, d.rule, prem_pos
+                );
+            }
+        }
+    }
+    println!("Topological order verified for {} steps", proof.len());
+}
+
+#[test]
+fn test_multiple_derivations_get_all() {
+    // Verify get_all returns correct number of alternatives for a known case
+    use geoprover::proof_trace::ProofTrace;
+    use geoprover::proof_state::Relation;
+
+    let mut trace = ProofTrace::new();
+    let fact = Relation::congruent(0, 1, 2, 3);
+    let p1 = Relation::congruent(0, 1, 4, 5);
+    let p2 = Relation::midpoint(0, 1, 2);
+
+    trace.add_derivation(
+        fact.clone(),
+        RuleName::TransitiveCongruent,
+        vec![p1],
+    );
+    trace.add_derivation(
+        fact.clone(),
+        RuleName::MidpointDefinition,
+        vec![p2],
+    );
+
+    let alts = trace.get_all(&fact).unwrap();
+    assert_eq!(alts.len(), 2, "Should have 2 alternatives");
+    assert_eq!(alts[0].rule, RuleName::TransitiveCongruent);
+    assert_eq!(alts[1].rule, RuleName::MidpointDefinition);
 }

@@ -945,7 +945,8 @@ class SetGeoTransformerV2(nn.Module):
 
         # Stage 4: Task heads
         # Policy: state_repr → scalar logit (one per construction)
-        self.policy_score = nn.Linear(d_model, 1)
+        self.policy_fc1 = nn.Linear(d_model, 128)
+        self.policy_fc2 = nn.Linear(128, 1)
         # Value head
         self.value_fc1 = nn.Linear(d_model, 128)
         self.value_fc2 = nn.Linear(128, 1)
@@ -958,7 +959,7 @@ class SetGeoTransformerV2(nn.Module):
         with torch.no_grad():
             self.token_emb.weight[PAD_ID].zero_()
 
-        for m in [self.policy_score, self.value_fc1, self.value_fc2]:
+        for m in [self.policy_fc1, self.policy_fc2, self.value_fc1, self.value_fc2]:
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight, gain=0.01)
                 if m.bias is not None:
@@ -1157,7 +1158,8 @@ class SetGeoTransformerV2(nn.Module):
         state_repr = state_repr.squeeze(1)  # (B*K, D)
 
         # Policy logits
-        logits = self.policy_score(state_repr).squeeze(-1)  # (B*K,)
+        p = F.relu(self.policy_fc1(state_repr))
+        logits = self.policy_fc2(p).squeeze(-1)  # (B*K,)
         logits = logits.reshape(B, K)  # (B, K)
 
         # Mask invalid constructions
@@ -1214,7 +1216,8 @@ class SetGeoTransformerV2(nn.Module):
             state_repr = layer(query=state_repr, kv=fact_kv_exp, key_padding_mask=fact_pad)
         state_repr = state_repr.squeeze(1)  # (K, D)
 
-        logits = self.policy_score(state_repr).squeeze(-1)  # (K,)
+        p = F.relu(self.policy_fc1(state_repr))
+        logits = self.policy_fc2(p).squeeze(-1)  # (K,)
         return logits
 
     def evaluate_cached(

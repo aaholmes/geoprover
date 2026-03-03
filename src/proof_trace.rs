@@ -2777,4 +2777,204 @@ mod tests {
         assert!(variants.len() >= 50, "Expected >=50 variants, got {}", variants.len());
         assert!(!variants.contains(&RuleName::Axiom));
     }
+
+    #[test]
+    fn test_get_all_returns_none_for_unknown() {
+        let trace = ProofTrace::new();
+        let fact = Relation::parallel(0, 1, 2, 3);
+        assert!(trace.get_all(&fact).is_none());
+    }
+
+    #[test]
+    fn test_get_returns_none_for_unknown() {
+        let trace = ProofTrace::new();
+        let fact = Relation::parallel(0, 1, 2, 3);
+        assert!(trace.get(&fact).is_none());
+    }
+
+    #[test]
+    fn test_axioms_iter() {
+        let mut trace = ProofTrace::new();
+        let a = Relation::parallel(0, 1, 2, 3);
+        let b = Relation::congruent(4, 5, 6, 7);
+        trace.add_axiom(a.clone());
+        trace.add_axiom(b.clone());
+        let axioms: HashSet<&Relation> = trace.axioms_iter().collect();
+        assert_eq!(axioms.len(), 2);
+        assert!(axioms.contains(&a));
+        assert!(axioms.contains(&b));
+    }
+
+    #[test]
+    fn test_is_empty() {
+        let mut trace = ProofTrace::new();
+        assert!(trace.is_empty());
+        trace.add_axiom(Relation::parallel(0, 1, 2, 3));
+        assert!(!trace.is_empty());
+    }
+
+    #[test]
+    fn test_set_all_facts() {
+        let mut trace = ProofTrace::new();
+        let mut facts = HashSet::new();
+        facts.insert(Relation::parallel(0, 1, 2, 3));
+        facts.insert(Relation::congruent(0, 1, 2, 3));
+        trace.set_all_facts(facts);
+        // all_facts is used internally; just verify it doesn't panic
+        assert_eq!(trace.len(), 0); // no derivations yet
+    }
+
+    #[test]
+    fn test_extract_proof_fallback_when_cost_fails() {
+        // If a derivation has unknown premises (not in reachable set),
+        // extract_proof should still return via fallback
+        let mut trace = ProofTrace::new();
+        let a = Relation::parallel(0, 1, 2, 3);
+        let b = Relation::parallel(0, 1, 4, 5);
+        trace.add_axiom(a.clone());
+        trace.add_derivation(b.clone(), RuleName::TransitiveParallel, vec![a.clone()]);
+        let proof = trace.extract_proof(&b).unwrap();
+        assert_eq!(proof.len(), 2);
+    }
+
+    #[test]
+    fn test_extract_all_shortest_proofs_single_path() {
+        // When there's only one path, should return exactly one proof
+        let mut trace = ProofTrace::new();
+        let a = Relation::parallel(0, 1, 2, 3);
+        let b = Relation::parallel(0, 1, 4, 5);
+        trace.add_axiom(a.clone());
+        trace.add_derivation(b.clone(), RuleName::TransitiveParallel, vec![a.clone()]);
+        let proofs = trace.extract_all_shortest_proofs(&b).unwrap();
+        assert_eq!(proofs.len(), 1);
+        assert_eq!(proofs[0].len(), 2); // axiom + derivation
+    }
+
+    #[test]
+    fn test_extract_all_shortest_proofs_nonexistent() {
+        let mut trace = ProofTrace::new();
+        let goal = Relation::parallel(0, 1, 2, 3);
+        assert!(trace.extract_all_shortest_proofs(&goal).is_none());
+    }
+
+    #[test]
+    fn test_format_proof_includes_step_numbers() {
+        use crate::proof_state::ObjectType;
+        let mut state = ProofState::new();
+        let a = state.add_object("a", ObjectType::Point);
+        let b = state.add_object("b", ObjectType::Point);
+        let c = state.add_object("c", ObjectType::Point);
+        let d = state.add_object("d", ObjectType::Point);
+
+        let mut trace = ProofTrace::new();
+        let ax1 = Relation::congruent(a, b, c, d);
+        let goal = Relation::congruent(c, d, a, b);
+
+        trace.add_axiom(ax1.clone());
+        // congruent is canonical, so congruent(c,d,a,b) == congruent(a,b,c,d)
+        // Let's use a real derivation
+        let derived = Relation::parallel(a, b, c, d);
+        trace.add_derivation(derived.clone(), RuleName::PerpToParallel, vec![ax1.clone()]);
+
+        let formatted = trace.format_proof(&derived, &state).unwrap();
+        assert!(formatted.contains("1."), "Should have step 1");
+        assert!(formatted.contains("2."), "Should have step 2");
+        assert!(formatted.contains("from"), "Should have premise references");
+    }
+
+    #[test]
+    fn test_shortest_proof_three_alternatives() {
+        // Three paths to goal with different costs:
+        // Path 1: A → B → C → D (3 steps)
+        // Path 2: A → E → D (2 steps)
+        // Path 3: A → D (1 step, direct)
+        let mut trace = ProofTrace::new();
+        let a = Relation::parallel(0, 1, 2, 3);
+        let b = Relation::parallel(0, 1, 4, 5);
+        let c = Relation::parallel(0, 1, 6, 7);
+        let d = Relation::parallel(0, 1, 8, 9);
+        let e = Relation::parallel(0, 1, 10, 11);
+
+        trace.add_axiom(a.clone());
+        // Path 1: A→B→C→D
+        trace.add_derivation(b.clone(), RuleName::TransitiveParallel, vec![a.clone()]);
+        trace.add_derivation(c.clone(), RuleName::TransitiveParallel, vec![b.clone()]);
+        trace.add_derivation(d.clone(), RuleName::TransitiveParallel, vec![c.clone()]);
+        // Path 2: A→E→D
+        trace.add_derivation(e.clone(), RuleName::PerpToParallel, vec![a.clone()]);
+        trace.add_derivation(d.clone(), RuleName::PerpToParallel, vec![e.clone()]);
+        // Path 3: A→D direct
+        trace.add_derivation(d.clone(), RuleName::PerpParallelTransfer, vec![a.clone()]);
+
+        let proof = trace.extract_proof(&d).unwrap();
+        // Should pick the 1-step direct path: [axiom a, derived d]
+        assert_eq!(proof.len(), 2, "Should pick shortest 1-step path, got {} steps", proof.len());
+    }
+
+    #[test]
+    fn test_resolve_premises_axiom() {
+        let mut trace = ProofTrace::new();
+        let a = Relation::parallel(0, 1, 2, 3);
+        trace.add_axiom(a.clone());
+        let deriv = trace.get(&a).unwrap();
+        // Axiom should resolve to empty premises
+        let premises = trace.resolve_premises(deriv);
+        assert!(premises.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_premises_with_stored_premises() {
+        let mut trace = ProofTrace::new();
+        let ax = Relation::parallel(0, 1, 2, 3);
+        let derived = Relation::parallel(0, 1, 4, 5);
+        trace.add_axiom(ax.clone());
+        trace.add_derivation(derived.clone(), RuleName::TransitiveParallel, vec![ax.clone()]);
+        let deriv = trace.get(&derived).unwrap();
+        let premises = trace.resolve_premises(deriv);
+        assert_eq!(premises.len(), 1);
+        assert_eq!(premises[0], ax);
+    }
+
+    #[test]
+    fn test_different_rules_same_fact_both_stored() {
+        // Two different rules deriving the same fact should both be stored
+        let mut trace = ProofTrace::new();
+        let fact = Relation::parallel(0, 1, 2, 3);
+        let p1 = Relation::perpendicular(0, 1, 4, 5);
+        let p2 = Relation::perpendicular(2, 3, 4, 5);
+        trace.add_derivation(fact.clone(), RuleName::PerpToParallel, vec![p1.clone(), p2.clone()]);
+        trace.add_derivation(fact.clone(), RuleName::TransitiveParallel, vec![Relation::parallel(0, 1, 6, 7)]);
+        let alts = trace.get_all(&fact).unwrap();
+        assert_eq!(alts.len(), 2);
+        assert_eq!(alts[0].rule, RuleName::PerpToParallel);
+        assert_eq!(alts[1].rule, RuleName::TransitiveParallel);
+    }
+
+    #[test]
+    fn test_len_counts_unique_facts() {
+        let mut trace = ProofTrace::new();
+        let fact = Relation::congruent(0, 1, 2, 3);
+        trace.add_derivation(fact.clone(), RuleName::TransitiveCongruent, vec![Relation::congruent(0, 1, 4, 5)]);
+        trace.add_derivation(fact.clone(), RuleName::MidpointDefinition, vec![Relation::midpoint(0, 1, 2)]);
+        // len() should count unique facts (keys), not total alternatives
+        assert_eq!(trace.len(), 1);
+    }
+
+    #[test]
+    fn test_add_axiom_is_axiom() {
+        let mut trace = ProofTrace::new();
+        let fact = Relation::parallel(0, 1, 2, 3);
+        assert!(!trace.is_axiom(&fact));
+        trace.add_axiom(fact.clone());
+        assert!(trace.is_axiom(&fact));
+        // axiom_count should be 1
+        assert_eq!(trace.axiom_count(), 1);
+    }
+
+    #[test]
+    fn test_rulename_display() {
+        assert_eq!(format!("{}", RuleName::Axiom), "Axiom");
+        assert_eq!(format!("{}", RuleName::TransitiveParallel), "TransitiveParallel");
+        assert_eq!(format!("{}", RuleName::SasCongruence), "SasCongruence");
+    }
 }

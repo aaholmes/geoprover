@@ -580,4 +580,45 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn test_empty_state_tensor_size() {
+        let state = ProofState::new();
+        let tensor = state_to_tensor(&state);
+        assert_eq!(tensor.len(), TENSOR_SIZE);
+        // All zeros for empty state
+        assert!(tensor.iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn test_exactly_32_objects() {
+        // Edge case: exactly at the GRID_SIZE cap
+        let mut state = ProofState::new();
+        for i in 0..32 {
+            state.add_object(&format!("p{}", i), ObjectType::Point);
+        }
+        state.add_fact(Relation::collinear(0, 15, 31));
+        let tensor = state_to_tensor(&state);
+        assert_eq!(tensor.len(), TENSOR_SIZE);
+        // Object type channels should be set for all 32 objects
+        for i in 0..32 {
+            assert_eq!(tensor[idx(16, i, i)], 1.0, "Point {} should be encoded", i);
+        }
+    }
+
+    #[test]
+    fn test_state_with_no_goal_encoding() {
+        let mut state = make_triangle();
+        state.add_fact(Relation::parallel(0, 1, 1, 2));
+        // No goal set — goal channels should be zero
+        let tensor = state_to_tensor(&state);
+        // Goal channels are 8-11
+        for ch in 8..12 {
+            let channel_sum: f32 = (0..GRID_SIZE)
+                .flat_map(|r| (0..GRID_SIZE).map(move |c| (r, c)))
+                .map(|(r, c)| tensor[idx(ch, r, c)])
+                .sum();
+            assert_eq!(channel_sum, 0.0, "Goal channel {} should be all zeros without goal", ch);
+        }
+    }
 }
