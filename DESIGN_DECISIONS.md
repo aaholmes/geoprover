@@ -270,7 +270,7 @@ The system could answer "proved" or "not proved" but couldn't explain why. For a
 
 The naive approach — identify premises for every derived fact during saturation — is too slow. Rules like SAS congruence require O(n^3) search through congruent and angle facts. With ~2000 facts derived per saturation, this blows up.
 
-**Solution**: During saturation, record only `(fact, rule_name)` with empty premises. In `extract_proof()`, walk backward from the goal through the derivation DAG, and only then call `identify_premises()` for the ~10-20 facts on the proof path. This makes saturation overhead negligible (~2x) while keeping proof extraction fast.
+**Solution**: During saturation, eagerly resolve premises against the pre-iteration fact set (preventing circular deps) and record them with the derivation. Multiple alternative derivations per fact are stored (up to 16). `extract_proof()` uses AND-OR DAG cost minimization over all stored alternatives to find the shortest proof, with lazy `discover_alternatives()` trying additional rules against proof-path facts.
 
 **Trade-off**: Premise identification uses the final fact set, not the fact set at derivation time. This means we might attribute premises that were actually derived later. In practice this doesn't matter for proof readability, and it avoids storing fact-set snapshots.
 
@@ -284,6 +284,35 @@ Each of the 54 rules has a characteristic "shape" — the types and point-relati
 The `identify_premises` function matches on `RuleName` and searches the fact set for inputs matching the expected pattern. It's essentially running the rule logic in reverse.
 
 **Fallback**: For complex rules where precise identification is hard, we use a "point overlap" heuristic — find facts of the right type whose points overlap with the derived fact's points. This is occasionally imprecise (may return extra premises) but never misses the real ones.
+
+### Shortest proof extraction via AND-OR DAG optimization
+
+The original `extract_proof()` stored only one derivation per fact (first-wins via `entry().or_insert()`) and did backward BFS to reconstruct the proof. This produced valid proofs, but not necessarily the shortest — whichever derivation happened to be recorded first determined the proof structure.
+
+**Problem**: A fact might be derivable in 1 step (directly from axioms) but if a 3-step derivation was recorded first, the proof would use the longer path.
+
+**Solution**: Store multiple alternative derivations per fact (up to 16), forming an AND-OR DAG:
+- **OR**: each fact may have multiple alternative derivations (different rules, different premises)
+- **AND**: each derivation requires all its premises
+
+The shortest proof is found by bottom-up cost computation:
+```
+cost(axiom) = 0
+cost(fact) = 1 + min over alternatives of (sum of premise costs)
+```
+
+This runs in topological order with iterative relaxation. After computing costs, we reconstruct the proof by following the cheapest derivation choice at each fact.
+
+**Alternative sources**: Alternatives come from three places:
+1. **Same-iteration alternatives**: During `saturate_with_trace()`, multiple rules may derive the same fact in a single iteration. The inner loop now tracks `added_this_iter` and records all derivations, not just the first.
+2. **Cross-iteration alternatives**: `discover_alternatives()` tries all 55 rule variants against each reachable fact's premises. This catches derivations that *would have* been recorded but were filtered by the `!state.facts.contains(f)` check in later iterations. Only done for facts on the proof path (~10-30 facts), so cost is manageable.
+3. **Deduplication**: Same rule + same premise set is deduplicated to avoid storing redundant alternatives.
+
+**All shortest proofs**: `extract_all_shortest_proofs()` extends the cost computation by tracking all tied-best alternatives per fact, then DFS-enumerates proof trees over the tied choices. Capped at 16 proofs to prevent exponential blowup.
+
+**Approximation**: The sum-of-costs formula over-counts when premises share sub-proofs (the exact minimum AND-OR subgraph problem is NP-hard). For typical geometry proofs (5-30 steps with minimal sharing), this gives optimal or near-optimal results.
+
+**Trade-off**: `extract_proof()` now takes `&mut self` instead of `&self` because `discover_alternatives()` may add new derivations to the trace. This required updating all callers (PyO3 bindings, integration tests). The fallback path (`extract_proof_fallback`) preserves the original first-derivation BFS behavior for cases where cost computation fails (e.g., unreachable premises).
 
 ## FactSummarizer: Filtering Post-Saturation Facts
 

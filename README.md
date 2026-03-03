@@ -61,7 +61,7 @@ Geoprover's deduction engine exceeds AlphaGeometry's DD baseline on JGEX-AG-231.
 
 ## Proof Output
 
-`saturate_with_trace()` records derivation provenance during deduction, producing human-readable proofs that trace each step from axioms to the goal.
+`saturate_with_trace()` records derivation provenance during deduction, producing human-readable proofs that trace each step from axioms to the goal. Multiple alternative derivations are stored per fact (AND-OR DAG), and `extract_proof()` finds the **shortest proof** via bottom-up cost minimization. `extract_all_shortest_proofs()` enumerates all tied-shortest proofs (up to 16).
 
 **Circumcenter equidistance** — circumcenter O of triangle ABC is equidistant from A and C:
 ```
@@ -86,14 +86,15 @@ Proof (3 steps):
   3. para a d b e [PerpToParallel from 2, 1]
 ```
 
-Proofs are extracted by backward BFS from the goal through the derivation DAG, then topologically sorted so axioms appear first.
+Proofs are extracted via AND-OR DAG cost minimization: each fact may have multiple alternative derivations (OR), each requiring all its premises (AND). The algorithm computes `cost(fact) = 1 + min over alternatives of (sum of premise costs)` bottom-up, then reconstructs the proof following cheapest choices. When multiple derivations tie, `extract_all_shortest_proofs()` enumerates all optimal proof trees.
 
 ```python
 import geoprover
 
 state = geoprover.parse_problem("iso\na b c = iso_triangle a b c ? eqangle b a b c c a c b")
 proved, trace = geoprover.saturate_with_trace(state)
-print(trace.format_proof())
+print(trace.format_proof())          # single shortest proof
+all_proofs = trace.extract_all_shortest_proofs()  # all tied-shortest proofs
 ```
 
 ## Architecture
@@ -207,7 +208,7 @@ src/
   deduction.rs      54 forward-chaining rules + saturate_with_trace() for proof output
   construction.rs   7 auxiliary construction types with priority classification
   parser.rs         JGEX DSL parser (40+ predicates, 231/231 coverage)
-  proof_trace.rs    RuleName, Derivation, ProofTrace, identify_premises (provenance tracking)
+  proof_trace.rs    RuleName, Derivation, ProofTrace, shortest proof via AND-OR DAG optimization
   encoding.rs       state_to_tensor() — 20x32x32 relation adjacency grid (legacy)
   synthetic.rs      Random geometry data generator: multi-point, multi-step, negative examples
   lib.rs            PyO3 bridge (PyProofState, PyConstruction, PyProofTrace, 12 functions)
@@ -291,7 +292,7 @@ a b c = triangle; h = on_tline b a c, on_tline c a b ? perp a h b c
 ## Build & Test
 
 ```bash
-cargo test                                          # 399 Rust tests
+cargo test                                          # 404 Rust tests
 cargo clippy                                        # lint
 cargo test --test test_integration -- --nocapture   # integration tests with output
 maturin develop                                     # build PyO3 extension
