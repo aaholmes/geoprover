@@ -176,12 +176,12 @@ Key properties:
 - Backbone: 6-layer transformer encoder, d_model=256, 8 heads, dim_ff=512
 - Custom tokenizer: ~86-token geometry vocabulary (point names, relation/construction keywords)
 - Policy head: 2048 logits over construction index space (7 types x 292 slots)
-- Value head: `V = sigmoid(v_logit)` — single scalar output in [0, 1]
+- Value head: `V = sigmoid(v_logit)` — distance-to-proof estimate in [0, 1], trained with TD-style targets (`gamma^D` on winning path)
 
 **Training pipeline (3-phase, end-to-end for SetGeoTransformer):**
-1. Synthetic pre-training on Rust-generated random geometry configurations (50K examples, mixed difficulty, with negative examples)
+1. Synthetic pre-training on Rust-generated random geometry configurations (50K examples, mixed difficulty, with negative examples). Value targets use `gamma=0.5` (1 construction step from proof)
 2. Supervised fine-tuning on JGEX problems with MCTS-derived policy targets (not zeros) + all-node sample collection
-3. Expert iteration: MCTS self-play -> collect visit distributions from all tree nodes -> train -> repeat
+3. Expert iteration: MCTS self-play -> collect TD-style value targets (`gamma^D` on winning path, NN estimates off-path) from all tree nodes -> train -> repeat
 
 Both SetGeoTransformer variants train fully end-to-end — cross-attention learns fact relevance implicitly from the policy+value loss, eliminating the separate FactSummarizer pre-training step. V2 additionally uses per-construction logits instead of the fixed 2048-slot policy space, and defers saturation during MCTS expansion for efficiency. The GeoTransformer optionally uses a pretrained FactSummarizer (frozen during RL) to filter post-saturation facts.
 
@@ -227,13 +227,13 @@ src/
     search.rs       mcts_search() loop, select_leaf, proof path extraction
 python/
   model.py          SetGeoTransformerV1/V2, GeoTransformer, GeoNetCNN (legacy), tokenizer
-  orchestrate.py    NN-guided MCTS (Python-side tree), all-node sample collection
+  orchestrate.py    NN-guided MCTS (Python-side tree), TD-style value learning, all-node sample collection
   train.py          3-phase training: synthetic -> supervised -> expert iteration
   evaluate.py       Benchmark suite: deduction vs MCTS+NN, comparison reports
   summarizer.py     FactSummarizer: cross-attention fact relevance scoring
   visualize.py      Coordinate synthesis + static proof diagram rendering
   animate.py        Animated proof walkthroughs + MCTS tree visualization
-  test_nn.py        42 end-to-end tests for NN modules
+  test_nn.py        47 end-to-end tests for NN modules
   test_bridge.py    14 PyO3 bridge smoke tests
 web/
   index.html        Interactive dashboard: problem browser, charts, IMO comparison
@@ -258,8 +258,8 @@ web/
 
 - **Select**: Two-phase — visit unvisited children first (by priority), then UCB/PUCT with NN priors
 - **Expand**: Generate constructions, score with NN policy head, create child nodes
-- **Evaluate**: Run `saturate()`. If proved, value=1.0. Otherwise `V = sigmoid(v_logit)`
-- **Backprop**: Single-player — `total_value += value` at every ancestor (no sign flip)
+- **Evaluate**: Run `saturate()`. If proved, value=1.0. Otherwise `V = sigmoid(v_logit)` (distance-to-proof estimate)
+- **Backprop**: Max with discount — `best_value = max(best_value, v); v *= gamma` up the tree. Single-player: take the best path, not the average. `gamma=0.5` means value halves per construction step (1 step = 0.5, 2 steps = 0.25, 3 steps = 0.125)
 
 ### Deduction Rules (54 active)
 
@@ -306,7 +306,7 @@ cargo clippy                                        # lint
 cargo test --test test_integration -- --nocapture   # integration tests with output
 maturin develop                                     # build PyO3 extension
 python python/test_bridge.py                        # PyO3 bridge smoke tests (14 tests)
-python python/test_nn.py                            # NN module tests (42 tests)
+python python/test_nn.py                            # NN module tests (47 tests)
 ./scripts/test-fast.sh                              # Full fast suite (~20s)
 ```
 

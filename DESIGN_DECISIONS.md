@@ -49,9 +49,29 @@ For MCTS, we need saturation to be fast — it runs at every node expansion. The
 
 ## Phase 2: MCTS Port
 
-### Single-player simplification
+### Single-player simplification and max backprop with discount
 
-Chess MCTS alternates sign during backpropagation because it's adversarial. Geometry is single-player — value is always "progress toward proof." So backprop simplifies to `total_value += value` at every ancestor. No sign flip. This made the port much cleaner.
+Chess MCTS alternates sign during backpropagation because it's adversarial. Geometry is single-player — value is always "progress toward proof." The initial port used simple sum backprop (`total_value += value`), but this suffered from value collapse: most problems are eventually solvable, so the value head tended toward always predicting 1.0.
+
+**Solution**: TD-style value learning with max backprop and discount factor `gamma=0.5`. Value semantics changed from binary solvability to **distance-to-proof**: `V = gamma^D` where D = number of construction steps to proof. Backprop uses `max` (not sum/average) because geometry is single-player — a node with one winning child and nine dead ends is a good node:
+
+```python
+def _backprop(node, value):
+    v = value
+    while node is not None:
+        node.visits += 1
+        node.best_value = max(node.best_value, v)
+        v *= GAMMA  # discount per construction step
+        node = node.parent
+```
+
+This gives the value head a gradient: 1 step away = 0.5, 2 steps = 0.25, 3 steps = 0.125. Deep noise is naturally dampened.
+
+**Training targets**: After search, winning-path nodes get ground-truth targets (`gamma^depth_to_terminal`). Off-path nodes use their NN prediction as a bootstrapped target (standard TD learning). As training improves, these estimates improve, creating a virtuous cycle.
+
+**Why gamma=0.5?** Simple, well-understood in RL. The ordering is the same as `1/(1+D)`, but gamma is trivial to implement in backprop (just multiply). Exponential decay naturally dampens noise from deep nodes.
+
+**Why max, not average?** Q_avg would rate a node with one winning child among nine dead ends at ~0.1. Q_max correctly rates it at the winning child's value. Since geometry is single-player, you always take the best path.
 
 ### Two-phase selection
 
@@ -115,14 +135,16 @@ Our first NN was a CNN operating on a 20x32x32 tensor encoding. Each channel rep
 
 Even with text encoding, the model could overfit to specific point name patterns (e.g., always seeing "a" as a triangle vertex). We added label permutation: randomly shuffle point names while preserving the geometric structure. This was surprisingly effective — a ~2% improvement on JGEX.
 
-### Value head: just sigmoid
+### Value head: sigmoid with distance-to-proof semantics
 
 We tried several value head designs:
 1. `V = sigmoid(v_logit)` — simple, single scalar
 2. `V = sigmoid(v_logit) * (1 - exp(-k * delta_D))` — modulated by classical heuristic
 3. `V = sigmoid(v_logit + alpha * delta_D)` — additive combination
 
-**Winner**: The simple sigmoid. The delta_D modulation added complexity without improving results. The NN learns its own value function that subsumes the classical heuristic.
+**Winner**: The simple sigmoid, but with changed training semantics. Originally trained with binary targets (1.0 = proved, 0.0 = not), the value head suffered from collapse — most problems are eventually solvable, so it tended toward always predicting 1.0.
+
+**Fix**: TD-style training targets with `gamma=0.5` discount. Value now represents distance-to-proof: `gamma^D` where D = construction steps remaining. Synthetic data (1 step from proof) uses target 0.5 instead of 1.0. MCTS training uses ground-truth `gamma^depth_to_terminal` on the winning path and bootstrapped NN estimates off-path. The architecture is unchanged — just better targets.
 
 ### Policy head: fixed-size vs dot-product
 
@@ -303,11 +325,11 @@ Comparable to V1's ~3.9M. The extra Stage 3b parameters replace the removed fact
 
 ### Three-phase training
 
-1. **Synthetic pre-training** (Phase A): Generate random geometry configurations in Rust, apply a random construction, find what new facts appear, use those as training targets. 50K examples, ~4 minutes to generate. This gives the model basic geometric intuition.
+1. **Synthetic pre-training** (Phase A): Generate random geometry configurations in Rust, apply a random construction, find what new facts appear, use those as training targets. 50K examples, ~4 minutes to generate. Value targets use `gamma=0.5` (each synthetic example is 1 construction step from proof, so target = 0.5 instead of 1.0). This gives the model basic geometric intuition with calibrated distance-to-proof estimates.
 
-2. **Supervised fine-tuning** (Phase B): Run deduction on all 231 JGEX problems. For the ~181 that deduction solves, use the final state as a positive value example. For the ~50 that fail, use them as negative examples. This calibrates the value head.
+2. **Supervised fine-tuning** (Phase B): Run deduction on all 231 JGEX problems. For the ~181 that deduction solves, use the final state as a positive value example (target = 1.0, since deduction-solved states are already proved, i.e., `gamma^0`). For the ~50 that fail, use them as negative examples.
 
-3. **Expert iteration** (Phase C): Run MCTS with the current model on unsolved problems. Collect visit distributions from all tree nodes (not just the root — this was a key improvement). Train on the collected samples. Repeat.
+3. **Expert iteration** (Phase C): Run MCTS with the current model on unsolved problems. Collect TD-style value targets from all tree nodes: winning-path nodes get `gamma^depth_to_terminal` (ground truth), off-path nodes get their NN prediction as a bootstrapped target. Train on the collected samples. Repeat.
 
 ### Why synthetic data matters
 
@@ -321,11 +343,13 @@ Expert iteration improves from 187/231 (random) to 189/231 (trained) but then pl
 
 **Diagnosis**: The remaining ~42 unsolved problems mostly need 2+ construction steps, but our MCTS config (`max_depth=1-2`) doesn't search deep enough. The problems that MCTS does solve almost always need exactly 1 construction.
 
-### Training on all tree nodes
+### Training on all tree nodes with TD-style targets
 
 Initially we only collected training samples from the MCTS root node. This wastes information — child nodes also have meaningful value estimates and visit distributions.
 
-**Fix**: Walk the entire MCTS tree after each episode, collecting (state, value, policy) from every node with >= 2 visits. This 5-10x'd our training data per episode and improved the value head significantly.
+**Fix**: Walk the entire MCTS tree after each episode, collecting (state, value, policy) from every node with >= 5 visits. This 5-10x'd our training data per episode.
+
+Value targets use TD-style learning: `_find_proof_path_nodes()` traces the winning branch via DFS and assigns `gamma^depth_to_terminal` as ground-truth targets. Off-path nodes get their raw NN prediction (`nn_value`) as a bootstrapped target — pessimistic but self-improving. This replaces the earlier binary scheme (1.0 for solved subtrees, Q-value otherwise) which lacked gradient for the value head.
 
 ## Proof Trace Infrastructure
 
@@ -488,6 +512,6 @@ We got to 228/231 parseable (3 problems use predicates we haven't implemented: `
 - **MCTS** (10 iterations, depth 1): ~2-3s per problem
 - **Synthetic data generation**: ~42 examples/sec in Rust
 - **Training**: ~3 min/epoch for 10K examples at seq_len=128 (CPU-only)
-- **Test suite**: 404 Rust tests + 42 Python NN tests in ~30s
+- **Test suite**: 404 Rust tests + 47 Python NN tests in ~30s
 
 The main bottleneck is CPU-only training. GPU training would likely 10x throughput and enable larger synthetic datasets.
