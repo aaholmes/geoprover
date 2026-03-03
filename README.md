@@ -150,12 +150,12 @@ Rust extension module (MCTS, deduction engine, state encoding, synthetic data)
                │                                          │
        ┌──────────────┐                           ┌──────────────┐
        │    Value     │                           │    Policy    │
-       │ Linear(128)  │                           │  Linear(1)   │
-       │ ReLU         │                           │  → scalar    │
-       │ Linear(1)    │                           │   logit      │
-       │ → sigmoid    │                           └──────────────┘
-       │   [0, 1]     │
-       └──────────────┘
+       │ Linear(128)  │                           │ Linear(128)  │
+       │ ReLU         │                           │ ReLU         │
+       │ Linear(1)    │                           │ Linear(1)    │
+       │ → sigmoid    │                           │ → scalar     │
+       │   [0, 1]     │                           │   logit      │
+       └──────────────┘                           └──────────────┘
 
   Stage 1 (shared): All inputs encoded by the same 2-layer transformer.
   Fact and goal embeddings are cached; only construction encoding is per-candidate.

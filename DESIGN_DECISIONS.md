@@ -254,7 +254,7 @@ V2 eliminates fact-to-fact attention entirely. See the architecture diagram in R
 
 **Stage 3b (Value Query-to-Facts)**: The raw goal embedding (without construction fusion) attends to the same fact embeddings via a **separate** 2-layer cross-attention with independent weights. This asks a different question — "how close is the current state to proving the goal?" — which doesn't depend on which construction is being considered. The fact KV cache is shared between 3a and 3b; only the query and attention weights differ.
 
-**Stage 4 (Task Heads)**: Policy uses Stage 3a output → `Linear(d_model, 1)` → scalar logit per construction. Value uses Stage 3b output → `FC(128) → ReLU → FC(1) → sigmoid`. No fixed index space, no hashing collisions.
+**Stage 4 (Task Heads)**: Both heads are 2-layer MLPs: `Linear(d_model, 128) → ReLU → Linear(128, 1)`. Policy produces a scalar logit per construction; value applies sigmoid for a probability in [0, 1]. No fixed index space, no hashing collisions.
 
 ### Deferred saturation in MCTS
 
