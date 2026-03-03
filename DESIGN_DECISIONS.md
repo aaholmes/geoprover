@@ -204,6 +204,24 @@ When batching states with different numbers of facts, shorter states get padded 
 
 The test suite includes an explicit permutation-invariance check: encode the same 4 facts in original, reversed, and shuffled order, and verify that value and policy outputs are identical (max diff < 1e-5). This passes by construction — no positional embeddings in Stage 2 means the model literally cannot distinguish fact orderings.
 
+### Training: end-to-end replaces two-stage frozen pipeline
+
+The FactSummarizer required a two-stage training procedure:
+1. **Stage 1 (supervised)**: Pre-train the Summarizer on proof-trace labels (BCE loss: 1 if fact is on proof path, 0 otherwise). This required running `saturate_with_trace()` on all solved problems, extracting proof paths, and caching them to `data/proof_cache.json`.
+2. **Stage 2 (RL with frozen Summarizer)**: Freeze the Summarizer weights, then train the Value/Policy transformer on top of its filtered output during expert iteration.
+
+This was fragile — the Summarizer's filtering decisions were fixed at deployment time, so errors in Stage 1 couldn't be corrected by Stage 2. The Summarizer also shared token embeddings with the main transformer, requiring careful coordination to avoid clobbering weights.
+
+The SetGeoTransformer eliminates this entirely. Stage 3's cross-attention learns which facts to attend to **as part of the standard policy+value loss**, with no separate supervision signal. The same 3-phase training pipeline (synthetic pre-training, supervised fine-tuning, expert iteration) trains the entire model end-to-end:
+
+- **Synthetic pre-training**: Each synthetic example is split into per-fact tokens via `SetSyntheticDataset`. The collate function (`set_collate_fn`) pads the fact dimension to the batch maximum, since different examples have different numbers of facts.
+- **Supervised fine-tuning**: `SetGeometryDataset` wraps `TrainingSample` objects, parsing their `state_text` ("fact ; fact ; ? goal") into per-fact sequences via `split_state_text()`.
+- **Expert iteration**: MCTS self-play uses `facts_as_text_list()` and `encode_state_as_set()` for inference, collecting the same `TrainingSample` format for training.
+
+All three phases use the combined KL(policy) + MSE(value) loss via `compute_set_loss()`. The cross-attention weights in Stage 3 adapt throughout training — early on they attend roughly uniformly; after supervised training they focus on goal-relevant facts. No separate proof-trace labels needed.
+
+**Data augmentation**: Label permutation still applies (shuffle point names). Fact shuffling is no longer needed for invariance but is still applied during training as a no-op sanity check — the model produces identical outputs regardless.
+
 ### Parameter budget
 
 ~3.9M parameters (vs ~4.0M for the original GeoTransformer):

@@ -168,10 +168,12 @@ Key properties:
 - Policy head: 2048 logits over construction index space (7 types x 292 slots)
 - Value head: `V = sigmoid(v_logit)` — single scalar output in [0, 1]
 
-**Training pipeline (3-phase):**
+**Training pipeline (3-phase, end-to-end for SetGeoTransformer):**
 1. Synthetic pre-training on Rust-generated random geometry configurations (50K examples, mixed difficulty, with negative examples)
 2. Supervised fine-tuning on JGEX problems with MCTS-derived policy targets (not zeros) + all-node sample collection
 3. Expert iteration: MCTS self-play -> collect visit distributions from all tree nodes -> train -> repeat
+
+The SetGeoTransformer trains fully end-to-end — Stage 3 cross-attention learns fact relevance implicitly from the policy+value loss, eliminating the separate FactSummarizer pre-training step. The GeoTransformer optionally uses a pretrained FactSummarizer (frozen during RL) to filter post-saturation facts.
 
 ## Visualization
 
