@@ -127,11 +127,11 @@ impl PyProofTrace {
 
     /// Extract the proof chain for the goal as a list of (fact_text, rule_name, premise_texts).
     #[allow(clippy::type_complexity)]
-    fn extract_proof(&self) -> PyResult<Option<Vec<(String, String, Vec<String>)>>> {
+    fn extract_proof(&mut self) -> PyResult<Option<Vec<(String, String, Vec<String>)>>> {
         let goal = self.state.goal.as_ref().ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err("No goal set")
-        })?;
-        Ok(self.inner.extract_proof(goal).map(|steps| {
+        })?.clone();
+        Ok(self.inner.extract_proof(&goal).map(|steps| {
             steps
                 .iter()
                 .map(|d| {
@@ -149,24 +149,55 @@ impl PyProofTrace {
     }
 
     /// Format a human-readable proof string.
-    fn format_proof(&self) -> PyResult<Option<String>> {
+    fn format_proof(&mut self) -> PyResult<Option<String>> {
         let goal = self.state.goal.as_ref().ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err("No goal set")
-        })?;
-        Ok(self.inner.format_proof(goal, &self.state))
+        })?.clone();
+        Ok(self.inner.format_proof(&goal, &self.state))
     }
 
     /// Return the set of fact texts that lie on the proof path (non-axiom derived facts only).
     /// Returns None if the goal has no proof.
-    fn proof_path_facts(&self) -> PyResult<Option<Vec<String>>> {
+    fn proof_path_facts(&mut self) -> PyResult<Option<Vec<String>>> {
         let goal = self.state.goal.as_ref().ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err("No goal set")
-        })?;
-        Ok(self.inner.extract_proof(goal).map(|steps| {
+        })?.clone();
+        Ok(self.inner.extract_proof(&goal).map(|steps| {
             steps
                 .iter()
                 .filter(|d| d.rule != proof_trace::RuleName::Axiom)
                 .map(|d| self.state.relation_to_text_pub(&d.fact))
+                .collect()
+        }))
+    }
+
+    /// Extract all shortest proofs (tied on step count). Returns up to 16 proofs.
+    /// Each proof is a list of (fact_text, rule_name, premise_texts).
+    #[allow(clippy::type_complexity)]
+    fn extract_all_shortest_proofs(
+        &mut self,
+    ) -> PyResult<Option<Vec<Vec<(String, String, Vec<String>)>>>> {
+        let goal = self.state.goal.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err("No goal set")
+        })?.clone();
+        Ok(self.inner.extract_all_shortest_proofs(&goal).map(|proofs| {
+            proofs
+                .iter()
+                .map(|steps| {
+                    steps
+                        .iter()
+                        .map(|d| {
+                            let fact_text = self.state.relation_to_text_pub(&d.fact);
+                            let rule_name = format!("{}", d.rule);
+                            let premise_texts: Vec<String> = d
+                                .premises
+                                .iter()
+                                .map(|p| self.state.relation_to_text_pub(p))
+                                .collect();
+                            (fact_text, rule_name, premise_texts)
+                        })
+                        .collect()
+                })
                 .collect()
         }))
     }

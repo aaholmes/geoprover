@@ -411,7 +411,7 @@ fn test_trace_midpoint_proof() {
     // Midpoint(m,a,b) → saturate → proves Cong(a,m,m,b)
     let input = "midpoint_trace\na b = segment a b; m = midpoint a b ? cong a m m b";
     let mut state = parse_problem(input).unwrap();
-    let (proved, trace) = saturate_with_trace(&mut state);
+    let (proved, mut trace) = saturate_with_trace(&mut state);
     assert!(proved, "Midpoint congruence should be proved with trace");
     assert!(trace.axiom_count() > 0, "Should have axioms");
     assert!(trace.len() > trace.axiom_count(), "Should have derived facts beyond axioms");
@@ -460,7 +460,7 @@ fn test_trace_orthocenter() {
     // Full problem: triangle orthocenter
     let input = "ortho_trace\na b c = triangle a b c; h = orthocenter a b c ? perp b h a c";
     let mut state = parse_problem(input).unwrap();
-    let (proved, trace) = saturate_with_trace(&mut state);
+    let (proved, mut trace) = saturate_with_trace(&mut state);
     assert!(proved, "Orthocenter perpendicularity should be proved");
 
     let goal = state.goal.as_ref().unwrap();
@@ -481,7 +481,7 @@ fn test_trace_orthocenter() {
 fn test_trace_isosceles() {
     let input = "iso_trace\na b c = iso_triangle a b c ? eqangle b a b c c a c b";
     let mut state = parse_problem(input).unwrap();
-    let (proved, trace) = saturate_with_trace(&mut state);
+    let (proved, mut trace) = saturate_with_trace(&mut state);
     assert!(proved, "Isosceles base angles should be proved");
 
     let goal = state.goal.as_ref().unwrap();
@@ -501,7 +501,7 @@ fn test_trace_isosceles() {
 fn test_trace_format_readable() {
     let input = "format_trace\na b c = triangle a b c; h = orthocenter a b c ? perp b h a c";
     let mut state = parse_problem(input).unwrap();
-    let (proved, trace) = saturate_with_trace(&mut state);
+    let (proved, mut trace) = saturate_with_trace(&mut state);
     assert!(proved);
 
     let goal = state.goal.as_ref().unwrap();
@@ -529,7 +529,7 @@ fn test_trace_transitive_parallel() {
     state.add_fact(Relation::parallel(c, d, e, f));
     state.set_goal(Relation::parallel(a, b, e, f));
 
-    let (proved, trace) = saturate_with_trace(&mut state);
+    let (proved, mut trace) = saturate_with_trace(&mut state);
     assert!(proved);
     assert_eq!(trace.axiom_count(), 2);
 
@@ -583,7 +583,7 @@ fn test_proof_trace_no_circular_deps_circumcenter() {
         h = midpoint h c b; d = on_line d o h, on_line d a b; \
         e = on_tline e c c o, on_tline e a a o ? cyclic a o e d";
     let mut state = parse_problem(input).unwrap();
-    let (proved, trace) = saturate_with_trace(&mut state);
+    let (proved, mut trace) = saturate_with_trace(&mut state);
     assert!(proved, "Problem should be solved by deduction");
 
     let goal = state.goal.as_ref().unwrap();
@@ -604,7 +604,7 @@ fn test_proof_trace_no_circular_deps_isquare() {
         e = s_angle c d e 15, s_angle d c e -15; \
         f = reflect f e a c ? contri e a b a b e";
     let mut state = parse_problem(input).unwrap();
-    let (proved, trace) = saturate_with_trace(&mut state);
+    let (proved, mut trace) = saturate_with_trace(&mut state);
     assert!(proved, "Problem should be solved by deduction");
 
     let goal = state.goal.as_ref().unwrap();
@@ -623,7 +623,7 @@ fn test_proof_trace_no_circular_deps_angle_bisector() {
         e = on_line e b c; \
         f = on_circle f d a, angle_bisector f a c e ? cong a f f b";
     let mut state = parse_problem(input).unwrap();
-    let (proved, trace) = saturate_with_trace(&mut state);
+    let (proved, mut trace) = saturate_with_trace(&mut state);
     assert!(proved, "Problem should be solved by deduction");
 
     let goal = state.goal.as_ref().unwrap();
@@ -643,7 +643,7 @@ fn test_proof_path_subset_of_deduced() {
         f = on_circle f d a, angle_bisector f a c e ? cong a f f b";
     let mut state = parse_problem(input).unwrap();
     let pre_facts: HashSet<_> = state.facts.iter().cloned().collect();
-    let (proved, trace) = saturate_with_trace(&mut state);
+    let (proved, mut trace) = saturate_with_trace(&mut state);
     assert!(proved);
 
     let goal = state.goal.as_ref().unwrap();
@@ -669,7 +669,7 @@ fn test_proof_premises_exist_in_proof() {
         e = on_line e b c; \
         f = on_circle f d a, angle_bisector f a c e ? cong a f f b";
     let mut state = parse_problem(input).unwrap();
-    let (proved, trace) = saturate_with_trace(&mut state);
+    let (proved, mut trace) = saturate_with_trace(&mut state);
     assert!(proved);
 
     let goal = state.goal.as_ref().unwrap();

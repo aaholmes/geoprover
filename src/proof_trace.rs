@@ -61,6 +61,68 @@ pub enum RuleName {
     OppositeAnglesCyclic,
 }
 
+impl RuleName {
+    /// Return all non-Axiom rule variants for alternative derivation discovery.
+    pub fn all_variants() -> Vec<RuleName> {
+        vec![
+            RuleName::TransitiveParallel,
+            RuleName::PerpToParallel,
+            RuleName::MidpointDefinition,
+            RuleName::TransitiveCongruent,
+            RuleName::IsoscelesBaseAngles,
+            RuleName::AlternateInteriorAngles,
+            RuleName::CorrespondingAngles,
+            RuleName::TransitiveEqualAngle,
+            RuleName::PerpendicularAngles,
+            RuleName::CirclePointEquidistance,
+            RuleName::MidlineParallel,
+            RuleName::CyclicFromOncircle,
+            RuleName::EqualAnglesToParallel,
+            RuleName::MidpointConverse,
+            RuleName::CongruentOncircle,
+            RuleName::PerpendicularBisector,
+            RuleName::EquidistantMidpoint,
+            RuleName::PerpParallelTransfer,
+            RuleName::LineCollinearExtension,
+            RuleName::CollinearTransitivity,
+            RuleName::CyclicInscribedAngles,
+            RuleName::ParallelSharedPointCollinear,
+            RuleName::ThalesTheorem,
+            RuleName::InscribedAngleConverse,
+            RuleName::IsoscelesConverse,
+            RuleName::PerpMidpointCongruent,
+            RuleName::TwoEquidistantPerp,
+            RuleName::MidpointDiagonalParallelogram,
+            RuleName::CyclicEqualAngleCongruent,
+            RuleName::CyclicParallelEqangle,
+            RuleName::EquidistantCyclicPerp,
+            RuleName::MidpointParallelogram,
+            RuleName::EqanglePerpToPerp,
+            RuleName::SasCongruence,
+            RuleName::AsaCongruence,
+            RuleName::SssCongruence,
+            RuleName::TransitiveRatio,
+            RuleName::RatioOneCongruence,
+            RuleName::MidpointRatio,
+            RuleName::ParallelCollinearRatio,
+            RuleName::CongruentRatio,
+            RuleName::RatioCollinearParallel,
+            RuleName::ParallelogramOppositeAngles,
+            RuleName::IsoscelesTrapezoidBaseAngles,
+            RuleName::TrapezoidMidsegment,
+            RuleName::ParallelBaseRatio,
+            RuleName::ParallelProjection,
+            RuleName::EqualTangentLengths,
+            RuleName::TangentChordAngle,
+            RuleName::AngleBisectorRatio,
+            RuleName::IncenterEqualInradii,
+            RuleName::AaSimilarity,
+            RuleName::OrthocenterConcurrence,
+            RuleName::OppositeAnglesCyclic,
+        ]
+    }
+}
+
 impl std::fmt::Display for RuleName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:?}", self)
@@ -75,12 +137,15 @@ pub struct Derivation {
     pub premises: Vec<Relation>,
 }
 
+/// Maximum number of alternative derivations stored per fact.
+const MAX_ALTERNATIVES: usize = 16;
+
 /// Proof trace: records how each fact was derived during saturation.
-/// Premises are resolved lazily during extract_proof to avoid expensive
-/// O(n^2+) searches for every derived fact during the hot saturation loop.
+/// Stores multiple alternative derivations per fact (AND-OR DAG) to enable
+/// shortest proof extraction.
 #[derive(Clone, Debug)]
 pub struct ProofTrace {
-    derivations: HashMap<Relation, Derivation>,
+    derivations: HashMap<Relation, Vec<Derivation>>,
     axioms: HashSet<Relation>,
     /// All facts available for premise resolution (populated at end of saturation)
     all_facts: HashSet<Relation>,
@@ -99,20 +164,37 @@ impl ProofTrace {
     pub fn add_axiom(&mut self, fact: Relation) {
         self.axioms.insert(fact.clone());
         // Also record a derivation entry for axioms
-        self.derivations.entry(fact.clone()).or_insert(Derivation {
-            fact,
-            rule: RuleName::Axiom,
-            premises: vec![],
-        });
+        self.derivations
+            .entry(fact.clone())
+            .or_insert_with(Vec::new)
+            .push(Derivation {
+                fact,
+                rule: RuleName::Axiom,
+                premises: vec![],
+            });
     }
 
-    /// Record a derived fact. First derivation wins (no overwrite).
+    /// Record a derived fact. Stores multiple alternative derivations per fact
+    /// (up to MAX_ALTERNATIVES). Deduplicates by rule + premise set.
     pub fn add_derivation(&mut self, fact: Relation, rule: RuleName, premises: Vec<Relation>) {
-        self.derivations.entry(fact.clone()).or_insert(Derivation {
-            fact,
-            rule,
-            premises,
+        let alts = self
+            .derivations
+            .entry(fact.clone())
+            .or_insert_with(Vec::new);
+        // Dedup: skip if same rule + same premise set already recorded
+        let dominated = alts.iter().any(|d| {
+            d.rule == rule && d.premises.len() == premises.len() && {
+                let existing: HashSet<&Relation> = d.premises.iter().collect();
+                premises.iter().all(|p| existing.contains(p))
+            }
         });
+        if !dominated && alts.len() < MAX_ALTERNATIVES {
+            alts.push(Derivation {
+                fact,
+                rule,
+                premises,
+            });
+        }
     }
 
     /// Is a fact recorded as an axiom?
@@ -140,14 +222,41 @@ impl ProofTrace {
         self.axioms.len()
     }
 
-    /// Get the derivation for a fact, if it exists.
+    /// Get the first derivation for a fact, if it exists (backward compat).
     pub fn get(&self, fact: &Relation) -> Option<&Derivation> {
-        self.derivations.get(fact)
+        self.derivations.get(fact).and_then(|v| v.first())
+    }
+
+    /// Get all alternative derivations for a fact.
+    pub fn get_all(&self, fact: &Relation) -> Option<&[Derivation]> {
+        self.derivations.get(fact).map(|v| v.as_slice())
     }
 
     /// Iterate over axiom facts.
     pub fn axioms_iter(&self) -> impl Iterator<Item = &Relation> {
         self.axioms.iter()
+    }
+
+    /// Discover alternative derivations for facts on the proof path by trying
+    /// all rules against the full fact set. Only done for reachable facts (~10-30),
+    /// so the cost is manageable.
+    fn discover_alternatives(&mut self, reachable: &HashSet<Relation>) {
+        if self.all_facts.is_empty() {
+            return;
+        }
+        let facts_to_check: Vec<Relation> = reachable
+            .iter()
+            .filter(|f| !self.is_axiom(f))
+            .cloned()
+            .collect();
+        for fact in facts_to_check {
+            for rule in RuleName::all_variants() {
+                let premises = identify_premises(&fact, &rule, &self.all_facts);
+                if !premises.is_empty() {
+                    self.add_derivation(fact.clone(), rule, premises);
+                }
+            }
+        }
     }
 
     /// Resolve premises for a derivation, using lazy identification if needed.
@@ -166,15 +275,150 @@ impl ProofTrace {
         }
     }
 
-    /// Extract a minimal proof: backward BFS from goal through premises,
-    /// return topologically sorted derivations (axioms first, goal last).
-    pub fn extract_proof(&self, goal: &Relation) -> Option<Vec<Derivation>> {
-        // Check if goal is in our derivations
+    /// Extract the shortest proof: uses AND-OR DAG cost minimization over
+    /// all stored alternative derivations to find the proof with fewest steps.
+    /// Returns topologically sorted derivations (axioms first, goal last).
+    pub fn extract_proof(&mut self, goal: &Relation) -> Option<Vec<Derivation>> {
         if !self.derivations.contains_key(goal) {
             return None;
         }
 
-        // First pass: resolve premises for facts on the proof path (lazy)
+        // Step 1: Collect all reachable facts from goal via ALL stored alternatives (BFS)
+        let mut reachable: HashSet<Relation> = HashSet::new();
+        let mut queue: VecDeque<Relation> = VecDeque::new();
+        queue.push_back(goal.clone());
+        reachable.insert(goal.clone());
+
+        while let Some(fact) = queue.pop_front() {
+            if let Some(alts) = self.derivations.get(&fact) {
+                for deriv in alts {
+                    let premises = self.resolve_premises(deriv);
+                    for premise in premises {
+                        if reachable.insert(premise.clone()) {
+                            queue.push_back(premise);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Step 2: Discover additional alternatives for reachable facts
+        self.discover_alternatives(&reachable);
+
+        // Rebuild reachable set after discovering new alternatives
+        reachable.clear();
+        queue.push_back(goal.clone());
+        reachable.insert(goal.clone());
+        while let Some(fact) = queue.pop_front() {
+            if let Some(alts) = self.derivations.get(&fact) {
+                for deriv in alts {
+                    let premises = self.resolve_premises(deriv);
+                    for premise in premises {
+                        if reachable.insert(premise.clone()) {
+                            queue.push_back(premise);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Step 3: Resolve all alternatives for reachable facts
+        let mut all_alts: HashMap<Relation, Vec<(RuleName, Vec<Relation>)>> = HashMap::new();
+        for fact in &reachable {
+            if let Some(alts) = self.derivations.get(fact) {
+                let resolved: Vec<(RuleName, Vec<Relation>)> = alts
+                    .iter()
+                    .map(|d| (d.rule.clone(), self.resolve_premises(d)))
+                    .collect();
+                all_alts.insert(fact.clone(), resolved);
+            }
+        }
+
+        // Step 4: Bottom-up cost computation in topological order
+        // cost(axiom) = 0
+        // cost(fact) = 1 + min over alternatives of (sum of premise costs)
+        let mut cost: HashMap<Relation, usize> = HashMap::new();
+        let mut chosen: HashMap<Relation, usize> = HashMap::new(); // index into all_alts
+
+        // Initialize axioms
+        for fact in &reachable {
+            if self.is_axiom(fact) {
+                cost.insert(fact.clone(), 0);
+                chosen.insert(fact.clone(), 0);
+            }
+        }
+
+        // Iterative relaxation until stable (handles DAG structure)
+        let max_iterations = reachable.len() + 1;
+        for _ in 0..max_iterations {
+            let mut changed = false;
+            for fact in &reachable {
+                if self.is_axiom(fact) {
+                    continue;
+                }
+                if let Some(alts) = all_alts.get(fact) {
+                    for (alt_idx, (_, premises)) in alts.iter().enumerate() {
+                        // Skip if any premise cost is unknown
+                        if !premises.iter().all(|p| cost.contains_key(p)) {
+                            continue;
+                        }
+                        let alt_cost: usize =
+                            1 + premises.iter().map(|p| cost[p]).sum::<usize>();
+                        let current = cost.get(fact).copied().unwrap_or(usize::MAX);
+                        if alt_cost < current {
+                            cost.insert(fact.clone(), alt_cost);
+                            chosen.insert(fact.clone(), alt_idx);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        // If goal has no cost, fall back to first-derivation BFS
+        if !cost.contains_key(goal) {
+            return self.extract_proof_fallback(goal);
+        }
+
+        // Step 5: Reconstruct proof by following chosen derivations
+        let mut proof_facts: HashSet<Relation> = HashSet::new();
+        let mut reconstruct_queue: VecDeque<Relation> = VecDeque::new();
+        reconstruct_queue.push_back(goal.clone());
+        proof_facts.insert(goal.clone());
+
+        let mut resolved_proof: HashMap<Relation, Derivation> = HashMap::new();
+        while let Some(fact) = reconstruct_queue.pop_front() {
+            if let (Some(alts), Some(&alt_idx)) = (all_alts.get(&fact), chosen.get(&fact)) {
+                let (ref rule, ref premises) = alts[alt_idx];
+                for p in premises {
+                    if proof_facts.insert(p.clone()) {
+                        reconstruct_queue.push_back(p.clone());
+                    }
+                }
+                resolved_proof.insert(
+                    fact.clone(),
+                    Derivation {
+                        fact: fact.clone(),
+                        rule: rule.clone(),
+                        premises: premises.clone(),
+                    },
+                );
+            }
+        }
+
+        // Step 6: Topological sort
+        self.topological_sort_with_cycle_breaking(&mut resolved_proof)
+    }
+
+    /// Fallback extract_proof using first-derivation BFS (pre-existing behavior).
+    fn extract_proof_fallback(&self, goal: &Relation) -> Option<Vec<Derivation>> {
+        if !self.derivations.contains_key(goal) {
+            return None;
+        }
+
         let mut resolved: HashMap<Relation, Derivation> = HashMap::new();
         let mut queue: VecDeque<Relation> = VecDeque::new();
         let mut visited: HashSet<Relation> = HashSet::new();
@@ -182,26 +426,311 @@ impl ProofTrace {
         visited.insert(goal.clone());
 
         while let Some(fact) = queue.pop_front() {
-            if let Some(deriv) = self.derivations.get(&fact) {
-                let premises = self.resolve_premises(deriv);
-                for premise in &premises {
-                    if visited.insert(premise.clone()) {
-                        queue.push_back(premise.clone());
+            if let Some(alts) = self.derivations.get(&fact) {
+                if let Some(deriv) = alts.first() {
+                    let premises = self.resolve_premises(deriv);
+                    for premise in &premises {
+                        if visited.insert(premise.clone()) {
+                            queue.push_back(premise.clone());
+                        }
                     }
+                    resolved.insert(
+                        fact,
+                        Derivation {
+                            fact: deriv.fact.clone(),
+                            rule: deriv.rule.clone(),
+                            premises,
+                        },
+                    );
                 }
-                resolved.insert(
-                    fact,
-                    Derivation {
-                        fact: deriv.fact.clone(),
-                        rule: deriv.rule.clone(),
-                        premises,
-                    },
-                );
             }
         }
 
-        // Topological sort with cycle breaking
         self.topological_sort_with_cycle_breaking(&mut resolved)
+    }
+
+    /// Extract all shortest proofs (tied on step count). Returns up to 16 proofs.
+    /// Each proof is a topologically-sorted Vec<Derivation>.
+    pub fn extract_all_shortest_proofs(
+        &mut self,
+        goal: &Relation,
+    ) -> Option<Vec<Vec<Derivation>>> {
+        if !self.derivations.contains_key(goal) {
+            return None;
+        }
+
+        // Reuse the cost computation from extract_proof
+        // Step 1-2: Collect reachable and discover alternatives
+        let mut reachable: HashSet<Relation> = HashSet::new();
+        let mut queue: VecDeque<Relation> = VecDeque::new();
+        queue.push_back(goal.clone());
+        reachable.insert(goal.clone());
+        while let Some(fact) = queue.pop_front() {
+            if let Some(alts) = self.derivations.get(&fact) {
+                for deriv in alts {
+                    let premises = self.resolve_premises(deriv);
+                    for premise in premises {
+                        if reachable.insert(premise.clone()) {
+                            queue.push_back(premise);
+                        }
+                    }
+                }
+            }
+        }
+        self.discover_alternatives(&reachable);
+
+        // Rebuild reachable
+        reachable.clear();
+        queue.push_back(goal.clone());
+        reachable.insert(goal.clone());
+        while let Some(fact) = queue.pop_front() {
+            if let Some(alts) = self.derivations.get(&fact) {
+                for deriv in alts {
+                    let premises = self.resolve_premises(deriv);
+                    for premise in premises {
+                        if reachable.insert(premise.clone()) {
+                            queue.push_back(premise);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Resolve all alternatives
+        let mut all_alts: HashMap<Relation, Vec<(RuleName, Vec<Relation>)>> = HashMap::new();
+        for fact in &reachable {
+            if let Some(alts) = self.derivations.get(fact) {
+                let resolved: Vec<(RuleName, Vec<Relation>)> = alts
+                    .iter()
+                    .map(|d| (d.rule.clone(), self.resolve_premises(d)))
+                    .collect();
+                all_alts.insert(fact.clone(), resolved);
+            }
+        }
+
+        // Cost computation
+        let mut cost: HashMap<Relation, usize> = HashMap::new();
+        for fact in &reachable {
+            if self.is_axiom(fact) {
+                cost.insert(fact.clone(), 0);
+            }
+        }
+        let max_iterations = reachable.len() + 1;
+        for _ in 0..max_iterations {
+            let mut changed = false;
+            for fact in &reachable {
+                if self.is_axiom(fact) {
+                    continue;
+                }
+                if let Some(alts) = all_alts.get(fact) {
+                    for (_, premises) in alts {
+                        if !premises.iter().all(|p| cost.contains_key(p)) {
+                            continue;
+                        }
+                        let alt_cost: usize =
+                            1 + premises.iter().map(|p| cost[p]).sum::<usize>();
+                        let current = cost.get(fact).copied().unwrap_or(usize::MAX);
+                        if alt_cost < current {
+                            cost.insert(fact.clone(), alt_cost);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        if !cost.contains_key(goal) {
+            return self.extract_proof_fallback(goal).map(|p| vec![p]);
+        }
+
+        // Find all tied-best alternative indices per fact
+        let mut tied_best: HashMap<Relation, Vec<usize>> = HashMap::new();
+        for fact in &reachable {
+            if self.is_axiom(fact) {
+                tied_best.insert(fact.clone(), vec![0]);
+                continue;
+            }
+            let best_cost = cost[fact];
+            if let Some(alts) = all_alts.get(fact) {
+                let indices: Vec<usize> = alts
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (_, premises))| {
+                        premises.iter().all(|p| cost.contains_key(p))
+                            && 1 + premises.iter().map(|p| cost[p]).sum::<usize>() == best_cost
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+                if !indices.is_empty() {
+                    tied_best.insert(fact.clone(), indices);
+                }
+            }
+        }
+
+        // DFS enumeration over tied choices, capped at 16 proofs
+        const MAX_PROOFS: usize = 16;
+        let mut results: Vec<Vec<Derivation>> = Vec::new();
+
+        // Stack-based DFS: each frame is (fact, choice assignments so far)
+        // We enumerate by choosing one tied alternative per fact on the proof path
+        fn enumerate_proofs(
+            goal: &Relation,
+            all_alts: &HashMap<Relation, Vec<(RuleName, Vec<Relation>)>>,
+            tied_best: &HashMap<Relation, Vec<usize>>,
+            axioms: &HashSet<Relation>,
+            results: &mut Vec<Vec<Derivation>>,
+            max_proofs: usize,
+        ) {
+            // Start with goal's tied alternatives
+            let goal_tied = match tied_best.get(goal) {
+                Some(t) => t.clone(),
+                None => return,
+            };
+
+            for &goal_choice in &goal_tied {
+                if results.len() >= max_proofs {
+                    return;
+                }
+                // For each goal choice, do BFS to build one proof, tracking where ties exist
+                let mut assignment: HashMap<Relation, usize> = HashMap::new();
+                assignment.insert(goal.clone(), goal_choice);
+
+                // Expand all facts on proof path using first tied choice for non-goal facts
+                let mut expand_queue: VecDeque<Relation> = VecDeque::new();
+                expand_queue.push_back(goal.clone());
+                let mut seen: HashSet<Relation> = HashSet::new();
+                seen.insert(goal.clone());
+
+                while let Some(fact) = expand_queue.pop_front() {
+                    if axioms.contains(&fact) {
+                        continue;
+                    }
+                    let alt_idx = assignment
+                        .get(&fact)
+                        .copied()
+                        .unwrap_or_else(|| tied_best.get(&fact).map(|t| t[0]).unwrap_or(0));
+                    assignment.entry(fact.clone()).or_insert(alt_idx);
+                    if let Some(alts) = all_alts.get(&fact) {
+                        if let Some((_, premises)) = alts.get(alt_idx) {
+                            for p in premises {
+                                if seen.insert(p.clone()) {
+                                    expand_queue.push_back(p.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Build the proof from this assignment
+                let mut resolved: HashMap<Relation, Derivation> = HashMap::new();
+                for (fact, &alt_idx) in &assignment {
+                    if axioms.contains(fact) {
+                        resolved.insert(
+                            fact.clone(),
+                            Derivation {
+                                fact: fact.clone(),
+                                rule: RuleName::Axiom,
+                                premises: vec![],
+                            },
+                        );
+                    } else if let Some(alts) = all_alts.get(fact) {
+                        if let Some((rule, premises)) = alts.get(alt_idx) {
+                            resolved.insert(
+                                fact.clone(),
+                                Derivation {
+                                    fact: fact.clone(),
+                                    rule: rule.clone(),
+                                    premises: premises.clone(),
+                                },
+                            );
+                        }
+                    }
+                }
+                // Also add axioms that are premises but not in assignment
+                for d in resolved.values().clone().collect::<Vec<_>>() {
+                    for p in &d.premises {
+                        if axioms.contains(p) && !resolved.contains_key(p) {
+                            // will be added below
+                        }
+                    }
+                }
+                // Add missing axiom premises
+                let needed_axioms: Vec<Relation> = resolved
+                    .values()
+                    .flat_map(|d| d.premises.iter())
+                    .filter(|p| axioms.contains(p) && !resolved.contains_key(p))
+                    .cloned()
+                    .collect::<HashSet<_>>()
+                    .into_iter()
+                    .collect();
+                for ax in needed_axioms {
+                    resolved.insert(
+                        ax.clone(),
+                        Derivation {
+                            fact: ax,
+                            rule: RuleName::Axiom,
+                            premises: vec![],
+                        },
+                    );
+                }
+
+                // Simple topological sort (no cycle breaking needed for well-formed proofs)
+                let mut result: Vec<Derivation> = Vec::new();
+                let mut emitted: HashSet<Relation> = HashSet::new();
+                let mut remaining: Vec<Relation> = resolved.keys().cloned().collect();
+                let mut made_progress = true;
+                while made_progress {
+                    made_progress = false;
+                    remaining.retain(|fact| {
+                        if let Some(deriv) = resolved.get(fact) {
+                            if deriv.premises.iter().all(|p| emitted.contains(p)) {
+                                result.push(deriv.clone());
+                                emitted.insert(fact.clone());
+                                made_progress = true;
+                                return false;
+                            }
+                        }
+                        true
+                    });
+                }
+                // Emit any remaining (cycle edge cases)
+                for fact in &remaining {
+                    if let Some(deriv) = resolved.get(fact) {
+                        result.push(deriv.clone());
+                    }
+                }
+
+                // Deduplicate: check if we already have this exact proof
+                let dominated = results.iter().any(|existing| {
+                    existing.len() == result.len()
+                        && existing
+                            .iter()
+                            .zip(result.iter())
+                            .all(|(a, b)| a.fact == b.fact && a.rule == b.rule)
+                });
+                if !dominated {
+                    results.push(result);
+                }
+            }
+        }
+
+        enumerate_proofs(
+            goal,
+            &all_alts,
+            &tied_best,
+            &self.axioms,
+            &mut results,
+            MAX_PROOFS,
+        );
+
+        if results.is_empty() {
+            None
+        } else {
+            Some(results)
+        }
     }
 
     /// Topological sort that breaks cycles by re-resolving premises.
@@ -329,7 +858,7 @@ impl ProofTrace {
     }
 
     /// Format a human-readable proof using point names from the state.
-    pub fn format_proof(&self, goal: &Relation, state: &ProofState) -> Option<String> {
+    pub fn format_proof(&mut self, goal: &Relation, state: &ProofState) -> Option<String> {
         let steps = self.extract_proof(goal)?;
         let mut lines = Vec::new();
 
@@ -1916,7 +2445,7 @@ mod tests {
     }
 
     #[test]
-    fn test_no_overwrite() {
+    fn test_multiple_derivations_stored() {
         let mut trace = ProofTrace::new();
         let fact = Relation::congruent(0, 1, 2, 3);
         trace.add_derivation(
@@ -1924,14 +2453,20 @@ mod tests {
             RuleName::TransitiveCongruent,
             vec![Relation::congruent(0, 1, 4, 5)],
         );
-        // Second derivation should NOT overwrite
+        // Second derivation with different rule should be stored as alternative
         trace.add_derivation(
             fact.clone(),
             RuleName::MidpointDefinition,
             vec![Relation::midpoint(0, 1, 2)],
         );
+        // First derivation is still returned by get()
         let d = trace.get(&fact).unwrap();
         assert_eq!(d.rule, RuleName::TransitiveCongruent);
+        // Both are stored
+        let alts = trace.get_all(&fact).unwrap();
+        assert_eq!(alts.len(), 2);
+        assert_eq!(alts[0].rule, RuleName::TransitiveCongruent);
+        assert_eq!(alts[1].rule, RuleName::MidpointDefinition);
     }
 
     #[test]
@@ -2032,7 +2567,7 @@ mod tests {
 
     #[test]
     fn test_extract_nonexistent_goal() {
-        let trace = ProofTrace::new();
+        let mut trace = ProofTrace::new();
         let goal = Relation::parallel(0, 1, 2, 3);
         assert!(trace.extract_proof(&goal).is_none());
     }
@@ -2137,5 +2672,109 @@ mod tests {
         let derived = Relation::parallel(0, 1, 4, 5);
         let premises = identify_premises(&derived, &RuleName::PerpToParallel, &facts);
         assert_eq!(premises.len(), 2);
+    }
+
+    // --- Shortest proof tests ---
+
+    #[test]
+    fn test_shortest_proof_prefers_direct() {
+        // Setup: A→B→C (2 steps) and A→C directly (1 step)
+        // Shortest proof should pick the direct A→C path
+        let mut trace = ProofTrace::new();
+        let a = Relation::parallel(0, 1, 2, 3);
+        let b = Relation::parallel(0, 1, 4, 5);
+        let c = Relation::parallel(0, 1, 6, 7);
+
+        trace.add_axiom(a.clone());
+        // Indirect path: A→B→C
+        trace.add_derivation(b.clone(), RuleName::TransitiveParallel, vec![a.clone()]);
+        trace.add_derivation(c.clone(), RuleName::TransitiveParallel, vec![b.clone()]);
+        // Direct path: A→C
+        trace.add_derivation(c.clone(), RuleName::PerpToParallel, vec![a.clone()]);
+
+        let proof = trace.extract_proof(&c).unwrap();
+        // Should be [axiom a, derived c] = 2 steps, not 3
+        assert_eq!(proof.len(), 2);
+        assert_eq!(proof[0].fact, a);
+        assert_eq!(proof[1].fact, c);
+    }
+
+    #[test]
+    fn test_shortest_proof_diamond() {
+        // A (axiom) → B and A → C, then B+C → D
+        // This is already optimal — 4 steps. Verify it still works.
+        let mut trace = ProofTrace::new();
+        let a = Relation::congruent(0, 1, 2, 3);
+        let b = Relation::congruent(0, 1, 4, 5);
+        let c = Relation::congruent(0, 1, 6, 7);
+        let d = Relation::congruent(4, 5, 6, 7);
+
+        trace.add_axiom(a.clone());
+        trace.add_derivation(b.clone(), RuleName::TransitiveCongruent, vec![a.clone()]);
+        trace.add_derivation(c.clone(), RuleName::TransitiveCongruent, vec![a.clone()]);
+        trace.add_derivation(d.clone(), RuleName::TransitiveCongruent, vec![b.clone(), c.clone()]);
+
+        let proof = trace.extract_proof(&d).unwrap();
+        assert_eq!(proof.len(), 4); // a, b, c, d
+        assert_eq!(proof.last().unwrap().fact, d);
+    }
+
+    #[test]
+    fn test_all_shortest_proofs_tie() {
+        // Two equal-length paths to goal: A→C via rule1 and B→C via rule2
+        let mut trace = ProofTrace::new();
+        let a = Relation::parallel(0, 1, 2, 3);
+        let b = Relation::parallel(4, 5, 6, 7);
+        let c = Relation::parallel(0, 1, 6, 7);
+
+        trace.add_axiom(a.clone());
+        trace.add_axiom(b.clone());
+        // Two different 1-step derivations of c
+        trace.add_derivation(c.clone(), RuleName::TransitiveParallel, vec![a.clone()]);
+        trace.add_derivation(c.clone(), RuleName::PerpToParallel, vec![b.clone()]);
+
+        let proofs = trace.extract_all_shortest_proofs(&c).unwrap();
+        // Should have 2 proofs, each with 2 steps (1 axiom + 1 derivation)
+        assert!(proofs.len() >= 2, "Expected at least 2 proofs, got {}", proofs.len());
+        for proof in &proofs {
+            assert_eq!(proof.len(), 2);
+            assert_eq!(proof.last().unwrap().fact, c);
+        }
+    }
+
+    #[test]
+    fn test_alternatives_cap() {
+        // Verify MAX_ALTERNATIVES cap
+        let mut trace = ProofTrace::new();
+        let fact = Relation::congruent(0, 1, 2, 3);
+        for i in 0..20u16 {
+            trace.add_derivation(
+                fact.clone(),
+                RuleName::TransitiveCongruent,
+                vec![Relation::congruent(0, 1, i + 10, i + 11)],
+            );
+        }
+        let alts = trace.get_all(&fact).unwrap();
+        assert_eq!(alts.len(), MAX_ALTERNATIVES);
+    }
+
+    #[test]
+    fn test_dedup_same_rule_same_premises() {
+        // Adding the same derivation twice should be deduplicated
+        let mut trace = ProofTrace::new();
+        let fact = Relation::congruent(0, 1, 2, 3);
+        let premise = Relation::congruent(0, 1, 4, 5);
+        trace.add_derivation(fact.clone(), RuleName::TransitiveCongruent, vec![premise.clone()]);
+        trace.add_derivation(fact.clone(), RuleName::TransitiveCongruent, vec![premise.clone()]);
+        let alts = trace.get_all(&fact).unwrap();
+        assert_eq!(alts.len(), 1);
+    }
+
+    #[test]
+    fn test_rulename_all_variants() {
+        let variants = RuleName::all_variants();
+        // Should have all non-Axiom variants
+        assert!(variants.len() >= 50, "Expected >=50 variants, got {}", variants.len());
+        assert!(!variants.contains(&RuleName::Axiom));
     }
 }

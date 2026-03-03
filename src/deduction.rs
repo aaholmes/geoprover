@@ -394,13 +394,23 @@ pub fn saturate_with_trace(state: &mut ProofState) -> (bool, ProofTrace) {
         // Add facts to state and record derivations with eagerly-resolved premises.
         // We resolve against state.facts BEFORE inserting new facts from this iteration,
         // which prevents circular dependencies (a derived fact can't be its own premise).
+        // Multiple rules may derive the same fact in one iteration — we record all alternatives.
         let pre_iteration_facts = state.facts.clone();
+        let mut added_this_iter: HashSet<crate::proof_state::Relation> = HashSet::new();
         for (fact, rule) in tagged_facts {
-            if state.add_fact(fact.clone()) {
+            let is_new = if !added_this_iter.contains(&fact) {
+                state.add_fact(fact.clone())
+            } else {
+                false
+            };
+            // Record derivation if the fact was newly added this iteration
+            // (either as the first or as an alternative derivation)
+            if is_new || added_this_iter.contains(&fact) {
                 let premises = crate::proof_trace::identify_premises(
                     &fact, &rule, &pre_iteration_facts,
                 );
-                trace.add_derivation(fact, rule, premises);
+                trace.add_derivation(fact.clone(), rule, premises);
+                added_this_iter.insert(fact);
             }
         }
 
