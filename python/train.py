@@ -242,10 +242,15 @@ def _parse_construction_text(text: str) -> tuple[str | None, list[int]]:
 class SummarizerDataset(Dataset):
     """PyTorch dataset for Summarizer training.
 
-    Each item returns:
+    Each item is one *problem* (not one fact), returning all deduced facts at once:
       - context_ids: (L_ctx,) token IDs for initial facts + goal
-      - fact_ids: (L_fact,) token IDs for one deduced fact
-      - label: 1.0 if on proof path, 0.0 otherwise
+      - fact_ids: (N_facts, L_fact) token IDs for all deduced facts
+      - labels: (N_facts,) 1.0 if on proof path, 0.0 otherwise
+
+    This allows the training loop to encode the context once per problem
+    and score all facts against it, avoiding redundant context encoding.
+
+    With augment=True, applies label permutation + fact shuffling per epoch.
     """
 
     def __init__(
@@ -253,23 +258,38 @@ class SummarizerDataset(Dataset):
         samples: list[SummarizerSample],
         context_max_len: int = SUMMARIZER_MAX_SEQ_LEN,
         fact_max_len: int = 32,
+        augment: bool = False,
+        epoch: int = 0,
     ):
-        # Flatten: one (context, fact, label) per deduced fact
-        self.items: list[tuple[list[str], str | None, str, float]] = []
-        for s in samples:
-            for fact, label in zip(s.deduced_facts, s.labels):
-                self.items.append((s.initial_facts, s.goal_text, fact, label))
+        self.samples = samples
         self.context_max_len = context_max_len
         self.fact_max_len = fact_max_len
+        self.augment = augment
+        self.epoch = epoch
 
     def __len__(self) -> int:
-        return len(self.items)
+        return len(self.samples)
 
     def __getitem__(self, idx: int):
-        initial_facts, goal_text, fact, label = self.items[idx]
+        s = self.samples[idx]
+        initial_facts = list(s.initial_facts)
+        goal_text = s.goal_text
+        deduced_facts = list(s.deduced_facts)
+        labels = list(s.labels)
+
+        if self.augment:
+            perm = make_augmentation_perm(self.epoch, idx, len(self.samples))
+            initial_facts = [permute_text(f, perm) for f in initial_facts]
+            if goal_text:
+                goal_text = permute_text(goal_text, perm)
+            deduced_facts = [permute_text(f, perm) for f in deduced_facts]
+            # Shuffle initial facts order
+            rng = random.Random(self.epoch * len(self.samples) + idx)
+            rng.shuffle(initial_facts)
+
         ctx_ids = build_context_tokens(initial_facts, goal_text, self.context_max_len)
-        fact_ids = build_fact_tokens([fact], self.fact_max_len).squeeze(0)
-        return ctx_ids, fact_ids, torch.tensor(label, dtype=torch.float32)
+        fact_ids = build_fact_tokens(deduced_facts, self.fact_max_len)
+        return ctx_ids, fact_ids, torch.tensor(labels, dtype=torch.float32)
 
 
 def train_summarizer(
@@ -280,17 +300,23 @@ def train_summarizer(
     lr: float = 1e-3,
     device: str = "cpu",
     checkpoint_dir: str = DEFAULT_CHECKPOINT_DIR,
+    augment: bool = True,
 ) -> FactSummarizer:
-    """Train the Summarizer on proof trace labels with BCE loss."""
-    dataset = SummarizerDataset(samples)
-    print(f"  Summarizer dataset: {len(dataset)} fact-level examples "
-          f"from {len(samples)} problems")
+    """Train the Summarizer on proof trace labels with BCE loss.
+
+    Each problem's context is encoded once; all its deduced facts are scored
+    against that single context encoding. Facts from multiple problems are
+    accumulated into mini-batches of ~batch_size fact-level examples.
+    """
+    dataset = SummarizerDataset(samples, augment=augment)
+    total_facts = sum(len(s.deduced_facts) for s in samples)
+    print(f"  Summarizer dataset: {len(dataset)} problems, {total_facts} fact-level examples "
+          f"(augment={augment})")
 
     if len(dataset) == 0:
         print("  No training data, skipping Summarizer training")
         return summarizer
 
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
     optimizer = torch.optim.Adam(summarizer.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=num_epochs, eta_min=lr * 0.01,
@@ -298,32 +324,61 @@ def train_summarizer(
 
     summarizer.to(device)
     for epoch in range(num_epochs):
+        dataset.epoch = epoch
         summarizer.train()
         total_loss = 0.0
         total_correct = 0
         total_items = 0
-        n_batches = 0
+        n_steps = 0
 
-        for ctx_ids, fact_ids, labels in loader:
-            ctx_ids = ctx_ids.to(device)
-            fact_ids = fact_ids.to(device)
-            labels = labels.to(device)
+        # Shuffle problem order each epoch
+        indices = list(range(len(dataset)))
+        random.Random(epoch).shuffle(indices)
 
-            optimizer.zero_grad()
-            scores = summarizer.score_facts(ctx_ids, fact_ids)
+        # Process per-problem: encode context ONCE, score all facts against it.
+        # Accumulate gradients across problems, step every ~batch_size facts.
+        optimizer.zero_grad()
+        acc_facts_since_step = 0
+
+        for problem_idx in indices:
+            ctx_ids, fact_ids, labels = dataset[problem_idx]
+            # ctx_ids: (L_ctx,), fact_ids: (N_facts, L_fact), labels: (N_facts,)
+            n_facts = fact_ids.shape[0]
+            if n_facts == 0:
+                continue
+
+            ctx_ids = ctx_ids.unsqueeze(0).to(device)  # (1, L_ctx)
+            fact_ids = fact_ids.to(device)              # (N_facts, L_fact)
+            labels = labels.to(device)                  # (N_facts,)
+
+            # NNUE trick: encode context once (1, d), score all N facts
+            scores = summarizer.score_facts(ctx_ids, fact_ids)  # (N_facts,)
             loss = F.binary_cross_entropy_with_logits(scores, labels)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(summarizer.parameters(), max_norm=1.0)
-            optimizer.step()
+            # Scale loss by number of facts so gradient magnitude is consistent
+            (loss * n_facts / batch_size).backward()
 
-            total_loss += loss.item()
+            total_loss += loss.item() * n_facts
             preds = (scores > 0).float()
             total_correct += (preds == labels).sum().item()
-            total_items += labels.numel()
-            n_batches += 1
+            total_items += n_facts
+            acc_facts_since_step += n_facts
+
+            if acc_facts_since_step >= batch_size:
+                torch.nn.utils.clip_grad_norm_(summarizer.parameters(), max_norm=1.0)
+                optimizer.step()
+                optimizer.zero_grad()
+                acc_facts_since_step = 0
+                n_steps += 1
+
+        # Flush remaining gradients
+        if acc_facts_since_step > 0:
+            torch.nn.utils.clip_grad_norm_(summarizer.parameters(), max_norm=1.0)
+            optimizer.step()
+            optimizer.zero_grad()
+            n_steps += 1
 
         scheduler.step()
-        avg_loss = total_loss / max(n_batches, 1)
+        avg_loss = total_loss / max(total_items, 1)
         accuracy = total_correct / max(total_items, 1)
         print(f"  Summarizer epoch {epoch+1}/{num_epochs}: "
               f"loss={avg_loss:.4f} acc={accuracy:.3f}")

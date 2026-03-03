@@ -93,6 +93,7 @@ def _get_state_text(
     config: MctsConfig,
     summarizer: FactSummarizer | None,
     pre_facts: set[str] | None,
+    num_constructions: int,
     device: str,
 ) -> str:
     """Get state text, optionally filtering deduced facts through the Summarizer."""
@@ -108,12 +109,10 @@ def _get_state_text(
 
     goal_text = state.goal_as_text()
     k = config.summarizer_k
-    if k is None:
-        k = len(initial_facts) + 1
 
     filtered = filter_facts(
         summarizer, initial_facts, deduced_facts, goal_text,
-        k=k, device=device,
+        num_constructions=num_constructions, k=k, device=device,
     )
     return build_summarized_text(initial_facts, filtered, goal_text)
 
@@ -166,7 +165,7 @@ def _expand(
     constructions = constructions[:config.max_children]
 
     # Encode state as text (with optional Summarizer filtering)
-    state_text = _get_state_text(node.state, config, summarizer, node.pre_facts, device)
+    state_text = _get_state_text(node.state, config, summarizer, node.pre_facts, node.depth, device)
     token_ids = tokenize_and_pad(state_text, max_len=config.max_seq_len).to(device)
     mask = build_valid_mask(constructions, device=device).unsqueeze(0)
 
@@ -213,7 +212,7 @@ def _evaluate(
         return 1.0
 
     # Encode state as text (with optional Summarizer filtering)
-    state_text = _get_state_text(node.state, config, summarizer, node.pre_facts, device)
+    state_text = _get_state_text(node.state, config, summarizer, node.pre_facts, node.depth, device)
     token_ids = tokenize_and_pad(state_text, max_len=config.max_seq_len).to(device)
 
     model.eval()

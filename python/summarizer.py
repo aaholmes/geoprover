@@ -336,6 +336,7 @@ def filter_facts(
     initial_facts: list[str],
     deduced_facts: list[str],
     goal_text: str | None,
+    num_constructions: int = 0,
     k: int | None = None,
     device: str = "cpu",
     fact_max_len: int = 32,
@@ -348,7 +349,8 @@ def filter_facts(
         initial_facts: pre-saturation fact texts
         deduced_facts: post-saturation minus pre-saturation fact texts
         goal_text: goal as text
-        k: number of facts to keep (default: len(initial_facts) + 1)
+        num_constructions: number of auxiliary constructions applied so far
+        k: number of facts to keep (default: |initial| + |constructions| + 1)
         device: torch device
         fact_max_len: max tokens per fact
         context_max_len: max tokens for context
@@ -360,7 +362,7 @@ def filter_facts(
         return []
 
     if k is None:
-        k = len(initial_facts) + 1
+        k = len(initial_facts) + num_constructions + 1
     k = min(k, len(deduced_facts))
 
     summarizer.eval()
