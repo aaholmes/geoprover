@@ -121,41 +121,44 @@ Rust extension module (MCTS, deduction engine, state encoding, synthetic data)
 **SetGeoTransformerV2** (`--model-type set_v2`, ~4.0M params) — 3-way attention with deferred saturation:
 
 ```
-                    ┌─────────────────────────────────────────────┐
-                    │           Stage 1: Per-Statement Encoding   │
-                    │         (shared 2-layer transformer)        │
-                    │         intra-fact positional embeddings     │
-                    └──────┬──────────────┬──────────────┬────────┘
-                           │              │              │
-                    fact [CLS] embs  goal [CLS] emb  constr full seq
-                     (N, 256)         (1, 256)        (L_c, 256)
-                     CACHED/node      CACHED/root      per candidate
-                           │              │              │
-                           │    ┌─────────┴──────────────┴────────┐
-                           │    │  Stage 2: Goal-Construction     │
-                           │    │  Fusion (2-layer cross-attn)    │
-                           │    │  goal attends to constr tokens  │
-                           │    └─────────────┬───────────────────┘
-                           │                  │
-                           │            joint_query
-                           │             (1, 256)
-                           │         ┌────────┴────────┐
-                           │         │                 │(goal_emb, no fusion)
-                    ┌──────┴─────────┴──┐  ┌───────────┴───────────┐
-                    │ Stage 3a: Policy  │  │ Stage 3b: Value       │
-                    │ (2-layer xattn)   │  │ (2-layer xattn)       │
-                    │ joint_q → facts   │  │ raw goal → facts      │
-                    │ O(N)/construction │  │ O(N), no construction  │
-                    └─────────┬─────────┘  └───────────┬───────────┘
-                              │                        │
-                        state_repr               value_repr
-                         (1, 256)                 (1, 256)
-                              │                        │
-                      ┌───────┴──┐             ┌───────┴──┐
-                      │  Policy  │             │  Value   │
-                      │ Linear→1 │             │  FC→sig  │
-                      │ (scalar) │             │  [0, 1]  │
-                      └──────────┘             └──────────┘
+  VALUE HEAD                              POLICY HEAD
+  "How close are we to the goal?"         "Is this construction useful?"
+
+  fact [CLS] embs    goal [CLS] emb      fact [CLS] embs    goal [CLS] emb    constr tokens
+   (N, 256)           (1, 256)             (N, 256)           (1, 256)          (L_c, 256)
+   CACHED/node        CACHED/root          CACHED/node        CACHED/root       per candidate
+        │                  │                    │                  │                 │
+        │     ┌────────────┘                    │                  └────────┐        │
+        │     │                                 │               ┌──────────┴────────┴──┐
+        │     │                                 │               │  Stage 2: Fusion     │
+        │     │                                 │               │  (2-layer xattn)     │
+        │     │                                 │               │  goal attends to     │
+        │     │                                 │               │  construction tokens │
+        │     │                                 │               └──────────┬───────────┘
+        │     │                                 │                    joint_query
+        │     │                                 │                     (1, 256)
+        │     │                                 │                          │
+   ┌────┴─────┴────────────┐             ┌──────┴──────────────────────────┴──┐
+   │  Stage 3b: Value      │             │  Stage 3a: Policy                 │
+   │  (2-layer xattn)      │             │  (2-layer xattn)                  │
+   │  Q: goal_emb          │             │  Q: joint_query                   │
+   │  KV: fact embeddings  │             │  KV: fact embeddings              │
+   └───────────┬───────────┘             └────────────────┬──────────────────┘
+               │                                          │
+         value_repr                                 state_repr
+          (1, 256)                                   (1, 256)
+               │                                          │
+       ┌──────────────┐                           ┌──────────────┐
+       │    Value     │                           │    Policy    │
+       │ Linear(128)  │                           │  Linear(1)   │
+       │ ReLU         │                           │  → scalar    │
+       │ Linear(1)    │                           │   logit      │
+       │ → sigmoid    │                           └──────────────┘
+       │   [0, 1]     │
+       └──────────────┘
+
+  Stage 1 (shared): All inputs encoded by the same 2-layer transformer.
+  Fact and goal embeddings are cached; only construction encoding is per-candidate.
 ```
 
 Key properties:
@@ -166,45 +169,7 @@ Key properties:
 - **Per-construction policy**: Each construction gets a scalar logit (no fixed 2048-slot index space)
 - **Permutation invariant**: Same Stage 1 encoding as V1, no inter-fact positional embeddings
 
-**SetGeoTransformerV1** (`--model-type set`, ~3.9M params) — set-equivariant with fact self-attention:
-
-```
-                    ┌─────────────────────────────────────────────┐
-                    │           Stage 1: Per-Statement Encoding   │
-                    │         (shared 2-layer transformer)        │
-                    │         intra-fact positional embeddings     │
-                    └──────────────┬──────────────────┬───────────┘
-                                   │                  │
-                         fact [CLS] embs        goal [CLS] emb
-                          (B, N, 256)             (B, 1, 256)
-                                   │                  │
-                    ┌──────────────┴──────────────┐   │
-                    │  Stage 2: Fact Self-Attention│   │
-                    │  (2-layer transformer)       │   │
-                    │  NO positional embeddings    │   │
-                    │  → permutation equivariant   │   │
-                    └──────────────┬───────────────┘   │
-                                   │                   │
-                         enriched facts          goal query
-                          (B, N, 256)           (B, 1, 256)
-                                   │                   │
-                    ┌──────────────┴───────────────────┴──────────┐
-                    │    Stage 3: Goal-Conditioned Aggregation    │
-                    │    (2-layer cross-attention: goal → facts)  │
-                    │    + mean-pool residual                     │
-                    └──────────────────────┬──────────────────────┘
-                                           │
-                                     state_repr
-                                      (B, 256)
-                                      ┌────┴────┐
-                              ┌───────┴──┐  ┌───┴────────┐
-                              │  Value   │  │   Policy   │
-                              │  FC→sig  │  │  FC→2048   │
-                              │  [0, 1]  │  │  logits    │
-                              └──────────┘  └────────────┘
-```
-
-V1 has O(N²) fact-to-fact self-attention in Stage 2, which limits scalability for large post-saturation fact sets.
+**SetGeoTransformerV1** (`--model-type set`, ~3.9M params) — set-equivariant with O(N²) fact self-attention. Superseded by V2. See DESIGN_DECISIONS.md for architecture diagram.
 
 **GeoTransformer** (`--model-type transformer`, ~4M params) — the original flat-sequence model:
 - Input: tokenized text sequence (proof state as relation list + goal)

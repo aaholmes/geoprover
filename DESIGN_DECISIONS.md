@@ -144,7 +144,45 @@ The GeoTransformer solved the point-labeling sensitivity of the CNN, but introdu
 
 ### Architecture: facts as a permutable set (V1)
 
-The SetGeoTransformerV1 treats the proof state as a **set of statements** with a distinguished **goal element**, achieving permutation invariance by construction. See the architecture diagram in README.md.
+The SetGeoTransformerV1 treats the proof state as a **set of statements** with a distinguished **goal element**, achieving permutation invariance by construction:
+
+```
+                    ┌─────────────────────────────────────────────┐
+                    │           Stage 1: Per-Statement Encoding   │
+                    │         (shared 2-layer transformer)        │
+                    │         intra-fact positional embeddings     │
+                    └──────────────┬──────────────────┬───────────┘
+                                   │                  │
+                         fact [CLS] embs        goal [CLS] emb
+                          (B, N, 256)             (B, 1, 256)
+                                   │                  │
+                    ┌──────────────┴──────────────┐   │
+                    │  Stage 2: Fact Self-Attention│   │
+                    │  (2-layer transformer)       │   │
+                    │  NO positional embeddings    │   │
+                    │  → permutation equivariant   │   │
+                    └──────────────┬───────────────┘   │
+                                   │                   │
+                         enriched facts          goal query
+                          (B, N, 256)           (B, 1, 256)
+                                   │                   │
+                    ┌──────────────┴───────────────────┴──────────┐
+                    │    Stage 3: Goal-Conditioned Aggregation    │
+                    │    (2-layer cross-attention: goal → facts)  │
+                    │    + mean-pool residual                     │
+                    └──────────────────────┬──────────────────────┘
+                                           │
+                                     state_repr
+                                      (B, 256)
+                                    ┌──────┴──────┐
+                            ┌───────┴──────┐  ┌───┴──────────┐
+                            │    Value     │  │    Policy    │
+                            │ Linear(128)  │  │ Linear(256)  │
+                            │ ReLU         │  │ ReLU         │
+                            │ Linear(1)    │  │ Linear(2048) │
+                            │ → sigmoid    │  │ → logits     │
+                            └──────────────┘  └──────────────┘
+```
 
 **Stage 1 (Per-Statement Encoding)**: Each fact (e.g., `"coll a b c"`) and the goal are independently tokenized into short sequences (max 16 tokens) and encoded through a shared 2-layer transformer. Positional embeddings exist *within* each statement — distinguishing keyword from arguments — but NOT *between* statements. The [CLS] token of each statement becomes its embedding.
 
