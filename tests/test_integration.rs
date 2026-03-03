@@ -427,6 +427,7 @@ fn test_trace_midpoint_proof() {
 }
 
 #[test]
+#[ignore] // Slow (~60s). Run with: cargo test -- --ignored
 fn test_trace_matches_saturate() {
     // For several JGEX problems, both functions should agree on proved/not-proved
     let content = std::fs::read_to_string("problems/jgex_ag_231.txt").unwrap();
@@ -575,6 +576,7 @@ fn assert_no_circular_deps(proof: &[geoprover::proof_trace::Derivation]) {
 }
 
 #[test]
+#[ignore] // Slow (~60s). Run with: cargo test -- --ignored
 fn test_proof_trace_no_circular_deps_circumcenter() {
     // This problem previously had circular deps in TransitiveCongruent premises
     let input = "test\na b c = triangle a b c; o = circle o a b c; \

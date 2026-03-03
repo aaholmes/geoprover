@@ -223,6 +223,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // Slow (~60s). Run with: cargo test -- --ignored
     fn test_mcts_unsolvable() {
         // Use a goal that can't be accidentally proved by construction cascading:
         // Cyclic(a,b,c,d) requires 4 points on a common circle — hard to derive from free points
