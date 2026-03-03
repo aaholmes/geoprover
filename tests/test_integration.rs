@@ -1,7 +1,9 @@
+use std::collections::HashSet;
 use geoprover::parser::parse_problem;
 use geoprover::deduction::{saturate, saturate_with_trace};
 use geoprover::construction::{generate_constructions, apply_construction};
 use geoprover::mcts::{mcts_search, MctsConfig};
+use geoprover::proof_trace::RuleName;
 
 // ============================
 // Level 1 — saturate() alone
@@ -535,4 +537,148 @@ fn test_trace_transitive_parallel() {
     let formatted = trace.format_proof(goal, &state).unwrap();
     println!("{}", formatted);
     assert!(formatted.contains("TransitiveParallel"));
+}
+
+// ============================
+// Proof trace: no circular deps
+// ============================
+
+/// Helper: check that no fact in the proof depends on itself (directly or transitively).
+fn assert_no_circular_deps(proof: &[geoprover::proof_trace::Derivation]) {
+    // Build dependency graph: fact -> set of premise facts
+    let fact_set: HashSet<_> = proof.iter().map(|d| &d.fact).collect();
+    for d in proof {
+        if d.rule == RuleName::Axiom {
+            assert!(d.premises.is_empty(), "Axiom {:?} should have no premises", d.fact);
+            continue;
+        }
+        // No self-referencing: a fact should not be its own premise
+        assert!(
+            !d.premises.contains(&d.fact),
+            "Self-reference: {:?} lists itself as a premise (rule: {:?})",
+            d.fact, d.rule,
+        );
+        // All premises should appear earlier in the proof (topological order)
+        let my_pos = proof.iter().position(|x| x.fact == d.fact).unwrap();
+        for premise in &d.premises {
+            if let Some(prem_pos) = proof.iter().position(|x| &x.fact == premise) {
+                assert!(
+                    prem_pos < my_pos,
+                    "Circular dep: {:?} (pos {}) depends on {:?} (pos {})",
+                    d.fact, my_pos, premise, prem_pos,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_proof_trace_no_circular_deps_circumcenter() {
+    // This problem previously had circular deps in TransitiveCongruent premises
+    let input = "test\na b c = triangle a b c; o = circle o a b c; \
+        h = midpoint h c b; d = on_line d o h, on_line d a b; \
+        e = on_tline e c c o, on_tline e a a o ? cyclic a o e d";
+    let mut state = parse_problem(input).unwrap();
+    let (proved, trace) = saturate_with_trace(&mut state);
+    assert!(proved, "Problem should be solved by deduction");
+
+    let goal = state.goal.as_ref().unwrap();
+    let proof = trace.extract_proof(goal).unwrap();
+    println!("Proof steps: {}", proof.len());
+    for (i, d) in proof.iter().enumerate() {
+        let prem_strs: Vec<String> = d.premises.iter().map(|p| format!("{:?}", p)).collect();
+        println!("  {}: {:?} [{:?}] from {:?}", i + 1, d.fact, d.rule,
+                 prem_strs.join(", "));
+    }
+    assert_no_circular_deps(&proof);
+}
+
+#[test]
+fn test_proof_trace_no_circular_deps_isquare() {
+    // The E061-65 problem that showed circular TransitiveCongruent deps
+    let input = "test\na b c d = isquare a b c d; \
+        e = s_angle c d e 15, s_angle d c e -15; \
+        f = reflect f e a c ? contri e a b a b e";
+    let mut state = parse_problem(input).unwrap();
+    let (proved, trace) = saturate_with_trace(&mut state);
+    assert!(proved, "Problem should be solved by deduction");
+
+    let goal = state.goal.as_ref().unwrap();
+    let proof = trace.extract_proof(goal).unwrap();
+    println!("Proof steps: {}", proof.len());
+    for (i, d) in proof.iter().enumerate() {
+        println!("  {}: {:?} [{:?}]", i + 1, d.fact, d.rule);
+    }
+    assert_no_circular_deps(&proof);
+}
+
+#[test]
+fn test_proof_trace_no_circular_deps_angle_bisector() {
+    // Circumcenter + angle bisector problem
+    let input = "test\na b c = triangle a b c; d = circumcenter d a c b; \
+        e = on_line e b c; \
+        f = on_circle f d a, angle_bisector f a c e ? cong a f f b";
+    let mut state = parse_problem(input).unwrap();
+    let (proved, trace) = saturate_with_trace(&mut state);
+    assert!(proved, "Problem should be solved by deduction");
+
+    let goal = state.goal.as_ref().unwrap();
+    let proof = trace.extract_proof(goal).unwrap();
+    println!("Proof steps: {}", proof.len());
+    for (i, d) in proof.iter().enumerate() {
+        println!("  {}: {:?} [{:?}]", i + 1, d.fact, d.rule);
+    }
+    assert_no_circular_deps(&proof);
+}
+
+#[test]
+fn test_proof_path_subset_of_deduced() {
+    // Verify that proof path facts are a subset of post-saturation facts
+    let input = "test\na b c = triangle a b c; d = circumcenter d a c b; \
+        e = on_line e b c; \
+        f = on_circle f d a, angle_bisector f a c e ? cong a f f b";
+    let mut state = parse_problem(input).unwrap();
+    let pre_facts: HashSet<_> = state.facts.iter().cloned().collect();
+    let (proved, trace) = saturate_with_trace(&mut state);
+    assert!(proved);
+
+    let goal = state.goal.as_ref().unwrap();
+    let proof = trace.extract_proof(goal).unwrap();
+    let post_facts: HashSet<_> = state.facts.iter().cloned().collect();
+    let deduced: HashSet<_> = post_facts.difference(&pre_facts).cloned().collect();
+
+    for d in &proof {
+        if d.rule != RuleName::Axiom {
+            assert!(
+                post_facts.contains(&d.fact),
+                "Proof step {:?} not in post-saturation facts",
+                d.fact,
+            );
+        }
+    }
+}
+
+#[test]
+fn test_proof_premises_exist_in_proof() {
+    // Every premise of a proof step should also be in the proof
+    let input = "test\na b c = triangle a b c; d = circumcenter d a c b; \
+        e = on_line e b c; \
+        f = on_circle f d a, angle_bisector f a c e ? cong a f f b";
+    let mut state = parse_problem(input).unwrap();
+    let (proved, trace) = saturate_with_trace(&mut state);
+    assert!(proved);
+
+    let goal = state.goal.as_ref().unwrap();
+    let proof = trace.extract_proof(goal).unwrap();
+    let proof_facts: HashSet<_> = proof.iter().map(|d| &d.fact).collect();
+
+    for d in &proof {
+        for premise in &d.premises {
+            assert!(
+                proof_facts.contains(premise),
+                "Premise {:?} of step {:?} [{:?}] not found in proof",
+                premise, d.fact, d.rule,
+            );
+        }
+    }
 }

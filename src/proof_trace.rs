@@ -200,32 +200,122 @@ impl ProofTrace {
             }
         }
 
-        // Topological sort: axioms first, then derived facts in dependency order
+        // Topological sort with cycle breaking
+        self.topological_sort_with_cycle_breaking(&mut resolved)
+    }
+
+    /// Topological sort that breaks cycles by re-resolving premises.
+    /// When a cycle is detected, we try to re-resolve premises for ALL cycle
+    /// participants at once, excluding cycle-creating dependencies.
+    fn topological_sort_with_cycle_breaking(
+        &self,
+        resolved: &mut HashMap<Relation, Derivation>,
+    ) -> Option<Vec<Derivation>> {
         let mut result: Vec<Derivation> = Vec::new();
         let mut emitted: HashSet<Relation> = HashSet::new();
 
         let mut remaining: Vec<Relation> = resolved.keys().cloned().collect();
-        let max_iters = remaining.len() * remaining.len() + 1;
-        let mut iter_count = 0;
+        let max_outer_iters = 20;
+        let mut outer_iter = 0;
 
-        while !remaining.is_empty() && iter_count < max_iters {
-            iter_count += 1;
-            let mut progress = false;
+        loop {
+            // Standard topological sort pass
+            let mut made_progress = true;
+            while made_progress {
+                made_progress = false;
+                remaining.retain(|fact| {
+                    if let Some(deriv) = resolved.get(fact) {
+                        if deriv.premises.iter().all(|p| emitted.contains(p)) {
+                            result.push(deriv.clone());
+                            emitted.insert(fact.clone());
+                            made_progress = true;
+                            return false;
+                        }
+                    }
+                    true
+                });
+            }
 
-            remaining.retain(|fact| {
-                if let Some(deriv) = resolved.get(fact) {
-                    if deriv.premises.iter().all(|p| emitted.contains(p)) {
+            if remaining.is_empty() {
+                break;
+            }
+
+            outer_iter += 1;
+            if outer_iter > max_outer_iters {
+                // Give up — emit remaining as-is
+                for fact in &remaining {
+                    if let Some(deriv) = resolved.get(fact) {
                         result.push(deriv.clone());
-                        emitted.insert(fact.clone());
-                        progress = true;
-                        return false;
                     }
                 }
-                true
-            });
+                break;
+            }
 
-            if !progress {
-                // Cycle or missing premises — emit remaining as-is
+            // Cycle detected. Try to break ALL cycle edges at once.
+            let remaining_set: HashSet<Relation> = remaining.iter().cloned().collect();
+            let mut broke_any = false;
+
+            // Collect facts to update (can't modify resolved while iterating)
+            let updates: Vec<(Relation, Derivation)> = remaining
+                .iter()
+                .filter_map(|fact| {
+                    let deriv = resolved.get(fact)?;
+                    let has_cycle_premise =
+                        deriv.premises.iter().any(|p| remaining_set.contains(p));
+                    if !has_cycle_premise {
+                        return None;
+                    }
+
+                    // Strategy 1: re-resolve against non-cycle facts
+                    let non_cycle_facts: HashSet<Relation> = self
+                        .all_facts
+                        .iter()
+                        .filter(|f| !remaining_set.contains(f) || *f == fact)
+                        .cloned()
+                        .collect();
+
+                    let alt_premises =
+                        identify_premises(&deriv.fact, &deriv.rule, &non_cycle_facts);
+
+                    if !alt_premises.is_empty()
+                        && alt_premises.iter().all(|p| !remaining_set.contains(p))
+                    {
+                        return Some((
+                            fact.clone(),
+                            Derivation {
+                                fact: deriv.fact.clone(),
+                                rule: deriv.rule.clone(),
+                                premises: alt_premises,
+                            },
+                        ));
+                    }
+
+                    // Strategy 2: drop cyclic premises
+                    let non_cycle_premises: Vec<Relation> = deriv
+                        .premises
+                        .iter()
+                        .filter(|p| !remaining_set.contains(p))
+                        .cloned()
+                        .collect();
+
+                    Some((
+                        fact.clone(),
+                        Derivation {
+                            fact: deriv.fact.clone(),
+                            rule: deriv.rule.clone(),
+                            premises: non_cycle_premises,
+                        },
+                    ))
+                })
+                .collect();
+
+            for (fact, new_deriv) in updates {
+                broke_any = true;
+                resolved.insert(fact, new_deriv);
+            }
+
+            if !broke_any {
+                // No cycles to break — emit remaining as-is
                 for fact in &remaining {
                     if let Some(deriv) = resolved.get(fact) {
                         result.push(deriv.clone());
@@ -728,17 +818,19 @@ pub fn identify_premises(
         }
 
         RuleName::CongruentOncircle => {
-            // Congruent + OnCircle → OnCircle
+            // Congruent(center, p, center, q) → OnCircle(p, center), OnCircle(q, center)
+            // Premise is just the single Congruent fact with a shared endpoint (the center).
             match fact {
                 Relation::OnCircle(p, circ) => {
-                    // Find OnCircle(q, circ) and Congruent(circ,q, circ,p) or similar
                     for f in facts {
-                        if let Relation::OnCircle(q, c2) = f {
-                            if c2 == circ && q != p {
-                                let cong = Relation::congruent(*circ, *q, *circ, *p);
-                                if facts.contains(&cong) {
-                                    return vec![f.clone(), cong];
-                                }
+                        if let Relation::Congruent(a, b, c, d) = f {
+                            // Check all 4 shared-endpoint patterns from the rule
+                            if (a == c && *a == *circ && (*b == *p || *d == *p))
+                                || (a == d && *a == *circ && (*b == *p || *c == *p))
+                                || (b == c && *b == *circ && (*a == *p || *d == *p))
+                                || (b == d && *b == *circ && (*a == *p || *c == *p))
+                            {
+                                return vec![f.clone()];
                             }
                         }
                     }

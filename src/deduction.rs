@@ -391,10 +391,16 @@ pub fn saturate_with_trace(state: &mut ProofState) -> (bool, ProofTrace) {
             tagged_facts = relevant;
         }
 
-        // Add facts to state and record derivations (premises resolved lazily)
+        // Add facts to state and record derivations with eagerly-resolved premises.
+        // We resolve against state.facts BEFORE inserting new facts from this iteration,
+        // which prevents circular dependencies (a derived fact can't be its own premise).
+        let pre_iteration_facts = state.facts.clone();
         for (fact, rule) in tagged_facts {
             if state.add_fact(fact.clone()) {
-                trace.add_derivation(fact, rule, vec![]);
+                let premises = crate::proof_trace::identify_premises(
+                    &fact, &rule, &pre_iteration_facts,
+                );
+                trace.add_derivation(fact, rule, premises);
             }
         }
 
