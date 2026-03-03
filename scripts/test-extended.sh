@@ -7,8 +7,8 @@ echo "=== Rust tests (all, including ignored benchmarks) ==="
 cargo test -- --include-ignored
 
 echo ""
-echo "=== Python NN tests ==="
-python python/test_nn.py
+echo "=== Python NN tests (including slow) ==="
+python python/test_nn.py --include-slow
 
 echo ""
 echo "=== Python bridge tests ==="

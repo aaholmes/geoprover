@@ -7,7 +7,7 @@ echo "=== Rust tests (unit + fast integration) ==="
 cargo test
 
 echo ""
-echo "=== Python NN tests ==="
+echo "=== Python NN tests (fast only) ==="
 python python/test_nn.py
 
 echo ""

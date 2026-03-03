@@ -990,54 +990,60 @@ def test_v2_construction_scoring():
     print("  PASS: v2 construction scoring")
 
 
-if __name__ == "__main__":
-    tests = [
-        test_tokenizer,
-        test_tokenize_and_pad,
-        test_model_architecture,
-        test_forward_pass,
-        test_forward_with_mask,
-        test_predict_single,
-        test_value_range,
-        test_construction_to_index,
-        test_state_to_text,
-        test_construction_to_text,
-        test_synthetic_data,
-        test_integration_with_geoprover,
-        test_training_step,
-        test_supervised_data_small,
-        test_mcts_search_basic,
-        test_synthetic_dataset,
-        test_legacy_cnn,
-        test_permute_text,
-        test_shuffle_facts,
-        test_permute_policy_reconstruction,
-        test_augmentation_deterministic,
-        test_augmented_synthetic_dataset,
-        test_summarizer_architecture,
-        test_summarizer_forward,
-        test_summarizer_training_step,
-        test_summarizer_filter_facts,
-        test_summarizer_data_generation,
-        test_build_summarized_text,
-        # SetGeoTransformer tests
-        test_split_state_text,
-        test_encode_state_as_set,
-        test_set_model_architecture,
-        test_set_forward_pass,
-        test_set_permutation_invariance,
-        test_set_predict_single,
-        test_create_model_factory,
-        test_set_training_step,
-        # SetGeoTransformerV2 tests
-        test_v2_architecture,
-        test_v2_forward_pass,
-        test_v2_permutation_invariance,
-        test_v2_kv_cache_consistency,
-        test_v2_training_step,
-        test_v2_construction_scoring,
-    ]
+# Tests organized by speed.
+# Fast tests run in <2s each, slow tests may take minutes.
+FAST_TESTS = [
+    test_tokenizer,
+    test_tokenize_and_pad,
+    test_model_architecture,
+    test_forward_pass,
+    test_forward_with_mask,
+    test_predict_single,
+    test_value_range,
+    test_construction_to_index,
+    test_state_to_text,
+    test_construction_to_text,
+    test_synthetic_data,
+    test_integration_with_geoprover,
+    test_training_step,
+    test_supervised_data_small,
+    test_mcts_search_basic,
+    test_synthetic_dataset,
+    test_legacy_cnn,
+    test_permute_text,
+    test_shuffle_facts,
+    test_permute_policy_reconstruction,
+    test_augmentation_deterministic,
+    test_augmented_synthetic_dataset,
+    test_summarizer_architecture,
+    test_summarizer_forward,
+    test_summarizer_training_step,
+    test_summarizer_filter_facts,
+    test_build_summarized_text,
+    # SetGeoTransformer tests
+    test_split_state_text,
+    test_encode_state_as_set,
+    test_set_model_architecture,
+    test_set_forward_pass,
+    test_set_permutation_invariance,
+    test_set_predict_single,
+    test_create_model_factory,
+    test_set_training_step,
+    # SetGeoTransformerV2 tests
+    test_v2_architecture,
+    test_v2_forward_pass,
+    test_v2_permutation_invariance,
+    test_v2_kv_cache_consistency,
+    test_v2_training_step,
+    test_v2_construction_scoring,
+]
 
+SLOW_TESTS = [
+    test_summarizer_data_generation,  # ~15 min: saturates complex problem with 8000+ facts
+]
+
+
+def run_tests(tests, label=""):
     passed = 0
     failed = 0
     for test in tests:
@@ -1052,7 +1058,20 @@ if __name__ == "__main__":
             failed += 1
 
     print(f"\n{'=' * 50}")
-    print(f"Results: {passed} passed, {failed} failed out of {len(tests)}")
+    print(f"Results{label}: {passed} passed, {failed} failed out of {len(tests)}")
+    return failed
+
+
+if __name__ == "__main__":
+    include_slow = "--include-slow" in sys.argv
+
+    failed = run_tests(FAST_TESTS)
+
+    if include_slow:
+        print(f"\n{'=' * 50}")
+        print("Running slow tests...")
+        failed += run_tests(SLOW_TESTS, " (slow)")
+
     if failed == 0:
         print("All tests passed!")
     else:
