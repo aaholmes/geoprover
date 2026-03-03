@@ -16,7 +16,7 @@ from dataclasses import asdict, dataclass
 import torch
 
 import geoprover
-from model import GeoNet, GeoTransformer, count_parameters
+from model import GeoNet, GeoTransformer, SetGeoTransformer, count_parameters, create_model
 from orchestrate import MctsConfig, SearchResult, load_problems, solve_problem
 from summarizer import FactSummarizer, count_summarizer_parameters
 from train import load_checkpoint, load_summarizer_checkpoint
@@ -189,6 +189,9 @@ def main():
                         help="Only run deduction evaluation")
     parser.add_argument("--summarizer-checkpoint", default=None,
                         help="Summarizer checkpoint path (enables fact filtering)")
+    parser.add_argument("--model-type", default="transformer",
+                        choices=["set", "transformer"],
+                        help="Model architecture: 'set' for SetGeoTransformer, 'transformer' for GeoTransformer")
     args = parser.parse_args()
 
     device = args.device
@@ -212,14 +215,15 @@ def main():
         return
 
     # 2. MCTS + NN
-    model = GeoTransformer().to(device)
+    model = create_model(args.model_type).to(device)
+    model_name = type(model).__name__
     if args.checkpoint and os.path.exists(args.checkpoint):
         load_checkpoint(model, None, args.checkpoint, device)
         print(f"Loaded model from {args.checkpoint}")
     else:
         print("No checkpoint - using random NN weights (baseline)")
 
-    print(f"GeoTransformer parameters: {count_parameters(model):,}")
+    print(f"{model_name} parameters: {count_parameters(model):,}")
 
     # Load Summarizer if checkpoint provided
     summarizer = None
@@ -237,6 +241,7 @@ def main():
         max_children=args.max_children,
         max_depth=args.max_depth,
         use_summarizer=use_summarizer,
+        model_type=args.model_type,
     )
 
     mode_label = "MCTS + NN + Summarizer" if use_summarizer else "MCTS + NN"

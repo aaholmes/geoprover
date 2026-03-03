@@ -495,6 +495,398 @@ GeoNet = GeoTransformer
 
 
 # ============================================================
+# SetGeoTransformer: set-equivariant architecture
+# ============================================================
+
+# Maximum tokens per fact/goal statement (e.g., "eqangle a b c d e f" = 7 tokens + CLS)
+SET_MAX_TOKENS = 16
+# Maximum number of facts per state
+SET_MAX_FACTS = 256
+
+
+def split_state_text(state_text: str) -> tuple[list[str], str]:
+    """Parse "fact ; fact ; ? goal" format into (list[str], str).
+
+    Returns (fact_texts, goal_text). If no goal marker, goal_text is empty.
+    """
+    if " ; ? " in state_text:
+        facts_part, goal_part = state_text.split(" ; ? ", 1)
+    elif " ? " in state_text:
+        facts_part, goal_part = state_text.split(" ? ", 1)
+    else:
+        return [f.strip() for f in state_text.split(" ; ") if f.strip()], ""
+
+    facts = [f.strip() for f in facts_part.split(" ; ") if f.strip()]
+    return facts, goal_part.strip()
+
+
+def tokenize_statement(text: str, max_tokens: int = SET_MAX_TOKENS) -> list[int]:
+    """Tokenize a single fact/goal statement (no CLS prefix, just tokens + padding)."""
+    ids = [CLS_ID]
+    for token in text.split():
+        if token in TOKEN_TO_ID:
+            ids.append(TOKEN_TO_ID[token])
+    ids = ids[:max_tokens]
+    while len(ids) < max_tokens:
+        ids.append(PAD_ID)
+    return ids
+
+
+def encode_state_as_set(
+    fact_texts: list[str],
+    goal_text: str,
+    max_facts: int = SET_MAX_FACTS,
+    max_tokens: int = SET_MAX_TOKENS,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Encode a proof state as a set of per-fact token sequences.
+
+    Args:
+        fact_texts: list of fact strings (e.g., ["coll a b c", "para a b c d"])
+        goal_text: goal string (e.g., "perp a h b c")
+        max_facts: maximum number of facts (truncate if more)
+        max_tokens: maximum tokens per fact/goal
+
+    Returns:
+        fact_ids: (N, max_tokens) LongTensor of per-fact token IDs
+        goal_ids: (max_tokens,) LongTensor of goal token IDs
+        fact_mask: (N,) BoolTensor, True for real facts, False for padding
+    """
+    facts = fact_texts[:max_facts]
+    n = len(facts)
+
+    # Tokenize each fact
+    fact_id_list = [tokenize_statement(f, max_tokens) for f in facts]
+    if not fact_id_list:
+        # At least one dummy fact to avoid empty tensors
+        fact_id_list = [[PAD_ID] * max_tokens]
+        n = 1
+        fact_mask = torch.zeros(1, dtype=torch.bool)
+    else:
+        fact_mask = torch.ones(n, dtype=torch.bool)
+
+    fact_ids = torch.tensor(fact_id_list, dtype=torch.long)
+    goal_ids = torch.tensor(tokenize_statement(goal_text, max_tokens), dtype=torch.long)
+
+    return fact_ids, goal_ids, fact_mask
+
+
+class CrossAttentionBlock(nn.Module):
+    """Pre-norm cross-attention + FFN block.
+
+    query attends to key/value from a different source.
+    """
+
+    def __init__(self, d_model: int, nhead: int, dim_ff: int, dropout: float = 0.1):
+        super().__init__()
+        self.norm_q = nn.LayerNorm(d_model)
+        self.norm_kv = nn.LayerNorm(d_model)
+        self.cross_attn = nn.MultiheadAttention(
+            d_model, nhead, dropout=dropout, batch_first=True,
+        )
+        self.norm_ff = nn.LayerNorm(d_model)
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, dim_ff),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_ff, d_model),
+            nn.Dropout(dropout),
+        )
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        kv: torch.Tensor,
+        key_padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            query: (B, Nq, D)
+            kv: (B, Nkv, D)
+            key_padding_mask: (B, Nkv) bool, True = ignore
+        """
+        q_normed = self.norm_q(query)
+        kv_normed = self.norm_kv(kv)
+        attn_out, _ = self.cross_attn(
+            q_normed, kv_normed, kv_normed,
+            key_padding_mask=key_padding_mask,
+        )
+        x = query + attn_out
+        x = x + self.ff(self.norm_ff(x))
+        return x
+
+
+class SetGeoTransformer(nn.Module):
+    """Set-equivariant transformer for geometry theorem proving.
+
+    Treats facts as a permutable set with a distinguished goal element.
+    Permutation-invariant by construction (no cross-fact positional embeddings).
+
+    Four stages:
+      1. Per-Statement Encoding: shared 2-layer transformer with intra-fact positions
+      2. Fact-to-Fact Self-Attention: 2-layer transformer, NO positional embeddings
+      3. Goal-Conditioned Aggregation: 2-layer cross-attention (goal queries facts)
+      4. Task Heads: value + policy (same as GeoTransformer)
+    """
+
+    def __init__(
+        self,
+        vocab_size: int = VOCAB_SIZE,
+        d_model: int = 256,
+        nhead: int = 8,
+        dim_feedforward: int = 512,
+        max_tokens: int = SET_MAX_TOKENS,
+        dropout: float = 0.1,
+        policy_size: int = POLICY_SIZE,
+        num_intra_layers: int = 2,
+        num_fact_layers: int = 2,
+        num_cross_layers: int = 2,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.max_tokens = max_tokens
+
+        # Stage 1: Per-statement encoding (shared)
+        self.token_emb = nn.Embedding(vocab_size, d_model, padding_idx=PAD_ID)
+        self.intra_pos_emb = nn.Embedding(max_tokens, d_model)
+        self.intra_norm = nn.LayerNorm(d_model)
+        self.intra_dropout = nn.Dropout(dropout)
+
+        intra_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward,
+            dropout=dropout, batch_first=True, norm_first=True,
+        )
+        self.intra_encoder = nn.TransformerEncoder(intra_layer, num_layers=num_intra_layers)
+
+        # Stage 2: Fact-to-fact self-attention (NO positional embeddings)
+        fact_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward,
+            dropout=dropout, batch_first=True, norm_first=True,
+        )
+        self.fact_encoder = nn.TransformerEncoder(fact_layer, num_layers=num_fact_layers)
+
+        # Stage 3: Goal-conditioned cross-attention
+        self.cross_layers = nn.ModuleList([
+            CrossAttentionBlock(d_model, nhead, dim_feedforward, dropout)
+            for _ in range(num_cross_layers)
+        ])
+        self.state_norm = nn.LayerNorm(d_model)
+
+        # Stage 4: Task heads
+        # Value head
+        self.value_fc1 = nn.Linear(d_model, 128)
+        self.value_fc2 = nn.Linear(128, 1)
+
+        # Fixed-size policy head
+        self.policy_fc1 = nn.Linear(d_model, 256)
+        self.policy_fc2 = nn.Linear(256, policy_size)
+
+        # Dot-product policy head
+        self.state_proj = nn.Linear(d_model, d_model)
+        self.construction_proj = nn.Linear(d_model, d_model)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.normal_(self.token_emb.weight, std=0.02)
+        nn.init.normal_(self.intra_pos_emb.weight, std=0.02)
+        with torch.no_grad():
+            self.token_emb.weight[PAD_ID].zero_()
+
+        for m in [self.value_fc1, self.value_fc2, self.policy_fc1, self.policy_fc2,
+                  self.state_proj, self.construction_proj]:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=0.01)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+    def _encode_statements(self, token_ids: torch.Tensor) -> torch.Tensor:
+        """Encode a batch of statements into [CLS] embeddings.
+
+        Args:
+            token_ids: (M, L) where M is total statements, L is max_tokens
+
+        Returns:
+            cls_embs: (M, d_model)
+        """
+        M, L = token_ids.shape
+        positions = torch.arange(L, device=token_ids.device).unsqueeze(0).expand(M, L)
+        x = self.token_emb(token_ids) + self.intra_pos_emb(positions)
+        x = self.intra_norm(self.intra_dropout(x))
+        padding_mask = (token_ids == PAD_ID)
+        x = self.intra_encoder(x, src_key_padding_mask=padding_mask)
+        return x[:, 0, :]  # [CLS] at position 0
+
+    def encode_state(
+        self,
+        fact_ids: torch.Tensor,
+        goal_ids: torch.Tensor,
+        fact_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Encode a batch of states into state representations.
+
+        Args:
+            fact_ids: (B, N, L) per-fact token IDs
+            goal_ids: (B, L) goal token IDs
+            fact_mask: (B, N) bool, True for real facts
+
+        Returns:
+            state_repr: (B, d_model)
+        """
+        B, N, L = fact_ids.shape
+
+        # Stage 1: encode all facts + goal through shared intra-encoder
+        # Flatten facts for batch encoding — only encode real facts to avoid NaN
+        flat_mask = fact_mask.reshape(B * N)  # (B*N,)
+        flat_facts = fact_ids.reshape(B * N, L)  # (B*N, L)
+
+        # Initialize embeddings to zeros (padding facts stay zero)
+        flat_cls = torch.zeros(B * N, self.d_model, device=fact_ids.device)
+        if flat_mask.any():
+            real_facts = flat_facts[flat_mask]  # (M, L) where M = num real facts
+            real_cls = self._encode_statements(real_facts)  # (M, D)
+            flat_cls[flat_mask] = real_cls
+
+        fact_embs = flat_cls.reshape(B, N, self.d_model)  # (B, N, D)
+
+        goal_cls = self._encode_statements(goal_ids)  # (B, D)
+        goal_emb = goal_cls.unsqueeze(1)  # (B, 1, D)
+
+        # Stage 2: fact-to-fact self-attention (permutation equivariant)
+        # Mask: True = padding (to ignore)
+        fact_pad_mask = ~fact_mask  # (B, N)
+        fact_embs = self.fact_encoder(
+            fact_embs, src_key_padding_mask=fact_pad_mask,
+        )
+
+        # Stage 3: goal-conditioned cross-attention
+        for cross_layer in self.cross_layers:
+            goal_emb = cross_layer(
+                query=goal_emb, kv=fact_embs,
+                key_padding_mask=fact_pad_mask,
+            )
+
+        goal_repr = goal_emb.squeeze(1)  # (B, D)
+
+        # Mean pool over valid facts as residual
+        fact_mask_expanded = fact_mask.unsqueeze(-1).float()  # (B, N, 1)
+        fact_sum = (fact_embs * fact_mask_expanded).sum(dim=1)  # (B, D)
+        fact_count = fact_mask_expanded.sum(dim=1).clamp(min=1)  # (B, 1)
+        mean_facts = fact_sum / fact_count
+
+        state_repr = self.state_norm(goal_repr + mean_facts)
+        return state_repr
+
+    def forward(
+        self,
+        fact_ids: torch.Tensor,
+        goal_ids: torch.Tensor,
+        fact_mask: torch.Tensor,
+        valid_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass with fixed-size policy output.
+
+        Args:
+            fact_ids: (B, N, L) per-fact token IDs
+            goal_ids: (B, L) goal token IDs
+            fact_mask: (B, N) bool, True for real facts
+            valid_mask: (B, POLICY_SIZE) bool mask of valid constructions
+
+        Returns:
+            value: (B,) sigmoid(v_logit) in [0, 1]
+            policy_logits: (B, POLICY_SIZE)
+        """
+        state_repr = self.encode_state(fact_ids, goal_ids, fact_mask)
+
+        # Value head
+        v = F.relu(self.value_fc1(state_repr))
+        value = torch.sigmoid(self.value_fc2(v).squeeze(-1))
+
+        # Policy head
+        p = F.relu(self.policy_fc1(state_repr))
+        policy_logits = self.policy_fc2(p)
+
+        if valid_mask is not None:
+            policy_logits = policy_logits.masked_fill(~valid_mask, float("-inf"))
+
+        return value, policy_logits
+
+    def score_constructions(
+        self,
+        fact_ids: torch.Tensor,
+        goal_ids: torch.Tensor,
+        fact_mask: torch.Tensor,
+        construction_ids_list: list[torch.Tensor],
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """Score candidate constructions via dot-product attention.
+
+        Args:
+            fact_ids: (B, N, L) per-fact token IDs
+            goal_ids: (B, L) goal token IDs
+            fact_mask: (B, N) bool
+            construction_ids_list: list of B tensors, each (N_i, L_constr)
+
+        Returns:
+            value: (B,)
+            scores: list of B tensors, each (N_i,)
+        """
+        state_repr = self.encode_state(fact_ids, goal_ids, fact_mask)
+
+        v = F.relu(self.value_fc1(state_repr))
+        value = torch.sigmoid(self.value_fc2(v).squeeze(-1))
+
+        state_vec = self.state_proj(state_repr)  # (B, D)
+
+        scores = []
+        for i in range(len(construction_ids_list)):
+            constr_ids = construction_ids_list[i]
+            if constr_ids.numel() == 0:
+                scores.append(torch.zeros(0, device=fact_ids.device))
+                continue
+            c_emb = self._encode_statements(constr_ids)
+            c_proj = self.construction_proj(c_emb)
+            s = (state_vec[i].unsqueeze(0) * c_proj).sum(dim=-1)
+            scores.append(s)
+
+        return value, scores
+
+    def predict(
+        self,
+        fact_ids: torch.Tensor,
+        goal_ids: torch.Tensor,
+        fact_mask: torch.Tensor,
+        valid_mask: torch.Tensor | None = None,
+    ) -> tuple[float, torch.Tensor]:
+        """Single-state prediction for inference."""
+        self.eval()
+        with torch.no_grad():
+            value, logits = self.forward(
+                fact_ids.unsqueeze(0),
+                goal_ids.unsqueeze(0),
+                fact_mask.unsqueeze(0),
+                valid_mask.unsqueeze(0) if valid_mask is not None else None,
+            )
+            policy = F.softmax(logits[0], dim=0)
+            return value.item(), policy
+
+
+def create_model(model_type: str = "set", **kwargs) -> nn.Module:
+    """Factory function to create a model by type.
+
+    Args:
+        model_type: "set" for SetGeoTransformer, "transformer" for GeoTransformer
+
+    Returns:
+        Model instance
+    """
+    if model_type == "set":
+        return SetGeoTransformer(**kwargs)
+    elif model_type == "transformer":
+        return GeoTransformer(**kwargs)
+    else:
+        raise ValueError(f"Unknown model type: {model_type}")
+
+
+# ============================================================
 # Utility functions
 # ============================================================
 

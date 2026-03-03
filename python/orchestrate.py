@@ -28,6 +28,8 @@ from model import (
     GeoNet,
     build_valid_mask,
     construction_to_index,
+    encode_state_as_set,
+    split_state_text,
     tokenize_and_pad,
 )
 from summarizer import FactSummarizer, filter_facts, build_summarized_text
@@ -48,6 +50,8 @@ class MctsConfig:
     # Summarizer: if set, filter deduced facts before feeding to GeoTransformer
     use_summarizer: bool = False
     summarizer_k: int | None = None  # None = adaptive (|initial| + |constructions| + 1)
+    # Model type: "set" for SetGeoTransformer, "transformer" for GeoTransformer
+    model_type: str = "transformer"
 
 
 @dataclass
@@ -163,16 +167,27 @@ def _expand(
         return
 
     constructions = constructions[:config.max_children]
-
-    # Encode state as text (with optional Summarizer filtering)
-    state_text = _get_state_text(node.state, config, summarizer, node.pre_facts, node.depth, device)
-    token_ids = tokenize_and_pad(state_text, max_len=config.max_seq_len).to(device)
     mask = build_valid_mask(constructions, device=device).unsqueeze(0)
 
     model.eval()
-    with torch.no_grad():
-        _, logits = model(token_ids.unsqueeze(0), mask)
-        priors = F.softmax(logits[0], dim=0)
+    if config.model_type == "set":
+        fact_texts = list(node.state.facts_as_text_list())
+        goal_text = node.state.goal_as_text()
+        fact_ids, goal_ids, fact_mask = encode_state_as_set(fact_texts, goal_text)
+        with torch.no_grad():
+            _, logits = model(
+                fact_ids.unsqueeze(0).to(device),
+                goal_ids.unsqueeze(0).to(device),
+                fact_mask.unsqueeze(0).to(device),
+                mask,
+            )
+            priors = F.softmax(logits[0], dim=0)
+    else:
+        state_text = _get_state_text(node.state, config, summarizer, node.pre_facts, node.depth, device)
+        token_ids = tokenize_and_pad(state_text, max_len=config.max_seq_len).to(device)
+        with torch.no_grad():
+            _, logits = model(token_ids.unsqueeze(0), mask)
+            priors = F.softmax(logits[0], dim=0)
 
     for c in constructions:
         idx = construction_to_index(c.construction_type(), c.args())
@@ -211,13 +226,22 @@ def _evaluate(
         node.terminal_value = 1.0
         return 1.0
 
-    # Encode state as text (with optional Summarizer filtering)
-    state_text = _get_state_text(node.state, config, summarizer, node.pre_facts, node.depth, device)
-    token_ids = tokenize_and_pad(state_text, max_len=config.max_seq_len).to(device)
-
     model.eval()
-    with torch.no_grad():
-        value, _ = model(token_ids.unsqueeze(0))
+    if config.model_type == "set":
+        fact_texts = list(node.state.facts_as_text_list())
+        goal_text = node.state.goal_as_text()
+        fact_ids, goal_ids, fact_mask = encode_state_as_set(fact_texts, goal_text)
+        with torch.no_grad():
+            value, _ = model(
+                fact_ids.unsqueeze(0).to(device),
+                goal_ids.unsqueeze(0).to(device),
+                fact_mask.unsqueeze(0).to(device),
+            )
+    else:
+        state_text = _get_state_text(node.state, config, summarizer, node.pre_facts, node.depth, device)
+        token_ids = tokenize_and_pad(state_text, max_len=config.max_seq_len).to(device)
+        with torch.no_grad():
+            value, _ = model(token_ids.unsqueeze(0))
 
     return value.item()
 

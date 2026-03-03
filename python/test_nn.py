@@ -13,14 +13,15 @@ sys.path.insert(0, os.path.dirname(__file__))
 import torch
 import geoprover
 from model import (
-    GeoNet, GeoTransformer, GeoNetCNN,
+    GeoNet, GeoTransformer, GeoNetCNN, SetGeoTransformer,
     construction_to_index, tokenize, tokenize_and_pad,
     build_valid_mask, constructions_to_policy_target,
-    count_parameters, POLICY_SIZE, VOCAB_SIZE, MAX_SEQ_LEN,
+    count_parameters, create_model, POLICY_SIZE, VOCAB_SIZE, MAX_SEQ_LEN,
     PAD_ID, CLS_ID, GOAL_ID, SEP_ID,
     CONSTRUCTION_TYPES, TOKEN_TO_ID, POINT_NAMES, POINT_NAME_SET,
     make_augmentation_perm, permute_text, shuffle_facts,
     augment_state_text, permute_point_ids,
+    encode_state_as_set, split_state_text, SET_MAX_TOKENS,
 )
 
 
@@ -545,6 +546,210 @@ def test_build_summarized_text():
     print("  PASS: build summarized text")
 
 
+def test_split_state_text():
+    """Test split_state_text parses facts and goal correctly."""
+    facts, goal = split_state_text("coll a b c ; para a b c d ; ? perp a h b c")
+    assert facts == ["coll a b c", "para a b c d"], f"Facts: {facts}"
+    assert goal == "perp a h b c", f"Goal: {goal}"
+
+    # No goal marker
+    facts2, goal2 = split_state_text("coll a b c ; para a b c d")
+    assert facts2 == ["coll a b c", "para a b c d"]
+    assert goal2 == ""
+
+    # Single fact with goal
+    facts3, goal3 = split_state_text("coll a b c ; ? perp a b c d")
+    assert len(facts3) == 1
+    assert goal3 == "perp a b c d"
+    print("  PASS: split_state_text")
+
+
+def test_encode_state_as_set():
+    """Test encode_state_as_set produces correct shapes."""
+    facts = ["coll a b c", "para a b c d", "cong a b c d"]
+    goal = "perp a h b c"
+    fact_ids, goal_ids, fact_mask = encode_state_as_set(facts, goal)
+
+    assert fact_ids.shape == (3, SET_MAX_TOKENS), f"fact_ids shape: {fact_ids.shape}"
+    assert goal_ids.shape == (SET_MAX_TOKENS,), f"goal_ids shape: {goal_ids.shape}"
+    assert fact_mask.shape == (3,), f"fact_mask shape: {fact_mask.shape}"
+    assert fact_mask.all(), "All facts should be valid"
+    assert fact_ids.dtype == torch.long
+    assert goal_ids.dtype == torch.long
+
+    # Empty facts should produce dummy
+    fact_ids_e, goal_ids_e, fact_mask_e = encode_state_as_set([], goal)
+    assert fact_ids_e.shape[0] == 1, "Should have 1 dummy fact"
+    assert not fact_mask_e[0], "Dummy fact should be masked out"
+    print(f"  fact_ids shape: {fact_ids.shape}")
+    print("  PASS: encode_state_as_set")
+
+
+def test_set_model_architecture():
+    """Test SetGeoTransformer instantiation and parameter count."""
+    model = SetGeoTransformer()
+    params = count_parameters(model)
+    print(f"  SetGeoTransformer parameters: {params:,}")
+    assert 1_000_000 < params < 15_000_000, f"Expected ~3-8M params, got {params:,}"
+    print("  PASS: set model architecture")
+
+
+def test_set_forward_pass():
+    """Test SetGeoTransformer forward pass with variable fact counts."""
+    model = SetGeoTransformer()
+    model.eval()
+
+    # Batch of 2 states with different fact counts (padded to max)
+    facts1 = ["coll a b c", "para a b c d"]
+    facts2 = ["cong a b c d", "perp a c b d", "mid m a b"]
+    goal1 = "perp a h b c"
+    goal2 = "cong a b c d"
+
+    fi1, gi1, fm1 = encode_state_as_set(facts1, goal1)
+    fi2, gi2, fm2 = encode_state_as_set(facts2, goal2)
+
+    # Pad to same N
+    max_n = max(fi1.shape[0], fi2.shape[0])
+    L = fi1.shape[1]
+
+    padded_facts = torch.zeros(2, max_n, L, dtype=torch.long)
+    padded_masks = torch.zeros(2, max_n, dtype=torch.bool)
+
+    padded_facts[0, :fi1.shape[0]] = fi1
+    padded_masks[0, :fi1.shape[0]] = fm1
+    padded_facts[1, :fi2.shape[0]] = fi2
+    padded_masks[1, :fi2.shape[0]] = fm2
+
+    goal_ids = torch.stack([gi1, gi2])
+
+    with torch.no_grad():
+        value, policy = model(padded_facts, goal_ids, padded_masks)
+
+    assert value.shape == (2,), f"value shape: {value.shape}"
+    assert policy.shape == (2, POLICY_SIZE), f"policy shape: {policy.shape}"
+    assert (value >= 0).all() and (value <= 1).all(), f"Value out of [0,1]: {value}"
+    print(f"  value={value[0].item():.4f}, {value[1].item():.4f}")
+    print("  PASS: set forward pass")
+
+
+def test_set_permutation_invariance():
+    """Test that SetGeoTransformer produces same output regardless of fact order."""
+    model = SetGeoTransformer()
+    model.eval()
+
+    facts = ["coll a b c", "para a b c d", "cong a b c d", "perp a c b d"]
+    goal = "eqangle a b c d e f"
+
+    # Order 1: original
+    fi1, gi1, fm1 = encode_state_as_set(facts, goal)
+
+    # Order 2: reversed
+    fi2, gi2, fm2 = encode_state_as_set(list(reversed(facts)), goal)
+
+    # Order 3: shuffled
+    import random
+    rng = random.Random(42)
+    shuffled = list(facts)
+    rng.shuffle(shuffled)
+    fi3, gi3, fm3 = encode_state_as_set(shuffled, goal)
+
+    with torch.no_grad():
+        v1, p1 = model(fi1.unsqueeze(0), gi1.unsqueeze(0), fm1.unsqueeze(0))
+        v2, p2 = model(fi2.unsqueeze(0), gi2.unsqueeze(0), fm2.unsqueeze(0))
+        v3, p3 = model(fi3.unsqueeze(0), gi3.unsqueeze(0), fm3.unsqueeze(0))
+
+    # Values should be identical (permutation invariant)
+    assert abs(v1.item() - v2.item()) < 1e-5, \
+        f"Values differ: {v1.item()} vs {v2.item()}"
+    assert abs(v1.item() - v3.item()) < 1e-5, \
+        f"Values differ: {v1.item()} vs {v3.item()}"
+
+    # Policy logits should be identical
+    assert torch.allclose(p1, p2, atol=1e-4), \
+        f"Policies differ (orig vs reversed): max diff={torch.max(torch.abs(p1 - p2)).item()}"
+    assert torch.allclose(p1, p3, atol=1e-4), \
+        f"Policies differ (orig vs shuffled): max diff={torch.max(torch.abs(p1 - p3)).item()}"
+
+    print(f"  v_orig={v1.item():.6f}, v_rev={v2.item():.6f}, v_shuf={v3.item():.6f}")
+    print(f"  max policy diff (orig vs rev): {torch.max(torch.abs(p1 - p2)).item():.8f}")
+    print("  PASS: set permutation invariance")
+
+
+def test_set_predict_single():
+    """Test SetGeoTransformer single-state prediction."""
+    model = SetGeoTransformer()
+    facts = ["coll a b c", "cong a b c d"]
+    goal = "perp a h b c"
+    fact_ids, goal_ids, fact_mask = encode_state_as_set(facts, goal)
+    mask = torch.zeros(POLICY_SIZE, dtype=torch.bool)
+    mask[[0, 73, 146]] = True
+
+    value, policy = model.predict(fact_ids, goal_ids, fact_mask, mask)
+    assert isinstance(value, float)
+    assert 0.0 <= value <= 1.0
+    assert policy.shape == (POLICY_SIZE,)
+    valid_sum = policy[[0, 73, 146]].sum().item()
+    assert abs(valid_sum - 1.0) < 0.01, f"Policy sum over valid: {valid_sum}"
+    print(f"  value={value:.4f}, policy_sum={valid_sum:.4f}")
+    print("  PASS: set predict single")
+
+
+def test_create_model_factory():
+    """Test create_model factory function."""
+    m1 = create_model("transformer")
+    assert isinstance(m1, GeoTransformer)
+    m2 = create_model("set")
+    assert isinstance(m2, SetGeoTransformer)
+    try:
+        create_model("invalid")
+        assert False, "Should raise ValueError"
+    except ValueError:
+        pass
+    print("  PASS: create_model factory")
+
+
+def test_set_training_step():
+    """Test a single training step with SetGeoTransformer."""
+    from train import compute_set_loss
+    model = SetGeoTransformer()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+    facts = [["coll a b c", "cong a b c d"], ["para a b c d", "perp a c b d"]]
+    goals = ["perp a h b c", "cong a b c d"]
+    B = len(facts)
+
+    # Encode and pad
+    encoded = [encode_state_as_set(f, g) for f, g in zip(facts, goals)]
+    max_n = max(e[0].shape[0] for e in encoded)
+    L = encoded[0][0].shape[1]
+
+    padded_facts = torch.zeros(B, max_n, L, dtype=torch.long)
+    padded_masks = torch.zeros(B, max_n, dtype=torch.bool)
+    for i, (fi, gi, fm) in enumerate(encoded):
+        padded_facts[i, :fi.shape[0]] = fi
+        padded_masks[i, :fi.shape[0]] = fm
+    goal_ids = torch.stack([e[1] for e in encoded])
+
+    policy_targets = torch.zeros(B, POLICY_SIZE)
+    for i in range(B):
+        active = torch.randperm(POLICY_SIZE)[:5]
+        policy_targets[i, active] = torch.rand(5)
+        policy_targets[i] /= policy_targets[i].sum()
+    value_targets = torch.rand(B)
+
+    optimizer.zero_grad()
+    loss, metrics = compute_set_loss(
+        model, padded_facts, goal_ids, padded_masks,
+        policy_targets, value_targets,
+    )
+    loss.backward()
+    optimizer.step()
+
+    assert metrics['loss'] > 0
+    print(f"  Loss: {metrics['loss']:.4f}")
+    print("  PASS: set training step")
+
+
 if __name__ == "__main__":
     tests = [
         test_tokenizer,
@@ -575,6 +780,15 @@ if __name__ == "__main__":
         test_summarizer_filter_facts,
         test_summarizer_data_generation,
         test_build_summarized_text,
+        # SetGeoTransformer tests
+        test_split_state_text,
+        test_encode_state_as_set,
+        test_set_model_architecture,
+        test_set_forward_pass,
+        test_set_permutation_invariance,
+        test_set_predict_single,
+        test_create_model_factory,
+        test_set_training_step,
     ]
 
     passed = 0

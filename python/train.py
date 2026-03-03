@@ -27,15 +27,21 @@ from model import (
     POLICY_SIZE,
     GeoNet,
     GeoTransformer,
+    SetGeoTransformer,
     build_valid_mask,
     construction_to_index,
     count_parameters,
+    create_model,
     tokenize_and_pad,
     augment_state_text,
     permute_text,
     permute_point_ids,
     make_augmentation_perm,
+    encode_state_as_set,
+    split_state_text,
     MAX_SEQ_LEN,
+    SET_MAX_TOKENS,
+    SET_MAX_FACTS,
 )
 from orchestrate import (
     MctsConfig,
@@ -199,6 +205,143 @@ class SyntheticDataset(Dataset):
         return token_ids, policy, value
 
 
+# ============================================================
+# Set-encoding datasets for SetGeoTransformer
+# ============================================================
+
+class SetSyntheticDataset(Dataset):
+    """Dataset from Rust-generated synthetic data for SetGeoTransformer.
+
+    Each example is split into per-fact token sequences instead of one flat sequence.
+    """
+
+    def __init__(
+        self,
+        examples: list[tuple[str, str, str]],
+        max_facts: int = SET_MAX_FACTS,
+        max_tokens: int = SET_MAX_TOKENS,
+        augment: bool = False,
+        epoch: int = 0,
+    ):
+        self.examples = examples
+        self.max_facts = max_facts
+        self.max_tokens = max_tokens
+        self.augment = augment
+        self.epoch = epoch
+
+    def __len__(self) -> int:
+        return len(self.examples)
+
+    def __getitem__(self, idx: int):
+        state_text, construction_text, goal_text = self.examples[idx]
+
+        is_negative = construction_text.startswith("NEG:")
+        clean_construction = construction_text[4:] if is_negative else construction_text
+
+        if self.augment:
+            perm = make_augmentation_perm(self.epoch, idx, len(self.examples))
+            state_text = permute_text(state_text, perm)
+            goal_text = permute_text(goal_text, perm)
+            clean_construction = permute_text(clean_construction, perm)
+
+        # Split state into individual facts
+        facts = [f.strip() for f in state_text.split(" ; ") if f.strip()]
+        if self.augment:
+            rng = random.Random(self.epoch * len(self.examples) + idx)
+            rng.shuffle(facts)
+
+        fact_ids, goal_ids, fact_mask = encode_state_as_set(
+            facts, goal_text, self.max_facts, self.max_tokens,
+        )
+
+        # Policy target
+        policy = torch.zeros(POLICY_SIZE, dtype=torch.float32)
+        if not is_negative:
+            c_type, c_args = _parse_construction_text(clean_construction)
+            if c_type is not None:
+                idx_val = construction_to_index(c_type, c_args)
+                policy[idx_val] = 1.0
+
+        value = torch.tensor(0.0 if is_negative else 1.0, dtype=torch.float32)
+        return fact_ids, goal_ids, fact_mask, policy, value
+
+
+class SetGeometryDataset(Dataset):
+    """PyTorch dataset from TrainingSample for SetGeoTransformer."""
+
+    def __init__(
+        self,
+        samples: list[TrainingSample],
+        max_facts: int = SET_MAX_FACTS,
+        max_tokens: int = SET_MAX_TOKENS,
+        augment: bool = False,
+        epoch: int = 0,
+    ):
+        self.samples = samples
+        self.max_facts = max_facts
+        self.max_tokens = max_tokens
+        self.augment = augment
+        self.epoch = epoch
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int):
+        s = self.samples[idx]
+        state_text = s.state_text
+
+        if self.augment:
+            aug_text, perm = augment_state_text(
+                state_text, self.epoch, idx, len(self.samples)
+            )
+            state_text = aug_text
+
+            if s.policy_constructions is not None:
+                policy = torch.zeros(POLICY_SIZE, dtype=torch.float32)
+                for type_name, args, weight in s.policy_constructions:
+                    new_args = permute_point_ids(args, perm)
+                    new_idx = construction_to_index(type_name, new_args)
+                    policy[new_idx] += weight
+            else:
+                policy = torch.tensor(s.policy_target, dtype=torch.float32)
+        else:
+            policy = torch.tensor(s.policy_target, dtype=torch.float32)
+
+        facts, goal_text = split_state_text(state_text)
+        fact_ids, goal_ids, fact_mask = encode_state_as_set(
+            facts, goal_text, self.max_facts, self.max_tokens,
+        )
+
+        value = torch.tensor(s.value_target, dtype=torch.float32)
+        return fact_ids, goal_ids, fact_mask, policy, value
+
+
+def set_collate_fn(batch):
+    """Custom collate for set-encoding datasets.
+
+    Pads the fact dimension (N) to the max in the batch.
+    """
+    fact_ids_list, goal_ids_list, fact_mask_list, policy_list, value_list = zip(*batch)
+
+    max_n = max(f.shape[0] for f in fact_ids_list)
+    L = fact_ids_list[0].shape[1]
+    B = len(batch)
+
+    padded_facts = torch.zeros(B, max_n, L, dtype=torch.long)
+    padded_masks = torch.zeros(B, max_n, dtype=torch.bool)
+
+    for i, (fi, fm) in enumerate(zip(fact_ids_list, fact_mask_list)):
+        n = fi.shape[0]
+        padded_facts[i, :n] = fi
+        padded_masks[i, :n] = fm
+
+    goal_ids = torch.stack(goal_ids_list)
+    policy = torch.stack(policy_list)
+    value = torch.stack(value_list)
+
+    return padded_facts, goal_ids, padded_masks, policy, value
+
+
 # Map from text keywords to ConstructionType names
 _KEYWORD_TO_TYPE = {
     "mid": "Midpoint",
@@ -264,14 +407,12 @@ class SummarizerDataset(Dataset):
         fact_max_len: int = 32,
         augment: bool = False,
         epoch: int = 0,
-        max_negatives: int = 500,
     ):
         self.samples = samples
         self.context_max_len = context_max_len
         self.fact_max_len = fact_max_len
         self.augment = augment
         self.epoch = epoch
-        self.max_negatives = max_negatives
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -283,16 +424,16 @@ class SummarizerDataset(Dataset):
         deduced_facts = list(s.deduced_facts)
         labels = list(s.labels)
 
-        # Subsample: keep all positives, cap negatives
-        if self.max_negatives > 0:
-            pos_indices = [i for i, l in enumerate(labels) if l > 0.5]
-            neg_indices = [i for i, l in enumerate(labels) if l <= 0.5]
-            if len(neg_indices) > self.max_negatives:
-                rng = random.Random(self.epoch * len(self.samples) + idx)
-                neg_indices = rng.sample(neg_indices, self.max_negatives)
-            keep = sorted(pos_indices + neg_indices)
-            deduced_facts = [deduced_facts[i] for i in keep]
-            labels = [labels[i] for i in keep]
+        # Balanced sampling: keep all positives, cap negatives to 2x positives
+        pos_indices = [i for i, l in enumerate(labels) if l > 0.5]
+        neg_indices = [i for i, l in enumerate(labels) if l <= 0.5]
+        max_neg = max(2 * len(pos_indices), 20)
+        if len(neg_indices) > max_neg:
+            rng = random.Random(self.epoch * len(self.samples) + idx)
+            neg_indices = rng.sample(neg_indices, max_neg)
+        keep = sorted(pos_indices + neg_indices)
+        deduced_facts = [deduced_facts[i] for i in keep]
+        labels = [labels[i] for i in keep]
 
         if self.augment:
             perm = make_augmentation_perm(self.epoch, idx, len(self.samples))
@@ -325,20 +466,18 @@ def train_summarizer(
     against that single context encoding. Facts from multiple problems are
     accumulated into mini-batches of ~batch_size fact-level examples.
     """
-    dataset = SummarizerDataset(samples, augment=augment, max_negatives=500)
+    dataset = SummarizerDataset(samples, augment=augment)
     total_facts = sum(len(s.deduced_facts) for s in samples)
     total_pos = sum(sum(1 for l in s.labels if l > 0.5) for s in samples)
     total_neg = total_facts - total_pos
-    # Compute class weight for capped dataset
-    capped_neg = sum(
-        min(sum(1 for l in s.labels if l <= 0.5), 500)
+    # Estimate balanced dataset size (2:1 neg:pos ratio per problem, min 20 neg)
+    balanced_neg = sum(
+        min(sum(1 for l in s.labels if l <= 0.5),
+            max(2 * sum(1 for l in s.labels if l > 0.5), 20))
         for s in samples
     )
-    pos_weight_val = capped_neg / max(total_pos, 1)
-    pos_weight_val = min(pos_weight_val, 10.0)
-    pos_weight = torch.tensor([pos_weight_val], device=device)
     print(f"  Summarizer dataset: {len(dataset)} problems, {total_facts} total facts "
-          f"(pos={total_pos}, capped_neg={capped_neg}, pos_weight={pos_weight_val:.1f}), "
+          f"(pos={total_pos}, neg={total_neg}, ~{balanced_neg} neg after balancing), "
           f"augment={augment}")
 
     if len(dataset) == 0:
@@ -384,9 +523,7 @@ def train_summarizer(
 
             # NNUE trick: encode context once (1, d), score all N facts
             scores = summarizer.score_facts(ctx_ids, fact_ids)  # (N_facts,)
-            loss = F.binary_cross_entropy_with_logits(
-                scores, labels, pos_weight=pos_weight
-            )
+            loss = F.binary_cross_entropy_with_logits(scores, labels)
             # Scale loss by number of facts so gradient magnitude is consistent
             (loss * n_facts / batch_size).backward()
 
@@ -447,13 +584,13 @@ def load_summarizer_checkpoint(
 
 
 def compute_loss(
-    model: GeoTransformer,
+    model,
     token_ids: torch.Tensor,
     policy_targets: torch.Tensor,
     value_targets: torch.Tensor,
     value_weight: float = DEFAULT_VALUE_WEIGHT,
 ) -> tuple[torch.Tensor, dict]:
-    """Compute combined policy + value loss."""
+    """Compute combined policy + value loss (for GeoTransformer)."""
     value_pred, policy_logits = model(token_ids)
 
     # Policy loss: KL(target || predicted)
@@ -469,6 +606,39 @@ def compute_loss(
     # Value loss: MSE between sigmoid value and target
     value_loss = F.mse_loss(value_pred, value_targets)
 
+    total_loss = policy_loss + value_weight * value_loss
+
+    metrics = {
+        "loss": total_loss.item(),
+        "policy_loss": policy_loss.item(),
+        "value_loss": value_loss.item(),
+        "mean_pred_value": value_pred.mean().item(),
+    }
+    return total_loss, metrics
+
+
+def compute_set_loss(
+    model: SetGeoTransformer,
+    fact_ids: torch.Tensor,
+    goal_ids: torch.Tensor,
+    fact_mask: torch.Tensor,
+    policy_targets: torch.Tensor,
+    value_targets: torch.Tensor,
+    value_weight: float = DEFAULT_VALUE_WEIGHT,
+) -> tuple[torch.Tensor, dict]:
+    """Compute combined policy + value loss (for SetGeoTransformer)."""
+    value_pred, policy_logits = model(fact_ids, goal_ids, fact_mask)
+
+    log_probs = F.log_softmax(policy_logits, dim=1)
+    policy_mask = policy_targets > 0
+    if policy_mask.any():
+        policy_loss = F.kl_div(
+            log_probs, policy_targets, reduction="batchmean", log_target=False
+        )
+    else:
+        policy_loss = torch.tensor(0.0, device=fact_ids.device)
+
+    value_loss = F.mse_loss(value_pred, value_targets)
     total_loss = policy_loss + value_weight * value_loss
 
     metrics = {
@@ -571,12 +741,13 @@ def generate_supervised_data(
 
 
 def train_epoch(
-    model: GeoTransformer,
+    model,
     dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: str,
     value_weight: float = DEFAULT_VALUE_WEIGHT,
     epoch: int = 0,
+    model_type: str = "transformer",
 ) -> dict:
     """Train for one epoch. Returns average metrics."""
     # Update dataset epoch for augmentation
@@ -586,15 +757,33 @@ def train_epoch(
     total_metrics = {}
     n_batches = 0
 
-    for token_ids, policy_targets, value_targets in dataloader:
-        token_ids = token_ids.to(device)
-        policy_targets = policy_targets.to(device)
-        value_targets = value_targets.to(device)
+    is_set = model_type == "set"
 
-        optimizer.zero_grad()
-        loss, metrics = compute_loss(
-            model, token_ids, policy_targets, value_targets, value_weight
-        )
+    for batch in dataloader:
+        if is_set:
+            fact_ids, goal_ids, fact_mask, policy_targets, value_targets = batch
+            fact_ids = fact_ids.to(device)
+            goal_ids = goal_ids.to(device)
+            fact_mask = fact_mask.to(device)
+            policy_targets = policy_targets.to(device)
+            value_targets = value_targets.to(device)
+
+            optimizer.zero_grad()
+            loss, metrics = compute_set_loss(
+                model, fact_ids, goal_ids, fact_mask,
+                policy_targets, value_targets, value_weight,
+            )
+        else:
+            token_ids, policy_targets, value_targets = batch
+            token_ids = token_ids.to(device)
+            policy_targets = policy_targets.to(device)
+            value_targets = value_targets.to(device)
+
+            optimizer.zero_grad()
+            loss, metrics = compute_loss(
+                model, token_ids, policy_targets, value_targets, value_weight
+            )
+
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
@@ -640,7 +829,7 @@ def load_checkpoint(
 
 
 def expert_iteration(
-    model: GeoTransformer,
+    model,
     problems_file: str = DEFAULT_PROBLEMS_FILE,
     num_iterations: int = DEFAULT_NUM_ITERATIONS,
     epochs_per_iter: int = DEFAULT_EPOCHS_PER_ITER,
@@ -656,7 +845,8 @@ def expert_iteration(
     augment: bool = True,
     train_summarizer_flag: bool = False,
     summarizer_epochs: int = 10,
-) -> GeoTransformer:
+    model_type: str = "transformer",
+):
     """Run expert iteration training loop.
 
     0. (Optional) Train Summarizer on proof traces
@@ -738,10 +928,14 @@ def expert_iteration(
     print(f"  Generated {len(synthetic_data)} examples in {elapsed:.1f}s")
 
     if synthetic_data:
-        dataset = SyntheticDataset(synthetic_data, max_seq_len=max_seq_len, augment=augment)
-        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+        if model_type == "set":
+            dataset = SetSyntheticDataset(synthetic_data, augment=augment)
+            loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=set_collate_fn)
+        else:
+            dataset = SyntheticDataset(synthetic_data, max_seq_len=max_seq_len, augment=augment)
+            loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
         for epoch in range(epochs_per_iter * 2):  # more epochs for synthetic
-            metrics = train_epoch(model, loader, optimizer, device, value_weight, epoch=epoch)
+            metrics = train_epoch(model, loader, optimizer, device, value_weight, epoch=epoch, model_type=model_type)
             scheduler.step()
             print(f"  Synthetic epoch {epoch+1}: "
                   f"loss={metrics['loss']:.4f} "
@@ -761,10 +955,14 @@ def expert_iteration(
     )
     if supervised_samples:
         replay.add(supervised_samples)
-        dataset = TextGeometryDataset(supervised_samples, max_seq_len=max_seq_len, augment=augment)
-        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+        if model_type == "set":
+            dataset = SetGeometryDataset(supervised_samples, augment=augment)
+            loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=set_collate_fn)
+        else:
+            dataset = TextGeometryDataset(supervised_samples, max_seq_len=max_seq_len, augment=augment)
+            loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
         for epoch in range(epochs_per_iter):
-            metrics = train_epoch(model, loader, optimizer, device, value_weight, epoch=epoch)
+            metrics = train_epoch(model, loader, optimizer, device, value_weight, epoch=epoch, model_type=model_type)
             scheduler.step()
             print(f"  Supervised epoch {epoch+1}: "
                   f"loss={metrics['loss']:.4f} "
@@ -785,6 +983,7 @@ def expert_iteration(
         max_depth=3,
         max_seq_len=max_seq_len,
         use_summarizer=summarizer is not None,
+        model_type=model_type,
     )
 
     for iteration in range(start_iter, num_iterations):
@@ -798,10 +997,14 @@ def expert_iteration(
 
         if len(replay) >= batch_size:
             train_samples = replay.all()
-            dataset = TextGeometryDataset(train_samples, max_seq_len=max_seq_len, augment=augment)
-            loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+            if model_type == "set":
+                dataset = SetGeometryDataset(train_samples, augment=augment)
+                loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=set_collate_fn)
+            else:
+                dataset = TextGeometryDataset(train_samples, max_seq_len=max_seq_len, augment=augment)
+                loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
             for epoch in range(epochs_per_iter):
-                metrics = train_epoch(model, loader, optimizer, device, value_weight, epoch=epoch)
+                metrics = train_epoch(model, loader, optimizer, device, value_weight, epoch=epoch, model_type=model_type)
                 scheduler.step()
             print(f"  Train: loss={metrics['loss']:.4f} "
                   f"policy={metrics['policy_loss']:.4f} "
@@ -842,6 +1045,9 @@ def main():
                         help="Number of epochs for Summarizer training")
     parser.add_argument("--summarizer-only", action="store_true",
                         help="Only train the Summarizer, skip GeoTransformer training")
+    parser.add_argument("--model-type", default="transformer",
+                        choices=["set", "transformer"],
+                        help="Model architecture: 'set' for SetGeoTransformer, 'transformer' for GeoTransformer")
     args = parser.parse_args()
 
     device = args.device
@@ -873,8 +1079,9 @@ def main():
             print("No Summarizer data available")
         return
 
-    model = GeoTransformer().to(device)
-    print(f"GeoTransformer parameters: {count_parameters(model):,}")
+    model = create_model(args.model_type).to(device)
+    model_name = type(model).__name__
+    print(f"{model_name} parameters: {count_parameters(model):,}")
 
     if args.supervised_only:
         # Generate synthetic + supervised data and train
@@ -902,11 +1109,16 @@ def main():
         )
 
         augment = not args.no_augment
+        mt = args.model_type
         if synthetic_data:
-            dataset = SyntheticDataset(synthetic_data, max_seq_len=args.max_seq_len, augment=augment)
-            loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)
+            if mt == "set":
+                dataset = SetSyntheticDataset(synthetic_data, augment=augment)
+                loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=0, collate_fn=set_collate_fn)
+            else:
+                dataset = SyntheticDataset(synthetic_data, max_seq_len=args.max_seq_len, augment=augment)
+                loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)
             for epoch in range(num_synthetic_epochs):
-                metrics = train_epoch(model, loader, optimizer, device, epoch=epoch)
+                metrics = train_epoch(model, loader, optimizer, device, epoch=epoch, model_type=mt)
                 scheduler.step()
                 print(f"Synthetic epoch {epoch+1}/{num_synthetic_epochs}: "
                       f"loss={metrics['loss']:.4f} "
@@ -921,10 +1133,14 @@ def main():
             args.problems, model=model, max_seq_len=args.max_seq_len, device=device,
         )
         if samples:
-            dataset = TextGeometryDataset(samples, max_seq_len=args.max_seq_len, augment=augment)
-            loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)
+            if mt == "set":
+                dataset = SetGeometryDataset(samples, augment=augment)
+                loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=0, collate_fn=set_collate_fn)
+            else:
+                dataset = TextGeometryDataset(samples, max_seq_len=args.max_seq_len, augment=augment)
+                loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)
             for epoch in range(num_supervised_epochs):
-                metrics = train_epoch(model, loader, optimizer, device, epoch=epoch)
+                metrics = train_epoch(model, loader, optimizer, device, epoch=epoch, model_type=mt)
                 scheduler.step()
                 print(f"Supervised epoch {epoch+1}/{num_supervised_epochs}: "
                       f"loss={metrics['loss']:.4f} "
@@ -952,6 +1168,7 @@ def main():
             augment=not args.no_augment,
             train_summarizer_flag=args.train_summarizer,
             summarizer_epochs=args.summarizer_epochs,
+            model_type=args.model_type,
         )
 
 
