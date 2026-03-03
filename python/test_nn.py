@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 import torch
 import geoprover
 from model import (
-    GeoNet, GeoTransformer, GeoNetCNN, SetGeoTransformer,
+    GeoNet, GeoTransformer, GeoNetCNN, SetGeoTransformer, SetGeoTransformerV2,
     construction_to_index, tokenize, tokenize_and_pad,
     build_valid_mask, constructions_to_policy_target,
     count_parameters, create_model, POLICY_SIZE, VOCAB_SIZE, MAX_SEQ_LEN,
@@ -700,6 +700,8 @@ def test_create_model_factory():
     assert isinstance(m1, GeoTransformer)
     m2 = create_model("set")
     assert isinstance(m2, SetGeoTransformer)
+    m3 = create_model("set_v2")
+    assert isinstance(m3, SetGeoTransformerV2)
     try:
         create_model("invalid")
         assert False, "Should raise ValueError"
@@ -750,6 +752,244 @@ def test_set_training_step():
     print("  PASS: set training step")
 
 
+def test_v2_architecture():
+    """Test SetGeoTransformerV2 instantiation and parameter count."""
+    model = SetGeoTransformerV2()
+    params = count_parameters(model)
+    print(f"  SetGeoTransformerV2 parameters: {params:,}")
+    assert 1_000_000 < params < 5_000_000, f"Expected ~2.5M params, got {params:,}"
+    print("  PASS: v2 architecture")
+
+
+def test_v2_forward_pass():
+    """Test V2 forward pass with variable fact counts and construction counts."""
+    model = SetGeoTransformerV2()
+    model.eval()
+
+    B = 2
+    # Facts
+    facts1 = ["coll a b c", "para a b c d"]
+    facts2 = ["cong a b c d", "perp a c b d", "mid m a b"]
+    goal1 = "perp a h b c"
+    goal2 = "cong a b c d"
+
+    fi1, gi1, fm1 = encode_state_as_set(facts1, goal1)
+    fi2, gi2, fm2 = encode_state_as_set(facts2, goal2)
+
+    max_n = max(fi1.shape[0], fi2.shape[0])
+    L = fi1.shape[1]
+
+    padded_facts = torch.zeros(B, max_n, L, dtype=torch.long)
+    padded_masks = torch.zeros(B, max_n, dtype=torch.bool)
+    padded_facts[0, :fi1.shape[0]] = fi1
+    padded_masks[0, :fi1.shape[0]] = fm1
+    padded_facts[1, :fi2.shape[0]] = fi2
+    padded_masks[1, :fi2.shape[0]] = fm2
+    goal_ids = torch.stack([gi1, gi2])
+
+    # Constructions: 2 per sample
+    from model import tokenize_statement, SET_MAX_TOKENS
+    c1a = torch.tensor([tokenize_statement("mid a b")], dtype=torch.long)
+    c1b = torch.tensor([tokenize_statement("alt c a b")], dtype=torch.long)
+    c2a = torch.tensor([tokenize_statement("circumcenter a b c")], dtype=torch.long)
+    c2b = torch.tensor([tokenize_statement("mid b c")], dtype=torch.long)
+
+    K = 2
+    constr_ids = torch.zeros(B, K, SET_MAX_TOKENS, dtype=torch.long)
+    constr_ids[0, 0] = c1a
+    constr_ids[0, 1] = c1b
+    constr_ids[1, 0] = c2a
+    constr_ids[1, 1] = c2b
+    constr_mask = torch.ones(B, K, dtype=torch.bool)
+
+    with torch.no_grad():
+        value, logits = model(padded_facts, goal_ids, padded_masks, constr_ids, constr_mask)
+
+    assert value.shape == (B,), f"value shape: {value.shape}"
+    assert logits.shape == (B, K), f"logits shape: {logits.shape}"
+    assert (value >= 0).all() and (value <= 1).all(), f"Value out of [0,1]: {value}"
+    assert not torch.isnan(logits).any(), "Logits contain NaN"
+    print(f"  value={value[0].item():.4f}, {value[1].item():.4f}")
+    print(f"  logits={logits[0].tolist()}")
+    print("  PASS: v2 forward pass")
+
+
+def test_v2_permutation_invariance():
+    """Test V2 produces same output regardless of fact order."""
+    model = SetGeoTransformerV2()
+    model.eval()
+
+    facts = ["coll a b c", "para a b c d", "cong a b c d", "perp a c b d"]
+    goal = "eqangle a b c d e f"
+    from model import tokenize_statement, SET_MAX_TOKENS
+
+    # Two constructions
+    K = 2
+    constr_ids = torch.zeros(1, K, SET_MAX_TOKENS, dtype=torch.long)
+    constr_ids[0, 0] = torch.tensor(tokenize_statement("mid a b"), dtype=torch.long)
+    constr_ids[0, 1] = torch.tensor(tokenize_statement("alt c a b"), dtype=torch.long)
+    constr_mask = torch.ones(1, K, dtype=torch.bool)
+
+    # Order 1: original
+    fi1, gi1, fm1 = encode_state_as_set(facts, goal)
+    # Order 2: reversed
+    fi2, gi2, fm2 = encode_state_as_set(list(reversed(facts)), goal)
+    # Order 3: shuffled
+    import random
+    rng = random.Random(42)
+    shuffled = list(facts)
+    rng.shuffle(shuffled)
+    fi3, gi3, fm3 = encode_state_as_set(shuffled, goal)
+
+    with torch.no_grad():
+        v1, p1 = model(fi1.unsqueeze(0), gi1.unsqueeze(0), fm1.unsqueeze(0), constr_ids, constr_mask)
+        v2, p2 = model(fi2.unsqueeze(0), gi2.unsqueeze(0), fm2.unsqueeze(0), constr_ids, constr_mask)
+        v3, p3 = model(fi3.unsqueeze(0), gi3.unsqueeze(0), fm3.unsqueeze(0), constr_ids, constr_mask)
+
+    assert abs(v1.item() - v2.item()) < 1e-5, \
+        f"Values differ: {v1.item()} vs {v2.item()}"
+    assert abs(v1.item() - v3.item()) < 1e-5, \
+        f"Values differ: {v1.item()} vs {v3.item()}"
+    assert torch.allclose(p1, p2, atol=1e-4), \
+        f"Logits differ (orig vs rev): max diff={torch.max(torch.abs(p1 - p2)).item()}"
+    assert torch.allclose(p1, p3, atol=1e-4), \
+        f"Logits differ (orig vs shuf): max diff={torch.max(torch.abs(p1 - p3)).item()}"
+
+    print(f"  v_orig={v1.item():.6f}, v_rev={v2.item():.6f}, v_shuf={v3.item():.6f}")
+    print(f"  max logit diff (orig vs rev): {torch.max(torch.abs(p1 - p2)).item():.8f}")
+    print("  PASS: v2 permutation invariance")
+
+
+def test_v2_kv_cache_consistency():
+    """Test that cached expand/evaluate matches full forward."""
+    model = SetGeoTransformerV2()
+    model.eval()
+
+    facts = ["coll a b c", "para a b c d", "cong a b c d"]
+    goal = "perp a h b c"
+    from model import tokenize_statement, SET_MAX_TOKENS
+
+    fi, gi, fm = encode_state_as_set(facts, goal)
+
+    constr_texts = ["mid a b", "alt c a b"]
+    K = len(constr_texts)
+    constr_ids = torch.zeros(1, K, SET_MAX_TOKENS, dtype=torch.long)
+    for i, ct in enumerate(constr_texts):
+        constr_ids[0, i] = torch.tensor(tokenize_statement(ct), dtype=torch.long)
+    constr_mask = torch.ones(1, K, dtype=torch.bool)
+
+    with torch.no_grad():
+        # Full forward
+        value_full, logits_full = model(
+            fi.unsqueeze(0), gi.unsqueeze(0), fm.unsqueeze(0),
+            constr_ids, constr_mask,
+        )
+
+        # Cached path
+        fact_kv = model.encode_facts(fi.unsqueeze(0), fm.unsqueeze(0)).squeeze(0)  # (N, D)
+        goal_emb = model.encode_goal(gi.unsqueeze(0)).squeeze(0)  # (D,)
+
+        constr_ids_flat = constr_ids.squeeze(0)  # (K, L)
+        logits_cached = model.score_constructions_cached(fact_kv, fm, goal_emb, constr_ids_flat)
+
+        value_cached = model.evaluate_cached(fact_kv, fm, goal_emb)
+
+    # Logits should match
+    assert torch.allclose(logits_full.squeeze(0), logits_cached, atol=1e-4), \
+        f"Logits differ: {logits_full.squeeze(0)} vs {logits_cached}"
+    # Values should match
+    assert abs(value_full.item() - value_cached) < 1e-4, \
+        f"Values differ: {value_full.item()} vs {value_cached}"
+
+    print(f"  full logits: {logits_full.squeeze(0).tolist()}")
+    print(f"  cached logits: {logits_cached.tolist()}")
+    print(f"  full value: {value_full.item():.6f}, cached value: {value_cached:.6f}")
+    print("  PASS: v2 kv cache consistency")
+
+
+def test_v2_training_step():
+    """Test loss backward works for V2."""
+    from train import compute_v2_loss
+    model = SetGeoTransformerV2()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+    from model import tokenize_statement, SET_MAX_TOKENS
+    B = 2
+    facts = [["coll a b c", "cong a b c d"], ["para a b c d", "perp a c b d"]]
+    goals = ["perp a h b c", "cong a b c d"]
+    constr_texts = [["mid a b", "alt c a b"], ["circumcenter a b c", "mid b c"]]
+
+    encoded = [encode_state_as_set(f, g) for f, g in zip(facts, goals)]
+    max_n = max(e[0].shape[0] for e in encoded)
+    L = encoded[0][0].shape[1]
+
+    padded_facts = torch.zeros(B, max_n, L, dtype=torch.long)
+    padded_masks = torch.zeros(B, max_n, dtype=torch.bool)
+    for i, (fi, gi, fm) in enumerate(encoded):
+        padded_facts[i, :fi.shape[0]] = fi
+        padded_masks[i, :fi.shape[0]] = fm
+    goal_ids = torch.stack([e[1] for e in encoded])
+
+    K = 2
+    constr_ids = torch.zeros(B, K, SET_MAX_TOKENS, dtype=torch.long)
+    constr_mask = torch.ones(B, K, dtype=torch.bool)
+    for i, cts in enumerate(constr_texts):
+        for j, ct in enumerate(cts):
+            constr_ids[i, j] = torch.tensor(tokenize_statement(ct), dtype=torch.long)
+
+    # Policy targets: distribution over K constructions
+    policy_targets = torch.zeros(B, K)
+    policy_targets[0] = torch.tensor([0.7, 0.3])
+    policy_targets[1] = torch.tensor([0.4, 0.6])
+    value_targets = torch.tensor([0.8, 0.3])
+
+    optimizer.zero_grad()
+    loss, metrics = compute_v2_loss(
+        model, padded_facts, goal_ids, padded_masks,
+        constr_ids, constr_mask, policy_targets, value_targets,
+    )
+    loss.backward()
+    optimizer.step()
+
+    assert metrics['loss'] > 0
+    print(f"  Loss: {metrics['loss']:.4f}")
+    print(f"  Policy loss: {metrics['policy_loss']:.4f}")
+    print(f"  Value loss: {metrics['value_loss']:.4f}")
+    print("  PASS: v2 training step")
+
+
+def test_v2_construction_scoring():
+    """Test individual construction scores are sensible."""
+    model = SetGeoTransformerV2()
+    model.eval()
+
+    facts = ["coll a b c", "para a b c d"]
+    goal = "perp a h b c"
+    from model import tokenize_statement, SET_MAX_TOKENS
+
+    fi, gi, fm = encode_state_as_set(facts, goal)
+
+    with torch.no_grad():
+        fact_kv = model.encode_facts(fi.unsqueeze(0), fm.unsqueeze(0)).squeeze(0)
+        goal_emb = model.encode_goal(gi.unsqueeze(0)).squeeze(0)
+
+        # Score 3 constructions
+        constr_texts = ["mid a b", "alt c a b", "circumcenter a b c"]
+        constr_ids = torch.stack([
+            torch.tensor(tokenize_statement(ct), dtype=torch.long)
+            for ct in constr_texts
+        ])
+        logits = model.score_constructions_cached(fact_kv, fm, goal_emb, constr_ids)
+
+    assert logits.shape == (3,), f"Expected (3,), got {logits.shape}"
+    assert not torch.isnan(logits).any(), "Logits contain NaN"
+    # Scores should respond to different constructions (not all identical)
+    assert not torch.allclose(logits, logits[0].expand(3), atol=1e-6), \
+        f"All logits identical: {logits.tolist()}"
+    print(f"  Logits: {logits.tolist()}")
+    print("  PASS: v2 construction scoring")
+
+
 if __name__ == "__main__":
     tests = [
         test_tokenizer,
@@ -789,6 +1029,13 @@ if __name__ == "__main__":
         test_set_predict_single,
         test_create_model_factory,
         test_set_training_step,
+        # SetGeoTransformerV2 tests
+        test_v2_architecture,
+        test_v2_forward_pass,
+        test_v2_permutation_invariance,
+        test_v2_kv_cache_consistency,
+        test_v2_training_step,
+        test_v2_construction_scoring,
     ]
 
     passed = 0

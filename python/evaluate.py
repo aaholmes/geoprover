@@ -16,7 +16,7 @@ from dataclasses import asdict, dataclass
 import torch
 
 import geoprover
-from model import GeoNet, GeoTransformer, SetGeoTransformer, count_parameters, create_model
+from model import GeoNet, GeoTransformer, SetGeoTransformer, SetGeoTransformerV2, count_parameters, create_model
 from orchestrate import MctsConfig, SearchResult, load_problems, solve_problem
 from summarizer import FactSummarizer, count_summarizer_parameters
 from train import load_checkpoint, load_summarizer_checkpoint
@@ -190,8 +190,8 @@ def main():
     parser.add_argument("--summarizer-checkpoint", default=None,
                         help="Summarizer checkpoint path (enables fact filtering)")
     parser.add_argument("--model-type", default="transformer",
-                        choices=["set", "transformer"],
-                        help="Model architecture: 'set' for SetGeoTransformer, 'transformer' for GeoTransformer")
+                        choices=["set", "set_v2", "transformer"],
+                        help="Model architecture: 'set' for SetGeoTransformerV1, 'set_v2' for V2, 'transformer' for GeoTransformer")
     args = parser.parse_args()
 
     device = args.device

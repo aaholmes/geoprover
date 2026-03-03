@@ -615,8 +615,8 @@ class CrossAttentionBlock(nn.Module):
         return x
 
 
-class SetGeoTransformer(nn.Module):
-    """Set-equivariant transformer for geometry theorem proving.
+class SetGeoTransformerV1(nn.Module):
+    """Set-equivariant transformer for geometry theorem proving (V1).
 
     Treats facts as a permutable set with a distinguished goal element.
     Permutation-invariant by construction (no cross-fact positional embeddings).
@@ -869,6 +869,384 @@ class SetGeoTransformer(nn.Module):
             return value.item(), policy
 
 
+# Backward compatibility alias
+SetGeoTransformer = SetGeoTransformerV1
+
+
+# ============================================================
+# SetGeoTransformerV2: 3-way attention with deferred saturation
+# ============================================================
+
+class SetGeoTransformerV2(nn.Module):
+    """V2 set-equivariant transformer with 3-way attention (goal × construction × facts).
+
+    Eliminates O(N²) fact-to-fact self-attention. Facts are encoded independently
+    and cached. A 3-way attention mechanism scores constructions in O(N) each.
+
+    Four stages:
+      1. Per-Statement Encoding: shared 2-layer transformer (CACHEABLE)
+         Each fact/goal/construction → intra_encoder → embedding
+      2. Goal-Construction Fusion: 2-layer cross-attention
+         goal_emb attends to construction tokens → joint_query
+      3. Joint-Query-to-Facts Cross-Attention: 2-layer cross-attention
+         joint_query attends to fact embeddings → state_repr (O(N) per query)
+      4. Task Heads: policy (scalar per construction) + value
+
+    ~2.5M params.
+    """
+
+    def __init__(
+        self,
+        vocab_size: int = VOCAB_SIZE,
+        d_model: int = 256,
+        nhead: int = 8,
+        dim_feedforward: int = 512,
+        max_tokens: int = SET_MAX_TOKENS,
+        dropout: float = 0.1,
+        num_intra_layers: int = 2,
+        num_fusion_layers: int = 2,
+        num_query_layers: int = 2,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.max_tokens = max_tokens
+
+        # Stage 1: Per-statement encoding (shared)
+        self.token_emb = nn.Embedding(vocab_size, d_model, padding_idx=PAD_ID)
+        self.intra_pos_emb = nn.Embedding(max_tokens, d_model)
+        self.intra_norm = nn.LayerNorm(d_model)
+        self.intra_dropout = nn.Dropout(dropout)
+
+        intra_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward,
+            dropout=dropout, batch_first=True, norm_first=True,
+        )
+        self.intra_encoder = nn.TransformerEncoder(intra_layer, num_layers=num_intra_layers)
+
+        # Stage 2: Goal-Construction Fusion (cross-attention)
+        self.fusion_layers = nn.ModuleList([
+            CrossAttentionBlock(d_model, nhead, dim_feedforward, dropout)
+            for _ in range(num_fusion_layers)
+        ])
+
+        # Stage 3: Joint-Query-to-Facts Cross-Attention
+        self.query_layers = nn.ModuleList([
+            CrossAttentionBlock(d_model, nhead, dim_feedforward, dropout)
+            for _ in range(num_query_layers)
+        ])
+
+        # Stage 4: Task heads
+        # Policy: state_repr → scalar logit (one per construction)
+        self.policy_score = nn.Linear(d_model, 1)
+        # Value head
+        self.value_fc1 = nn.Linear(d_model, 128)
+        self.value_fc2 = nn.Linear(128, 1)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.normal_(self.token_emb.weight, std=0.02)
+        nn.init.normal_(self.intra_pos_emb.weight, std=0.02)
+        with torch.no_grad():
+            self.token_emb.weight[PAD_ID].zero_()
+
+        for m in [self.policy_score, self.value_fc1, self.value_fc2]:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=0.01)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+    def _encode_statements_cls(self, token_ids: torch.Tensor) -> torch.Tensor:
+        """Encode statements, returning [CLS] embeddings.
+
+        Args:
+            token_ids: (M, L)
+        Returns:
+            cls_embs: (M, d_model)
+        """
+        M, L = token_ids.shape
+        positions = torch.arange(L, device=token_ids.device).unsqueeze(0).expand(M, L)
+        x = self.token_emb(token_ids) + self.intra_pos_emb(positions)
+        x = self.intra_norm(self.intra_dropout(x))
+        padding_mask = (token_ids == PAD_ID)
+        x = self.intra_encoder(x, src_key_padding_mask=padding_mask)
+        return x[:, 0, :]  # [CLS] at position 0
+
+    def _encode_statements_full(self, token_ids: torch.Tensor) -> torch.Tensor:
+        """Encode statements, returning full token sequence.
+
+        Args:
+            token_ids: (M, L)
+        Returns:
+            full_embs: (M, L, d_model)
+        """
+        M, L = token_ids.shape
+        positions = torch.arange(L, device=token_ids.device).unsqueeze(0).expand(M, L)
+        x = self.token_emb(token_ids) + self.intra_pos_emb(positions)
+        x = self.intra_norm(self.intra_dropout(x))
+        padding_mask = (token_ids == PAD_ID)
+        x = self.intra_encoder(x, src_key_padding_mask=padding_mask)
+        return x
+
+    def encode_facts(self, fact_ids: torch.Tensor, fact_mask: torch.Tensor) -> torch.Tensor:
+        """Encode facts into [CLS] embeddings (cacheable).
+
+        Args:
+            fact_ids: (B, N, L) or (M, L) flat
+            fact_mask: (B, N) or (M,) flat bool
+
+        Returns:
+            fact_embs: same leading dims as input, d_model last dim
+        """
+        if fact_ids.dim() == 3:
+            B, N, L = fact_ids.shape
+            flat_mask = fact_mask.reshape(B * N)
+            flat_facts = fact_ids.reshape(B * N, L)
+            flat_cls = torch.zeros(B * N, self.d_model, device=fact_ids.device)
+            if flat_mask.any():
+                real_facts = flat_facts[flat_mask]
+                real_cls = self._encode_statements_cls(real_facts)
+                flat_cls[flat_mask] = real_cls
+            return flat_cls.reshape(B, N, self.d_model)
+        else:
+            # (M, L) flat input
+            return self._encode_statements_cls(fact_ids)
+
+    def encode_goal(self, goal_ids: torch.Tensor) -> torch.Tensor:
+        """Encode goal into [CLS] embedding.
+
+        Args:
+            goal_ids: (B, L)
+        Returns:
+            goal_emb: (B, d_model)
+        """
+        return self._encode_statements_cls(goal_ids)
+
+    def encode_construction_seq(self, constr_ids: torch.Tensor) -> torch.Tensor:
+        """Encode constructions, returning full token sequences for fusion.
+
+        Args:
+            constr_ids: (M, L)
+        Returns:
+            constr_seq: (M, L, d_model)
+        """
+        return self._encode_statements_full(constr_ids)
+
+    def fuse_goal_construction(
+        self,
+        goal_emb: torch.Tensor,
+        constr_seq: torch.Tensor,
+        constr_pad_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Stage 2: Goal attends to construction tokens.
+
+        Args:
+            goal_emb: (B, 1, D) or (B, D)
+            constr_seq: (B, L_c, D) full construction token sequence
+            constr_pad_mask: (B, L_c) bool, True = padding to ignore
+
+        Returns:
+            joint_query: (B, 1, D)
+        """
+        if goal_emb.dim() == 2:
+            goal_emb = goal_emb.unsqueeze(1)  # (B, 1, D)
+
+        for layer in self.fusion_layers:
+            goal_emb = layer(
+                query=goal_emb, kv=constr_seq,
+                key_padding_mask=constr_pad_mask,
+            )
+        return goal_emb  # (B, 1, D)
+
+    def query_facts(
+        self,
+        joint_q: torch.Tensor,
+        fact_kv: torch.Tensor,
+        fact_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Stage 3: Joint query attends to fact embeddings.
+
+        Args:
+            joint_q: (B, 1, D)
+            fact_kv: (B, N, D) fact [CLS] embeddings
+            fact_mask: (B, N) bool, True = real facts
+
+        Returns:
+            state_repr: (B, D)
+        """
+        # fact_mask: True = real, need to invert for key_padding_mask (True = ignore)
+        pad_mask = ~fact_mask if fact_mask is not None else None
+
+        for layer in self.query_layers:
+            joint_q = layer(
+                query=joint_q, kv=fact_kv,
+                key_padding_mask=pad_mask,
+            )
+        return joint_q.squeeze(1)  # (B, D)
+
+    def forward(
+        self,
+        fact_ids: torch.Tensor,
+        goal_ids: torch.Tensor,
+        fact_mask: torch.Tensor,
+        constr_ids: torch.Tensor,
+        constr_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Full training forward pass.
+
+        Args:
+            fact_ids: (B, N, L) per-fact token IDs
+            goal_ids: (B, L) goal token IDs
+            fact_mask: (B, N) bool, True = real facts
+            constr_ids: (B, K, L) per-construction token IDs
+            constr_mask: (B, K) bool, True = real constructions
+
+        Returns:
+            value: (B,) sigmoid(v_logit) in [0, 1]
+            logits: (B, K) per-construction logits
+        """
+        B, N, L = fact_ids.shape
+        K = constr_ids.shape[1]
+
+        # Stage 1: encode facts, goal, constructions
+        fact_embs = self.encode_facts(fact_ids, fact_mask)  # (B, N, D)
+        goal_emb = self.encode_goal(goal_ids)  # (B, D)
+
+        # Encode all constructions (flatten for batch efficiency)
+        flat_constr = constr_ids.reshape(B * K, L)  # (B*K, L)
+        flat_constr_seq = self._encode_statements_full(flat_constr)  # (B*K, L, D)
+        constr_seqs = flat_constr_seq.reshape(B, K, L, self.d_model)  # (B, K, L, D)
+
+        # Score each construction
+        logits = torch.zeros(B, K, device=fact_ids.device)
+
+        # Process constructions: for each, fuse with goal and query facts
+        # Efficient batched version: expand goal for all K constructions
+        goal_expanded = goal_emb.unsqueeze(1).expand(B, K, self.d_model)  # (B, K, D)
+        goal_flat = goal_expanded.reshape(B * K, 1, self.d_model)  # (B*K, 1, D)
+
+        constr_seqs_flat = constr_seqs.reshape(B * K, L, self.d_model)  # (B*K, L, D)
+
+        # Construct padding mask for construction tokens
+        flat_constr_pad = (flat_constr == PAD_ID)  # (B*K, L)
+
+        # Stage 2: fuse goal with each construction
+        joint_q = goal_flat
+        for layer in self.fusion_layers:
+            joint_q = layer(query=joint_q, kv=constr_seqs_flat, key_padding_mask=flat_constr_pad)
+        # joint_q: (B*K, 1, D)
+
+        # Stage 3: query facts with joint query
+        fact_embs_expanded = fact_embs.unsqueeze(1).expand(B, K, N, self.d_model)
+        fact_embs_flat = fact_embs_expanded.reshape(B * K, N, self.d_model)
+
+        fact_mask_expanded = fact_mask.unsqueeze(1).expand(B, K, N)
+        fact_pad_flat = ~fact_mask_expanded.reshape(B * K, N)
+
+        state_repr = joint_q
+        for layer in self.query_layers:
+            state_repr = layer(query=state_repr, kv=fact_embs_flat, key_padding_mask=fact_pad_flat)
+        state_repr = state_repr.squeeze(1)  # (B*K, D)
+
+        # Policy logits
+        logits = self.policy_score(state_repr).squeeze(-1)  # (B*K,)
+        logits = logits.reshape(B, K)  # (B, K)
+
+        # Mask invalid constructions
+        logits = logits.masked_fill(~constr_mask, float("-inf"))
+
+        # Value: use goal querying facts directly (no construction)
+        goal_q = goal_emb.unsqueeze(1)  # (B, 1, D)
+        fact_pad = ~fact_mask
+        for layer in self.query_layers:
+            goal_q = layer(query=goal_q, kv=fact_embs, key_padding_mask=fact_pad)
+        value_repr = goal_q.squeeze(1)  # (B, D)
+
+        v = F.relu(self.value_fc1(value_repr))
+        value = torch.sigmoid(self.value_fc2(v).squeeze(-1))
+
+        return value, logits
+
+    def score_constructions_cached(
+        self,
+        fact_kv: torch.Tensor,
+        fact_mask: torch.Tensor,
+        goal_emb: torch.Tensor,
+        constr_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Score constructions using pre-cached fact embeddings.
+
+        Args:
+            fact_kv: (N, D) cached fact [CLS] embeddings
+            fact_mask: (N,) bool
+            goal_emb: (D,) cached goal embedding
+            constr_ids: (K, L) construction token IDs
+
+        Returns:
+            logits: (K,) per-construction logits
+        """
+        K, L = constr_ids.shape
+        # Encode construction sequences
+        constr_seqs = self._encode_statements_full(constr_ids)  # (K, L, D)
+        constr_pad = (constr_ids == PAD_ID)  # (K, L)
+
+        # Expand goal for K constructions
+        goal_q = goal_emb.unsqueeze(0).unsqueeze(0).expand(K, 1, self.d_model)  # (K, 1, D)
+
+        # Stage 2: fuse
+        for layer in self.fusion_layers:
+            goal_q = layer(query=goal_q, kv=constr_seqs, key_padding_mask=constr_pad)
+
+        # Stage 3: query facts
+        fact_kv_exp = fact_kv.unsqueeze(0).expand(K, -1, self.d_model)  # (K, N, D)
+        fact_pad = (~fact_mask).unsqueeze(0).expand(K, -1)  # (K, N)
+
+        state_repr = goal_q
+        for layer in self.query_layers:
+            state_repr = layer(query=state_repr, kv=fact_kv_exp, key_padding_mask=fact_pad)
+        state_repr = state_repr.squeeze(1)  # (K, D)
+
+        logits = self.policy_score(state_repr).squeeze(-1)  # (K,)
+        return logits
+
+    def evaluate_cached(
+        self,
+        fact_kv: torch.Tensor,
+        fact_mask: torch.Tensor,
+        goal_emb: torch.Tensor,
+    ) -> float:
+        """Get value from cached fact embeddings (post-saturation).
+
+        Args:
+            fact_kv: (N, D) fact embeddings
+            fact_mask: (N,) bool
+            goal_emb: (D,) goal embedding
+
+        Returns:
+            value: float in [0, 1]
+        """
+        # Goal queries facts directly (no construction)
+        goal_q = goal_emb.unsqueeze(0).unsqueeze(0)  # (1, 1, D)
+        fkv = fact_kv.unsqueeze(0)  # (1, N, D)
+        fpad = (~fact_mask).unsqueeze(0)  # (1, N)
+
+        for layer in self.query_layers:
+            goal_q = layer(query=goal_q, kv=fkv, key_padding_mask=fpad)
+
+        value_repr = goal_q.squeeze(1).squeeze(0)  # (D,)
+        v = F.relu(self.value_fc1(value_repr))
+        return torch.sigmoid(self.value_fc2(v)).item()
+
+    def predict_value(
+        self,
+        fact_kv: torch.Tensor,
+        fact_mask: torch.Tensor,
+        goal_emb: torch.Tensor,
+    ) -> float:
+        """Root value: goal queries facts, no construction. Alias for evaluate_cached."""
+        return self.evaluate_cached(fact_kv, fact_mask, goal_emb)
+
+
 def create_model(model_type: str = "set", **kwargs) -> nn.Module:
     """Factory function to create a model by type.
 
@@ -879,7 +1257,9 @@ def create_model(model_type: str = "set", **kwargs) -> nn.Module:
         Model instance
     """
     if model_type == "set":
-        return SetGeoTransformer(**kwargs)
+        return SetGeoTransformerV1(**kwargs)
+    elif model_type == "set_v2":
+        return SetGeoTransformerV2(**kwargs)
     elif model_type == "transformer":
         return GeoTransformer(**kwargs)
     else:

@@ -28,11 +28,13 @@ from model import (
     GeoNet,
     GeoTransformer,
     SetGeoTransformer,
+    SetGeoTransformerV2,
     build_valid_mask,
     construction_to_index,
     count_parameters,
     create_model,
     tokenize_and_pad,
+    tokenize_statement,
     augment_state_text,
     permute_text,
     permute_point_ids,
@@ -42,6 +44,7 @@ from model import (
     MAX_SEQ_LEN,
     SET_MAX_TOKENS,
     SET_MAX_FACTS,
+    PAD_ID,
 )
 from orchestrate import (
     MctsConfig,
@@ -340,6 +343,209 @@ def set_collate_fn(batch):
     value = torch.stack(value_list)
 
     return padded_facts, goal_ids, padded_masks, policy, value
+
+
+# ============================================================
+# V2 datasets for SetGeoTransformerV2
+# ============================================================
+
+class V2SyntheticDataset(Dataset):
+    """Synthetic dataset for SetGeoTransformerV2.
+
+    Each sample: (fact_ids, goal_ids, fact_mask, constr_ids, value_target, is_positive).
+    The construction is the single target from synthetic data.
+    """
+
+    def __init__(
+        self,
+        examples: list[tuple[str, str, str]],
+        max_facts: int = SET_MAX_FACTS,
+        max_tokens: int = SET_MAX_TOKENS,
+        augment: bool = False,
+        epoch: int = 0,
+    ):
+        self.examples = examples
+        self.max_facts = max_facts
+        self.max_tokens = max_tokens
+        self.augment = augment
+        self.epoch = epoch
+
+    def __len__(self) -> int:
+        return len(self.examples)
+
+    def __getitem__(self, idx: int):
+        state_text, construction_text, goal_text = self.examples[idx]
+
+        is_negative = construction_text.startswith("NEG:")
+        clean_construction = construction_text[4:] if is_negative else construction_text
+
+        if self.augment:
+            perm = make_augmentation_perm(self.epoch, idx, len(self.examples))
+            state_text = permute_text(state_text, perm)
+            goal_text = permute_text(goal_text, perm)
+            clean_construction = permute_text(clean_construction, perm)
+
+        facts = [f.strip() for f in state_text.split(" ; ") if f.strip()]
+        if self.augment:
+            rng = random.Random(self.epoch * len(self.examples) + idx)
+            rng.shuffle(facts)
+
+        fact_ids, goal_ids, fact_mask = encode_state_as_set(
+            facts, goal_text, self.max_facts, self.max_tokens,
+        )
+
+        # Single construction
+        constr_ids = torch.tensor(
+            tokenize_statement(clean_construction, self.max_tokens),
+            dtype=torch.long,
+        )
+
+        value = torch.tensor(0.0 if is_negative else 1.0, dtype=torch.float32)
+        is_pos = torch.tensor(0.0 if is_negative else 1.0, dtype=torch.float32)
+
+        return fact_ids, goal_ids, fact_mask, constr_ids, value, is_pos
+
+
+class V2GeometryDataset(Dataset):
+    """Training dataset from TrainingSample for SetGeoTransformerV2.
+
+    Each sample uses policy_constructions for variable-count constructions.
+    """
+
+    def __init__(
+        self,
+        samples: list,
+        max_facts: int = SET_MAX_FACTS,
+        max_tokens: int = SET_MAX_TOKENS,
+        augment: bool = False,
+        epoch: int = 0,
+    ):
+        self.samples = samples
+        self.max_facts = max_facts
+        self.max_tokens = max_tokens
+        self.augment = augment
+        self.epoch = epoch
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int):
+        s = self.samples[idx]
+        state_text = s.state_text
+
+        if self.augment:
+            aug_text, perm = augment_state_text(
+                state_text, self.epoch, idx, len(self.samples)
+            )
+            state_text = aug_text
+        else:
+            perm = None
+
+        facts, goal_text = split_state_text(state_text)
+        fact_ids, goal_ids, fact_mask = encode_state_as_set(
+            facts, goal_text, self.max_facts, self.max_tokens,
+        )
+
+        # Build construction IDs and weights from policy_constructions
+        if s.policy_constructions:
+            constr_id_list = []
+            weights = []
+            for type_name, args, weight in s.policy_constructions:
+                if perm is not None:
+                    args = permute_point_ids(args, perm)
+                # Reconstruct construction text
+                rev_type = {v: k for k, v in _KEYWORD_TO_TYPE.items()}
+                keyword = rev_type.get(type_name, type_name.lower())
+                from model import POINT_NAMES as _PN
+                arg_names = [_PN[a] if 0 <= a < len(_PN) else f"aux_{a-26}" for a in args]
+                ctext = keyword + " " + " ".join(arg_names)
+                constr_id_list.append(
+                    torch.tensor(tokenize_statement(ctext, self.max_tokens), dtype=torch.long)
+                )
+                weights.append(weight)
+
+            constr_ids = torch.stack(constr_id_list)  # (K, L)
+            constr_weights = torch.tensor(weights, dtype=torch.float32)
+            # Normalize weights to form distribution
+            if constr_weights.sum() > 0:
+                constr_weights = constr_weights / constr_weights.sum()
+        else:
+            # Value-only sample: single dummy construction
+            constr_ids = torch.zeros(1, self.max_tokens, dtype=torch.long)
+            constr_weights = torch.zeros(1, dtype=torch.float32)
+
+        constr_mask = torch.ones(constr_ids.shape[0], dtype=torch.bool)
+        value = torch.tensor(s.value_target, dtype=torch.float32)
+
+        return fact_ids, goal_ids, fact_mask, constr_ids, constr_mask, constr_weights, value
+
+
+def v2_collate_fn(batch):
+    """Custom collate for V2 datasets.
+
+    Pads both fact dimension N and construction dimension K per batch.
+    Handles both V2SyntheticDataset (6 items) and V2GeometryDataset (7 items).
+    """
+    n_items = len(batch[0])
+
+    if n_items == 6:
+        # V2SyntheticDataset: (fact_ids, goal_ids, fact_mask, constr_ids, value, is_pos)
+        fact_ids_list, goal_ids_list, fact_mask_list, constr_ids_list, value_list, is_pos_list = zip(*batch)
+
+        B = len(batch)
+        max_n = max(f.shape[0] for f in fact_ids_list)
+        L = fact_ids_list[0].shape[1]
+
+        padded_facts = torch.zeros(B, max_n, L, dtype=torch.long)
+        padded_masks = torch.zeros(B, max_n, dtype=torch.bool)
+        for i, (fi, fm) in enumerate(zip(fact_ids_list, fact_mask_list)):
+            n = fi.shape[0]
+            padded_facts[i, :n] = fi
+            padded_masks[i, :n] = fm
+
+        goal_ids = torch.stack(goal_ids_list)
+        # Constructions: each is (L,), pad to (B, 1, L) for single construction
+        constr_ids = torch.stack(constr_ids_list).unsqueeze(1)  # (B, 1, L)
+        constr_mask = torch.ones(B, 1, dtype=torch.bool)
+        # Policy: target construction gets weight 1.0 for positive, 0.0 for negative
+        constr_weights = torch.stack(is_pos_list).unsqueeze(1)  # (B, 1)
+        values = torch.stack(value_list)
+
+        return padded_facts, goal_ids, padded_masks, constr_ids, constr_mask, constr_weights, values
+
+    else:
+        # V2GeometryDataset: (fact_ids, goal_ids, fact_mask, constr_ids, constr_mask, constr_weights, value)
+        fact_ids_list, goal_ids_list, fact_mask_list, constr_ids_list, constr_mask_list, constr_weights_list, value_list = zip(*batch)
+
+        B = len(batch)
+        max_n = max(f.shape[0] for f in fact_ids_list)
+        max_k = max(c.shape[0] for c in constr_ids_list)
+        L = fact_ids_list[0].shape[1]
+        Lc = constr_ids_list[0].shape[1]
+
+        padded_facts = torch.zeros(B, max_n, L, dtype=torch.long)
+        padded_masks = torch.zeros(B, max_n, dtype=torch.bool)
+        padded_constrs = torch.zeros(B, max_k, Lc, dtype=torch.long)
+        padded_cmasks = torch.zeros(B, max_k, dtype=torch.bool)
+        padded_cweights = torch.zeros(B, max_k, dtype=torch.float32)
+
+        for i in range(B):
+            fi = fact_ids_list[i]
+            fm = fact_mask_list[i]
+            padded_facts[i, :fi.shape[0]] = fi
+            padded_masks[i, :fi.shape[0]] = fm
+
+            ci = constr_ids_list[i]
+            cm = constr_mask_list[i]
+            cw = constr_weights_list[i]
+            padded_constrs[i, :ci.shape[0]] = ci
+            padded_cmasks[i, :ci.shape[0]] = cm
+            padded_cweights[i, :cw.shape[0]] = cw
+
+        goal_ids = torch.stack(goal_ids_list)
+        values = torch.stack(value_list)
+
+        return padded_facts, goal_ids, padded_masks, padded_constrs, padded_cmasks, padded_cweights, values
 
 
 # Map from text keywords to ConstructionType names
@@ -650,6 +856,63 @@ def compute_set_loss(
     return total_loss, metrics
 
 
+def compute_v2_loss(
+    model: SetGeoTransformerV2,
+    fact_ids: torch.Tensor,
+    goal_ids: torch.Tensor,
+    fact_mask: torch.Tensor,
+    constr_ids: torch.Tensor,
+    constr_mask: torch.Tensor,
+    constr_weights: torch.Tensor,
+    value_targets: torch.Tensor,
+    value_weight: float = DEFAULT_VALUE_WEIGHT,
+) -> tuple[torch.Tensor, dict]:
+    """Compute combined policy + value loss for SetGeoTransformerV2.
+
+    Args:
+        fact_ids: (B, N, L)
+        goal_ids: (B, L)
+        fact_mask: (B, N)
+        constr_ids: (B, K, L)
+        constr_mask: (B, K)
+        constr_weights: (B, K) target distribution over constructions
+        value_targets: (B,)
+    """
+    value_pred, logits = model(fact_ids, goal_ids, fact_mask, constr_ids, constr_mask)
+
+    # Policy loss: KL-div over per-construction logits vs target distribution
+    policy_has_target = constr_weights.sum(dim=1) > 0  # (B,)
+    if policy_has_target.any():
+        # Only compute policy loss on samples with valid targets
+        valid_logits = logits[policy_has_target]  # (B', K)
+        valid_targets = constr_weights[policy_has_target]  # (B', K)
+        valid_cmask = constr_mask[policy_has_target]  # (B', K)
+
+        # Mask invalid constructions before softmax
+        valid_logits = valid_logits.masked_fill(~valid_cmask, float("-inf"))
+        log_probs = F.log_softmax(valid_logits, dim=1)
+
+        # Replace -inf in log_probs with 0 to avoid NaN in KL div
+        log_probs = log_probs.masked_fill(~valid_cmask, 0.0)
+
+        policy_loss = F.kl_div(
+            log_probs, valid_targets, reduction="batchmean", log_target=False,
+        )
+    else:
+        policy_loss = torch.tensor(0.0, device=fact_ids.device)
+
+    value_loss = F.mse_loss(value_pred, value_targets)
+    total_loss = policy_loss + value_weight * value_loss
+
+    metrics = {
+        "loss": total_loss.item(),
+        "policy_loss": policy_loss.item(),
+        "value_loss": value_loss.item(),
+        "mean_pred_value": value_pred.mean().item(),
+    }
+    return total_loss, metrics
+
+
 def generate_supervised_data(
     problems_file: str,
     model: GeoTransformer | None = None,
@@ -758,9 +1021,26 @@ def train_epoch(
     n_batches = 0
 
     is_set = model_type == "set"
+    is_v2 = model_type == "set_v2"
 
     for batch in dataloader:
-        if is_set:
+        if is_v2:
+            fact_ids, goal_ids, fact_mask, constr_ids, constr_mask, constr_weights, value_targets = batch
+            fact_ids = fact_ids.to(device)
+            goal_ids = goal_ids.to(device)
+            fact_mask = fact_mask.to(device)
+            constr_ids = constr_ids.to(device)
+            constr_mask = constr_mask.to(device)
+            constr_weights = constr_weights.to(device)
+            value_targets = value_targets.to(device)
+
+            optimizer.zero_grad()
+            loss, metrics = compute_v2_loss(
+                model, fact_ids, goal_ids, fact_mask,
+                constr_ids, constr_mask, constr_weights,
+                value_targets, value_weight,
+            )
+        elif is_set:
             fact_ids, goal_ids, fact_mask, policy_targets, value_targets = batch
             fact_ids = fact_ids.to(device)
             goal_ids = goal_ids.to(device)
@@ -928,7 +1208,10 @@ def expert_iteration(
     print(f"  Generated {len(synthetic_data)} examples in {elapsed:.1f}s")
 
     if synthetic_data:
-        if model_type == "set":
+        if model_type == "set_v2":
+            dataset = V2SyntheticDataset(synthetic_data, augment=augment)
+            loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=v2_collate_fn)
+        elif model_type == "set":
             dataset = SetSyntheticDataset(synthetic_data, augment=augment)
             loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=set_collate_fn)
         else:
@@ -955,7 +1238,10 @@ def expert_iteration(
     )
     if supervised_samples:
         replay.add(supervised_samples)
-        if model_type == "set":
+        if model_type == "set_v2":
+            dataset = V2GeometryDataset(supervised_samples, augment=augment)
+            loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=v2_collate_fn)
+        elif model_type == "set":
             dataset = SetGeometryDataset(supervised_samples, augment=augment)
             loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=set_collate_fn)
         else:
@@ -997,7 +1283,10 @@ def expert_iteration(
 
         if len(replay) >= batch_size:
             train_samples = replay.all()
-            if model_type == "set":
+            if model_type == "set_v2":
+                dataset = V2GeometryDataset(train_samples, augment=augment)
+                loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=v2_collate_fn)
+            elif model_type == "set":
                 dataset = SetGeometryDataset(train_samples, augment=augment)
                 loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=set_collate_fn)
             else:
@@ -1046,8 +1335,8 @@ def main():
     parser.add_argument("--summarizer-only", action="store_true",
                         help="Only train the Summarizer, skip GeoTransformer training")
     parser.add_argument("--model-type", default="transformer",
-                        choices=["set", "transformer"],
-                        help="Model architecture: 'set' for SetGeoTransformer, 'transformer' for GeoTransformer")
+                        choices=["set", "set_v2", "transformer"],
+                        help="Model architecture: 'set' for SetGeoTransformerV1, 'set_v2' for V2, 'transformer' for GeoTransformer")
     args = parser.parse_args()
 
     device = args.device
@@ -1111,7 +1400,10 @@ def main():
         augment = not args.no_augment
         mt = args.model_type
         if synthetic_data:
-            if mt == "set":
+            if mt == "set_v2":
+                dataset = V2SyntheticDataset(synthetic_data, augment=augment)
+                loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=0, collate_fn=v2_collate_fn)
+            elif mt == "set":
                 dataset = SetSyntheticDataset(synthetic_data, augment=augment)
                 loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=0, collate_fn=set_collate_fn)
             else:
@@ -1133,7 +1425,10 @@ def main():
             args.problems, model=model, max_seq_len=args.max_seq_len, device=device,
         )
         if samples:
-            if mt == "set":
+            if mt == "set_v2":
+                dataset = V2GeometryDataset(samples, augment=augment)
+                loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=0, collate_fn=v2_collate_fn)
+            elif mt == "set":
                 dataset = SetGeometryDataset(samples, augment=augment)
                 loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=0, collate_fn=set_collate_fn)
             else:

@@ -26,11 +26,14 @@ import geoprover
 from model import (
     POLICY_SIZE,
     GeoNet,
+    SetGeoTransformerV2,
     build_valid_mask,
     construction_to_index,
     encode_state_as_set,
     split_state_text,
     tokenize_and_pad,
+    tokenize_statement,
+    SET_MAX_TOKENS,
 )
 from summarizer import FactSummarizer, filter_facts, build_summarized_text
 
@@ -69,6 +72,9 @@ class MctsNode:
     expanded: bool = False
     depth: int = 0
     pre_facts: set = field(default_factory=set)  # Facts before saturation (for Summarizer)
+    # V2 KV caches
+    fact_kv_cache: object = None  # Tensor (N, d_model) cached fact embeddings
+    goal_emb_cache: object = None  # Tensor (d_model,) cached goal embedding
 
 
 @dataclass
@@ -246,6 +252,117 @@ def _evaluate(
     return value.item()
 
 
+def _expand_v2(
+    node: MctsNode,
+    config: MctsConfig,
+    model: SetGeoTransformerV2,
+    device: str,
+) -> None:
+    """Expand a leaf node using V2: deferred saturation, KV-cached scoring."""
+    if node.depth >= config.max_depth:
+        return
+
+    constructions = geoprover.generate_constructions(node.state)
+    if not constructions:
+        return
+    constructions = constructions[:config.max_children]
+
+    model.eval()
+
+    # Ensure parent has KV cache (root init)
+    if node.fact_kv_cache is None:
+        fact_texts = list(node.state.facts_as_text_list())
+        goal_text = node.state.goal_as_text()
+        fact_ids, goal_ids, fact_mask = encode_state_as_set(fact_texts, goal_text)
+        fact_ids = fact_ids.to(device)
+        goal_ids = goal_ids.unsqueeze(0).to(device)
+        fact_mask = fact_mask.to(device)
+
+        with torch.no_grad():
+            node.fact_kv_cache = model.encode_facts(
+                fact_ids.unsqueeze(0), fact_mask.unsqueeze(0)
+            ).squeeze(0)  # (N, D)
+            node.goal_emb_cache = model.encode_goal(goal_ids).squeeze(0)  # (D,)
+            # Store fact_mask for later use
+            node._fact_mask = fact_mask
+
+    # Encode constructions and score via cached path
+    constr_texts = [geoprover.construction_to_text(c, node.state) for c in constructions]
+    constr_ids = torch.stack([
+        torch.tensor(tokenize_statement(ct, SET_MAX_TOKENS), dtype=torch.long)
+        for ct in constr_texts
+    ]).to(device)  # (K, L)
+
+    with torch.no_grad():
+        logits = model.score_constructions_cached(
+            node.fact_kv_cache, node._fact_mask, node.goal_emb_cache, constr_ids,
+        )
+        priors = F.softmax(logits, dim=0)
+
+    for i, c in enumerate(constructions):
+        child_state = geoprover.apply_construction(node.state, c)
+        child_pre_facts = set(child_state.facts_as_text_list()) if config.use_summarizer else set()
+        child = MctsNode(
+            state=child_state,
+            action=c,
+            action_index=i,  # V2 uses construction index, not policy slot
+            parent=node,
+            prior=priors[i].item(),
+            depth=node.depth + 1,
+            pre_facts=child_pre_facts,
+            goal_emb_cache=node.goal_emb_cache,  # inherited from parent
+        )
+        node.children.append(child)
+
+    node.expanded = True
+
+
+def _evaluate_v2(
+    node: MctsNode,
+    model: SetGeoTransformerV2,
+    config: MctsConfig,
+    device: str,
+) -> float:
+    """Evaluate a node V2: saturate, encode new facts, get value."""
+    proved = geoprover.saturate_with_config(
+        node.state,
+        max_iterations=config.saturate_max_iterations,
+        max_facts=config.saturate_max_facts,
+    )
+
+    if proved:
+        node.terminal_value = 1.0
+        return 1.0
+
+    model.eval()
+
+    # Build KV cache for this node
+    if node.fact_kv_cache is None:
+        fact_texts = list(node.state.facts_as_text_list())
+        goal_text = node.state.goal_as_text()
+        fact_ids, goal_ids, fact_mask = encode_state_as_set(fact_texts, goal_text)
+        fact_ids = fact_ids.to(device)
+        fact_mask = fact_mask.to(device)
+
+        with torch.no_grad():
+            node.fact_kv_cache = model.encode_facts(
+                fact_ids.unsqueeze(0), fact_mask.unsqueeze(0)
+            ).squeeze(0)  # (N, D)
+            node._fact_mask = fact_mask
+
+        if node.goal_emb_cache is None:
+            goal_ids = goal_ids.unsqueeze(0).to(device)
+            with torch.no_grad():
+                node.goal_emb_cache = model.encode_goal(goal_ids).squeeze(0)
+
+    with torch.no_grad():
+        value = model.evaluate_cached(
+            node.fact_kv_cache, node._fact_mask, node.goal_emb_cache,
+        )
+
+    return value
+
+
 def _backprop(node: MctsNode, value: float) -> None:
     current = node
     while current is not None:
@@ -270,8 +387,14 @@ def mcts_search(
 
     # Snapshot pre-saturation facts for root (if Summarizer enabled)
     root_pre_facts = set(state.facts_as_text_list()) if config.use_summarizer else set()
+    is_v2 = config.model_type == "set_v2"
+
     root = MctsNode(state=state, pre_facts=root_pre_facts)
-    root_value = _evaluate(root, model, config, device, summarizer)
+
+    if is_v2:
+        root_value = _evaluate_v2(root, model, config, device)
+    else:
+        root_value = _evaluate(root, model, config, device, summarizer)
 
     if root.terminal_value == 1.0:
         elapsed = (time.time() - start) * 1000
@@ -280,7 +403,10 @@ def mcts_search(
             samples=[], actions=[], elapsed_ms=elapsed,
         )
 
-    _expand(root, config, model, device, summarizer)
+    if is_v2:
+        _expand_v2(root, config, model, device)
+    else:
+        _expand(root, config, model, device, summarizer)
 
     for _ in range(config.num_iterations):
         leaf = _select_leaf(root, config.c_puct)
@@ -291,14 +417,20 @@ def mcts_search(
                 break
             continue
 
-        value = _evaluate(leaf, model, config, device, summarizer)
+        if is_v2:
+            value = _evaluate_v2(leaf, model, config, device)
+        else:
+            value = _evaluate(leaf, model, config, device, summarizer)
 
         if leaf.terminal_value == 1.0:
             _backprop(leaf, 1.0)
             break
 
         if leaf.depth < config.max_depth:
-            _expand(leaf, config, model, device, summarizer)
+            if is_v2:
+                _expand_v2(leaf, config, model, device)
+            else:
+                _expand(leaf, config, model, device, summarizer)
 
         _backprop(leaf, value)
 
