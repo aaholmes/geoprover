@@ -132,6 +132,88 @@ We implemented two policy head variants:
 
 **Decision**: Fixed-size for training/evaluation, dot-product available for future work. The fixed-size head is simpler and faster, and the 2048-slot indexing scheme (7 types x 292 slots per type) covers all constructions we generate.
 
+## SetGeoTransformer: From Sequence to Set
+
+### The remaining permutation problem
+
+The GeoTransformer solved the point-labeling sensitivity of the CNN, but introduced a new one: **fact-ordering sensitivity**. The proof state `"coll a b c ; para a b c d"` and `"para a b c d ; coll a b c"` are semantically identical but produce different positional embeddings. This caused:
+
+1. **Non-deterministic outputs**: `HashSet` iteration order in Rust varies between runs, so the same state gets serialized differently. This produced +/-2 solve-count variation.
+2. **Augmentation tax**: We needed fact-shuffling augmentation during training to teach the model that order doesn't matter — wasting capacity learning something the architecture should guarantee.
+3. **Separate FactSummarizer**: A second model (~500K params) was needed to filter deduced facts because the flat sequence couldn't efficiently attend over hundreds of facts.
+
+### Architecture: facts as a permutable set
+
+The SetGeoTransformer treats the proof state as a **set of statements** with a distinguished **goal element**, achieving permutation invariance by construction:
+
+```
+                    ┌─────────────────────────────────────────────┐
+                    │           Stage 1: Per-Statement Encoding   │
+                    │         (shared 2-layer transformer)        │
+                    │         intra-fact positional embeddings     │
+                    └──────────────┬──────────────────┬───────────┘
+                                   │                  │
+                         fact [CLS] embs        goal [CLS] emb
+                          (B, N, 256)             (B, 1, 256)
+                                   │                  │
+                    ┌──────────────┴──────────────┐   │
+                    │  Stage 2: Fact Self-Attention│   │
+                    │  (2-layer transformer)       │   │
+                    │  NO positional embeddings    │   │
+                    │  → permutation equivariant   │   │
+                    └──────────────┬───────────────┘   │
+                                   │                   │
+                         enriched facts          goal query
+                          (B, N, 256)           (B, 1, 256)
+                                   │                   │
+                    ┌──────────────┴───────────────────┴──────────┐
+                    │    Stage 3: Goal-Conditioned Aggregation    │
+                    │    (2-layer cross-attention: goal → facts)  │
+                    │    + mean-pool residual                     │
+                    └──────────────────────┬──────────────────────┘
+                                           │
+                                     state_repr
+                                      (B, 256)
+                                      ┌────┴────┐
+                              ┌───────┴──┐  ┌───┴────────┐
+                              │  Value   │  │   Policy   │
+                              │  FC→sig  │  │  FC→2048   │
+                              │  [0, 1]  │  │  logits    │
+                              └──────────┘  └────────────┘
+```
+
+**Stage 1 (Per-Statement Encoding)**: Each fact (e.g., `"coll a b c"`) and the goal are independently tokenized into short sequences (max 16 tokens) and encoded through a shared 2-layer transformer. Positional embeddings exist *within* each statement — distinguishing keyword from arguments — but NOT *between* statements. The [CLS] token of each statement becomes its embedding.
+
+**Stage 2 (Fact Self-Attention)**: The N fact embeddings attend to each other through a 2-layer transformer with **no positional embeddings**. Since self-attention over a set without positional encoding is permutation equivariant, reordering the input facts produces the same set of output embeddings (in the corresponding order). This is the key invariance property.
+
+**Stage 3 (Goal-Conditioned Aggregation)**: The goal embedding cross-attends into the enriched fact embeddings. This produces a goal representation that is informed by the facts. A mean-pool residual over all valid facts is added to capture global state information. The combined representation is the final state vector.
+
+**Stage 4 (Task Heads)**: Same as GeoTransformer — value head (FC → sigmoid) and policy head (FC → 2048 logits).
+
+### Why this subsumes the FactSummarizer
+
+The FactSummarizer was a separate model that scored each deduced fact for relevance to the goal. In the SetGeoTransformer, Stage 3's cross-attention weights serve the same function: the goal naturally attends more to relevant facts and ignores irrelevant ones. No separate model needed, no filtering step, no adaptive-K tuning.
+
+### The all-PAD row problem
+
+When batching states with different numbers of facts, shorter states get padded with all-zero (PAD) token rows. Running these through the intra-encoder produces NaN — the attention mask marks every position as "ignore", so softmax over all `-inf` values gives NaN.
+
+**Fix**: Before encoding, partition the flattened `(B*N, L)` fact matrix into real facts and padding rows using the `fact_mask`. Only real facts go through the transformer; padding rows get zero embeddings. This is a common pitfall with transformer encoders over variable-length sets.
+
+### Verified permutation invariance
+
+The test suite includes an explicit permutation-invariance check: encode the same 4 facts in original, reversed, and shuffled order, and verify that value and policy outputs are identical (max diff < 1e-5). This passes by construction — no positional embeddings in Stage 2 means the model literally cannot distinguish fact orderings.
+
+### Parameter budget
+
+~3.9M parameters (vs ~4.0M for the original GeoTransformer):
+- Stage 1 (shared intra-encoder): ~1.1M
+- Stage 2 (fact self-attention): ~1.1M
+- Stage 3 (cross-attention + norms): ~1.1M
+- Stage 4 (value + policy heads): ~0.6M
+
+The two models are close enough in size for fair A/B comparison.
+
 ## Phase 5: Training Pipeline
 
 ### Three-phase training
@@ -248,6 +330,12 @@ The 20x32x32 CNN encoding was our first attempt. It suffered from:
 - No way to encode the goal distinctly from facts
 
 We kept it as `encoding.rs` for ablation studies but it's not used in the final system.
+
+### Flat-sequence encoding for unordered facts
+
+The GeoTransformer concatenates all facts into a single token sequence with positional embeddings. This means the model sees `"coll a b c ; para a b c d"` and `"para a b c d ; coll a b c"` as different inputs. We mitigated this with fact-shuffling augmentation, but the model still needed to learn something the architecture should guarantee.
+
+**Resolution**: The SetGeoTransformer treats facts as a permutable set with no inter-fact positional embeddings. Permutation invariance holds by construction, verified by automated tests. See the dedicated section above.
 
 ### Deep MCTS search (max_depth > 2)
 

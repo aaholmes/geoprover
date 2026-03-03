@@ -115,13 +115,58 @@ Rust extension module (MCTS, deduction engine, state encoding, synthetic data)
 | 2 | MCTS tree search | Search over auxiliary constructions (~20-30 candidates/step) |
 | 3 | Neural oracle | GeoTransformer (~5M params), dual-head: policy + value |
 
-**GeoTransformer architecture:**
+**Two neural architectures** (selectable via `--model-type`):
+
+**SetGeoTransformer** (`--model-type set`, ~3.9M params) — set-equivariant, permutation invariant by construction:
+
+```
+                    ┌─────────────────────────────────────────────┐
+                    │           Stage 1: Per-Statement Encoding   │
+                    │         (shared 2-layer transformer)        │
+                    │         intra-fact positional embeddings     │
+                    └──────────────┬──────────────────┬───────────┘
+                                   │                  │
+                         fact [CLS] embs        goal [CLS] emb
+                          (B, N, 256)             (B, 1, 256)
+                                   │                  │
+                    ┌──────────────┴──────────────┐   │
+                    │  Stage 2: Fact Self-Attention│   │
+                    │  (2-layer transformer)       │   │
+                    │  NO positional embeddings    │   │
+                    │  → permutation equivariant   │   │
+                    └──────────────┬───────────────┘   │
+                                   │                   │
+                         enriched facts          goal query
+                          (B, N, 256)           (B, 1, 256)
+                                   │                   │
+                    ┌──────────────┴───────────────────┴──────────┐
+                    │    Stage 3: Goal-Conditioned Aggregation    │
+                    │    (2-layer cross-attention: goal → facts)  │
+                    │    + mean-pool residual                     │
+                    └──────────────────────┬──────────────────────┘
+                                           │
+                                     state_repr
+                                      (B, 256)
+                                      ┌────┴────┐
+                              ┌───────┴──┐  ┌───┴────────┐
+                              │  Value   │  │   Policy   │
+                              │  FC→sig  │  │  FC→2048   │
+                              │  [0, 1]  │  │  logits    │
+                              └──────────┘  └────────────┘
+```
+
+Key properties:
+- **Permutation invariant**: No cross-fact positional embeddings; reordering facts produces identical output
+- **Goal isolation**: Goal uses same encoder but separate cross-attention projections as the "query" into facts
+- **Subsumes FactSummarizer**: Stage 3 attention weights implicitly learn fact relevance (no separate model needed)
+- **Eliminates fact-order sensitivity**: The +/-2 solve-count variation from `HashSet` iteration order is architecturally eliminated
+
+**GeoTransformer** (`--model-type transformer`, ~4M params) — the original flat-sequence model:
 - Input: tokenized text sequence (proof state as relation list + goal)
 - Backbone: 6-layer transformer encoder, d_model=256, 8 heads, dim_ff=512
 - Custom tokenizer: ~86-token geometry vocabulary (point names, relation/construction keywords)
 - Policy head: 2048 logits over construction index space (7 types x 292 slots)
 - Value head: `V = sigmoid(v_logit)` — single scalar output in [0, 1]
-- ~5M trainable parameters
 
 **Training pipeline (3-phase):**
 1. Synthetic pre-training on Rust-generated random geometry configurations (50K examples, mixed difficulty, with negative examples)
@@ -169,13 +214,14 @@ src/
     node.rs         MctsNode (Rc<RefCell> tree), expand, evaluate, backprop, UCB/PUCT
     search.rs       mcts_search() loop, select_leaf, proof path extraction
 python/
-  model.py          GeoTransformer (text-based), GeoNetCNN (legacy), tokenizer
+  model.py          SetGeoTransformer, GeoTransformer, GeoNetCNN (legacy), tokenizer
   orchestrate.py    NN-guided MCTS (Python-side tree), all-node sample collection
   train.py          3-phase training: synthetic -> supervised -> expert iteration
   evaluate.py       Benchmark suite: deduction vs MCTS+NN, comparison reports
+  summarizer.py     FactSummarizer: cross-attention fact relevance scoring
   visualize.py      Coordinate synthesis + static proof diagram rendering
   animate.py        Animated proof walkthroughs + MCTS tree visualization
-  test_nn.py        17 end-to-end tests for NN modules
+  test_nn.py        36 end-to-end tests for NN modules
   test_bridge.py    14 PyO3 bridge smoke tests
 web/
   index.html        Interactive dashboard: problem browser, charts, IMO comparison
@@ -248,22 +294,26 @@ cargo clippy                                        # lint
 cargo test --test test_integration -- --nocapture   # integration tests with output
 maturin develop                                     # build PyO3 extension
 python python/test_bridge.py                        # PyO3 bridge smoke tests (14 tests)
-python python/test_nn.py                            # NN module tests (17 tests)
+python python/test_nn.py                            # NN module tests (36 tests)
+./scripts/test-fast.sh                              # Full fast suite (~20s)
 ```
 
 ## Training
 
 ```bash
-# Phase A+B: Synthetic pre-training + supervised fine-tuning
-python python/train.py --supervised-only --synthetic-size 50000
+# Train SetGeoTransformer (set-equivariant, recommended)
+python python/train.py --model-type set --supervised-only --synthetic-size 50000
+
+# Train GeoTransformer (original flat-sequence model)
+python python/train.py --model-type transformer --supervised-only --synthetic-size 50000
 
 # Full pipeline: synthetic + supervised + expert iteration
-python python/train.py --iterations 10 --synthetic-size 50000
+python python/train.py --model-type set --iterations 10 --synthetic-size 50000
 
 # Resume expert iteration from checkpoint
-python python/train.py --resume checkpoints/supervised.pt --iterations 10
+python python/train.py --model-type set --resume checkpoints/supervised.pt --iterations 10
 
 # Evaluate
-python python/evaluate.py --checkpoint checkpoints/iter_005.pt
+python python/evaluate.py --model-type set --checkpoint checkpoints/iter_005.pt
 python python/evaluate.py --deduction-only
 ```
