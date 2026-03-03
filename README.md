@@ -118,7 +118,7 @@ Rust extension module (MCTS, deduction engine, state encoding, synthetic data)
 
 **Three neural architectures** (selectable via `--model-type`):
 
-**SetGeoTransformerV2** (`--model-type set_v2`, ~3.2M params) — 3-way attention with deferred saturation:
+**SetGeoTransformerV2** (`--model-type set_v2`, ~4.0M params) — 3-way attention with deferred saturation:
 
 ```
                     ┌─────────────────────────────────────────────┐
@@ -139,25 +139,28 @@ Rust extension module (MCTS, deduction engine, state encoding, synthetic data)
                            │                  │
                            │            joint_query
                            │             (1, 256)
-                           │                  │
-                    ┌──────┴──────────────────┴───────────────────┐
-                    │    Stage 3: Query-to-Facts Cross-Attention  │
-                    │    (2-layer cross-attn: joint_q → facts)   │
-                    │    O(N) per construction — no N² attention  │
-                    └──────────────────────┬──────────────────────┘
-                                           │
-                                     state_repr
-                                      (1, 256)
-                                      ┌────┴────┐
-                              ┌───────┴──┐  ┌───┴────────┐
-                              │  Value   │  │  Policy    │
-                              │  FC→sig  │  │  Linear→1  │
-                              │  [0, 1]  │  │  (scalar)  │
-                              └──────────┘  └────────────┘
+                           │         ┌────────┴────────┐
+                           │         │                 │(goal_emb, no fusion)
+                    ┌──────┴─────────┴──┐  ┌───────────┴───────────┐
+                    │ Stage 3a: Policy  │  │ Stage 3b: Value       │
+                    │ (2-layer xattn)   │  │ (2-layer xattn)       │
+                    │ joint_q → facts   │  │ raw goal → facts      │
+                    │ O(N)/construction │  │ O(N), no construction  │
+                    └─────────┬─────────┘  └───────────┬───────────┘
+                              │                        │
+                        state_repr               value_repr
+                         (1, 256)                 (1, 256)
+                              │                        │
+                      ┌───────┴──┐             ┌───────┴──┐
+                      │  Policy  │             │  Value   │
+                      │ Linear→1 │             │  FC→sig  │
+                      │ (scalar) │             │  [0, 1]  │
+                      └──────────┘             └──────────┘
 ```
 
 Key properties:
 - **O(N) per construction**: No fact-to-fact attention; joint query attends to N facts once per candidate
+- **Separate policy/value queries**: Policy fuses goal+construction ("is this construction useful?"); value uses raw goal ("how close are we?"). Same fact KV, different query weights.
 - **KV caching**: Fact embeddings computed once per node and inherited by children; goal embedding cached at root
 - **Deferred saturation**: During MCTS expand, children are scored *before* saturation; only the PUCT-selected child gets saturated
 - **Per-construction policy**: Each construction gets a scalar logit (no fixed 2048-slot index space)

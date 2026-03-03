@@ -212,9 +212,11 @@ V2 eliminates fact-to-fact attention entirely. See the architecture diagram in R
 
 **Stage 2 (Goal-Construction Fusion)**: 2-layer cross-attention where the goal embedding (query) attends to the construction's full token sequence (key/value). This produces a `joint_query` that captures "what is this construction in the context of what we want to prove?" Each construction type (midpoint, altitude, circumcenter...) produces different attention patterns, letting the model learn type-specific reasoning.
 
-**Stage 3 (Joint-Query-to-Facts Cross-Attention)**: The joint query (1 vector) attends to all N fact embeddings. This is **O(N) per construction**, not O(N²). The model learns to find facts relevant to the specific (goal, construction) pair — e.g., for a circumcenter construction targeting a perpendicularity goal, it attends to congruence and on-circle facts.
+**Stage 3a (Policy Query-to-Facts)**: The joint query (1 vector) attends to all N fact embeddings via 2-layer cross-attention. This is **O(N) per construction**, not O(N²). The model learns to find facts relevant to the specific (goal, construction) pair — e.g., for a circumcenter construction targeting a perpendicularity goal, it attends to congruence and on-circle facts.
 
-**Stage 4 (Per-Construction Policy)**: Each construction gets its own scalar logit via `Linear(d_model, 1)`. No fixed index space, no hashing collisions. Value head uses a direct goal→facts query path (bypassing Stage 2) since value doesn't depend on which construction is being considered.
+**Stage 3b (Value Query-to-Facts)**: The raw goal embedding (without construction fusion) attends to the same fact embeddings via a **separate** 2-layer cross-attention with independent weights. This asks a different question — "how close is the current state to proving the goal?" — which doesn't depend on which construction is being considered. The fact KV cache is shared between 3a and 3b; only the query and attention weights differ.
+
+**Stage 4 (Task Heads)**: Policy uses Stage 3a output → `Linear(d_model, 1)` → scalar logit per construction. Value uses Stage 3b output → `FC(128) → ReLU → FC(1) → sigmoid`. No fixed index space, no hashing collisions.
 
 ### Deferred saturation in MCTS
 
@@ -250,13 +252,14 @@ The training loss changes from KL-div over 2048 logits to KL-div over K logits (
 
 ### Parameter budget
 
-~3.2M parameters (room to grow within the 4M budget):
-- Stage 1 (shared intra-encoder): ~790K
+~4.0M parameters:
+- Stage 1 (shared intra-encoder, 2 layers): ~790K
 - Stage 2 (fusion cross-attention, 2 layers): ~790K
-- Stage 3 (fact cross-attention, 2 layers): ~790K
+- Stage 3a (policy fact cross-attention, 2 layers): ~790K
+- Stage 3b (value fact cross-attention, 2 layers): ~790K
 - Heads (value FC + policy linear): ~100K
 
-The reduction from V1's ~3.9M comes from removing the fact self-attention layers and the fixed-size policy head.
+Comparable to V1's ~3.9M. The extra Stage 3b parameters replace the removed fact self-attention layers and fixed-size policy head.
 
 ## Phase 5: Training Pipeline
 
