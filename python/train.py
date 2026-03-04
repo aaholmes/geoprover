@@ -15,8 +15,6 @@ import random
 import threading
 import time
 from collections import deque
-from pathlib import Path
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -107,7 +105,7 @@ def _make_loader(
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
-        pin_memory=use_cuda and num_workers >= 0,
+        pin_memory=use_cuda,
     )
     if collate_fn is not None:
         kwargs["collate_fn"] = collate_fn
@@ -1253,6 +1251,7 @@ def main():
         t0 = time.time()
 
         # Load from cache or generate
+        bg_thread = None
         if args.synthetic_cache and os.path.exists(args.synthetic_cache):
             with open(args.synthetic_cache) as f:
                 synthetic_data = json.load(f)
@@ -1263,16 +1262,11 @@ def main():
             synthetic_data, bg_thread = _generate_synthetic_background(
                 args.synthetic_size, args.synthetic_seed,
             )
-            # If background thread exists, collect before Phase B
-            if bg_thread is not None:
-                # Start training on initial batch while background generates more
-                pass  # bg_thread collected below after synthetic training
-
-        gen_elapsed = time.time() - t0
 
         num_synthetic_epochs = args.epochs * 3
+        num_bg_epochs = args.epochs if bg_thread is not None else 0
         num_supervised_epochs = args.epochs * 5
-        total_epochs = num_synthetic_epochs + num_supervised_epochs
+        total_epochs = num_synthetic_epochs + num_bg_epochs + num_supervised_epochs
         optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=DEFAULT_WEIGHT_DECAY)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=total_epochs, eta_min=lr * 0.01,
@@ -1293,22 +1287,21 @@ def main():
                       f"policy={metrics['policy_loss']:.4f} "
                       f"value={metrics['value_loss']:.4f}")
 
-            # Collect background data if running
-            if 'bg_thread' in dir() and bg_thread is not None:
+            # Collect background data and train on full dataset
+            if bg_thread is not None:
                 print("Waiting for background synthetic generation...")
                 bg_thread.join()
                 synthetic_data.extend(bg_thread.result)
                 print(f"Total synthetic examples: {len(synthetic_data)}")
-                # Retrain with full dataset for remaining epochs
                 if bg_thread.result:
                     loader = _make_typed_loader(
                         synthetic_data, mt, batch_size, num_workers, device,
                         augment=augment, max_seq_len=args.max_seq_len, is_synthetic=True,
                     )
-                    for epoch in range(num_synthetic_epochs // 3):  # extra epochs for new data
+                    for epoch in range(num_bg_epochs):
                         metrics = train_epoch(model, loader, optimizer, device, epoch=epoch, model_type=mt, scaler=scaler)
                         scheduler.step()
-                        print(f"Synthetic+bg epoch {epoch+1}: "
+                        print(f"Synthetic+bg epoch {epoch+1}/{num_bg_epochs}: "
                               f"loss={metrics['loss']:.4f} "
                               f"policy={metrics['policy_loss']:.4f} "
                               f"value={metrics['value_loss']:.4f}")
