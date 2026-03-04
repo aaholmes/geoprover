@@ -1000,6 +1000,116 @@ def test_v2_construction_scoring():
     print("  PASS: v2 construction scoring")
 
 
+# --- GPU/CPU acceleration tests ---
+
+def test_resolve_device():
+    """Test _resolve_device auto-detection and fallback."""
+    from train import _resolve_device
+    # Explicit CPU always works
+    assert _resolve_device("cpu") == "cpu"
+    # Auto should return a valid device string
+    result = _resolve_device("auto")
+    assert result in ("cpu", "cuda", "mps"), f"Unexpected device: {result}"
+    # If CUDA not available, cuda should fall back to cpu
+    if not torch.cuda.is_available():
+        assert _resolve_device("cuda") == "cpu"
+    print(f"  auto -> {result}")
+    print("  PASS: resolve_device")
+
+
+def test_get_default_batch_size():
+    """Test _get_default_batch_size returns correct values."""
+    from train import _get_default_batch_size, DEFAULT_BATCH_SIZE
+    assert _get_default_batch_size("cpu") == DEFAULT_BATCH_SIZE
+    assert _get_default_batch_size("cuda") == 256
+    assert _get_default_batch_size("mps") == DEFAULT_BATCH_SIZE
+    print("  PASS: get_default_batch_size")
+
+
+def test_make_loader_cpu():
+    """Test _make_loader returns DataLoader with correct settings for CPU."""
+    from train import _make_loader, V2SyntheticDataset, v2_collate_fn
+    data = geoprover.generate_synthetic_data(5, 42)
+    if len(data) == 0:
+        print("  SKIP: no data")
+        return
+    dataset = V2SyntheticDataset(data)
+    loader = _make_loader(dataset, batch_size=2, shuffle=True, collate_fn=v2_collate_fn,
+                          num_workers=0, device="cpu")
+    assert isinstance(loader, torch.utils.data.DataLoader)
+    assert loader.batch_size == 2
+    # pin_memory should be True even for CPU (harmless no-op)
+    # num_workers=0 means no persistent_workers
+    batch = next(iter(loader))
+    assert len(batch) == 7, f"V2 batch should have 7 elements, got {len(batch)}"
+    print("  PASS: make_loader cpu")
+
+
+def test_make_loader_cuda_settings():
+    """Test _make_loader sets pin_memory=True for CUDA device string."""
+    from train import _make_loader, V2SyntheticDataset, v2_collate_fn
+    data = geoprover.generate_synthetic_data(5, 42)
+    if len(data) == 0:
+        print("  SKIP: no data")
+        return
+    dataset = V2SyntheticDataset(data)
+    # Even without actual CUDA, we test the loader creation with device="cuda"
+    loader = _make_loader(dataset, batch_size=2, shuffle=True, collate_fn=v2_collate_fn,
+                          num_workers=0, device="cuda")
+    assert loader.pin_memory is True, "pin_memory should be True for CUDA"
+    print("  PASS: make_loader cuda settings")
+
+
+def test_train_epoch_with_scaler_none():
+    """Test train_epoch accepts scaler=None and produces valid metrics."""
+    from train import train_epoch, V2SyntheticDataset, v2_collate_fn, _make_loader
+    model = SetGeoTransformerV2()
+    data = geoprover.generate_synthetic_data(5, 42)
+    if len(data) == 0:
+        print("  SKIP: no data")
+        return
+    dataset = V2SyntheticDataset(data)
+    loader = _make_loader(dataset, batch_size=2, shuffle=True, collate_fn=v2_collate_fn,
+                          num_workers=0, device="cpu")
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    metrics = train_epoch(model, loader, optimizer, "cpu", model_type="set_v2", scaler=None)
+    assert "loss" in metrics
+    assert metrics["loss"] > 0
+    print(f"  loss={metrics['loss']:.4f}")
+    print("  PASS: train_epoch with scaler=None")
+
+
+def test_make_typed_loader():
+    """Test _make_typed_loader creates loaders for all model types."""
+    from train import _make_typed_loader
+    data = geoprover.generate_synthetic_data(5, 42)
+    if len(data) == 0:
+        print("  SKIP: no data")
+        return
+    for mt in ["set_v2", "set", "transformer"]:
+        loader = _make_typed_loader(data, mt, batch_size=2, num_workers=0,
+                                    device="cpu", is_synthetic=True)
+        batch = next(iter(loader))
+        assert len(batch) > 0, f"Empty batch for {mt}"
+    print("  PASS: make_typed_loader")
+
+
+def test_background_synthetic_gen():
+    """Test threaded synthetic generation produces valid results."""
+    from train import _generate_synthetic_background
+    data, bg = _generate_synthetic_background(total_size=20, seed=99, initial_size=10)
+    assert len(data) > 0, "Should have initial data"
+    if bg is not None:
+        bg.join(timeout=30)
+        assert not bg.is_alive(), "Background thread should finish"
+        data.extend(bg.result)
+    assert len(data) >= 10, f"Expected >=10 examples, got {len(data)}"
+    for state, constr, goal in data:
+        assert isinstance(state, str) and len(state) > 0
+    print(f"  Generated {len(data)} examples (initial + background)")
+    print("  PASS: background synthetic gen")
+
+
 # Tests organized by speed.
 # Fast tests run in <2s each, slow tests may take minutes.
 FAST_TESTS = [
@@ -1047,6 +1157,14 @@ FAST_TESTS = [
     test_v2_kv_cache_consistency,
     test_v2_training_step,
     test_v2_construction_scoring,
+    # GPU/CPU acceleration tests
+    test_resolve_device,
+    test_get_default_batch_size,
+    test_make_loader_cpu,
+    test_make_loader_cuda_settings,
+    test_train_epoch_with_scaler_none,
+    test_make_typed_loader,
+    test_background_synthetic_gen,
 ]
 
 SLOW_TESTS = [

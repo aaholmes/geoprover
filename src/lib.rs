@@ -226,21 +226,27 @@ impl PyProofTrace {
 
 /// Parse a JGEX DSL problem string into a PyProofState.
 #[pyfunction]
-fn parse_problem(problem_text: &str) -> PyResult<PyProofState> {
-    let state = parser::parse_problem(problem_text)
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+fn parse_problem(py: Python<'_>, problem_text: &str) -> PyResult<PyProofState> {
+    let text = problem_text.to_string();
+    let state = py.allow_threads(|| {
+        parser::parse_problem(&text)
+    }).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
     Ok(PyProofState { inner: state })
 }
 
 /// Run deduction to fixed point with default config. Returns true if goal is proved.
 #[pyfunction]
-fn saturate(state: &mut PyProofState) -> PyResult<bool> {
-    Ok(deduction::saturate(&mut state.inner))
+fn saturate(py: Python<'_>, state: &mut PyProofState) -> PyResult<bool> {
+    let mut inner = state.inner.clone();
+    let result = py.allow_threads(|| deduction::saturate(&mut inner));
+    state.inner = inner;
+    Ok(result)
 }
 
 /// Run deduction with custom config. Returns true if goal is proved.
 #[pyfunction]
 fn saturate_with_config(
+    py: Python<'_>,
     state: &mut PyProofState,
     max_iterations: usize,
     max_facts: usize,
@@ -250,18 +256,23 @@ fn saturate_with_config(
         max_facts,
         ..deduction::SaturateConfig::default()
     };
-    Ok(deduction::saturate_with_config(&mut state.inner, &config))
+    let mut inner = state.inner.clone();
+    let result = py.allow_threads(|| deduction::saturate_with_config(&mut inner, &config));
+    state.inner = inner;
+    Ok(result)
 }
 
 /// Run deduction with proof trace. Returns (proved, PyProofTrace).
 #[pyfunction]
-fn saturate_with_trace(state: &mut PyProofState) -> PyResult<(bool, PyProofTrace)> {
-    let (proved, trace) = deduction::saturate_with_trace(&mut state.inner);
+fn saturate_with_trace(py: Python<'_>, state: &mut PyProofState) -> PyResult<(bool, PyProofTrace)> {
+    let mut inner = state.inner.clone();
+    let (proved, trace) = py.allow_threads(|| deduction::saturate_with_trace(&mut inner));
+    state.inner = inner.clone();
     Ok((
         proved,
         PyProofTrace {
             inner: trace,
-            state: state.inner.clone(),
+            state: inner,
         },
     ))
 }
@@ -274,8 +285,9 @@ fn encode_state(state: &PyProofState) -> PyResult<Vec<f32>> {
 
 /// Generate candidate auxiliary constructions for the current state.
 #[pyfunction]
-fn generate_constructions(state: &PyProofState) -> PyResult<Vec<PyConstruction>> {
-    let constructions = construction::generate_constructions(&state.inner);
+fn generate_constructions(py: Python<'_>, state: &PyProofState) -> PyResult<Vec<PyConstruction>> {
+    let inner = state.inner.clone();
+    let constructions = py.allow_threads(|| construction::generate_constructions(&inner));
     Ok(constructions
         .into_iter()
         .map(|c| PyConstruction { inner: c })
@@ -312,8 +324,8 @@ fn construction_to_text(construction: &PyConstruction, state: &PyProofState) -> 
 
 /// Generate synthetic training data: Vec of (state_text, construction_text, goal_text).
 #[pyfunction]
-fn generate_synthetic_data(num_examples: usize, seed: u64) -> PyResult<Vec<(String, String, String)>> {
-    Ok(synthetic::generate_batch(num_examples, seed))
+fn generate_synthetic_data(py: Python<'_>, num_examples: usize, seed: u64) -> PyResult<Vec<(String, String, String)>> {
+    Ok(py.allow_threads(|| synthetic::generate_batch(num_examples, seed)))
 }
 
 // --- Module registration ---

@@ -12,6 +12,7 @@ import argparse
 import json
 import os
 import random
+import threading
 import time
 from collections import deque
 from pathlib import Path
@@ -68,6 +69,52 @@ DEFAULT_SYNTHETIC_SIZE = 50000
 DEFAULT_SYNTHETIC_SEED = 42
 DEFAULT_MAX_SEQ_LEN = 128
 DEFAULT_SELFPLAY_MCTS_ITERS = 200
+
+
+def _resolve_device(requested: str) -> str:
+    """Resolve device string: 'auto' detects best available device."""
+    if requested != "auto":
+        if requested == "cuda" and not torch.cuda.is_available():
+            print("CUDA not available, falling back to CPU")
+            return "cpu"
+        return requested
+    if torch.cuda.is_available():
+        return "cuda"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def _get_default_batch_size(device: str) -> int:
+    """Return default batch size based on device."""
+    if device == "cuda":
+        return 256
+    return DEFAULT_BATCH_SIZE  # 128
+
+
+def _make_loader(
+    dataset: Dataset,
+    batch_size: int,
+    shuffle: bool,
+    collate_fn=None,
+    *,
+    num_workers: int = 0,
+    device: str = "cpu",
+) -> DataLoader:
+    """Create a DataLoader with device-appropriate settings."""
+    use_cuda = device == "cuda"
+    kwargs = dict(
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=use_cuda and num_workers >= 0,
+    )
+    if collate_fn is not None:
+        kwargs["collate_fn"] = collate_fn
+    if num_workers > 0:
+        kwargs["persistent_workers"] = True
+        kwargs["prefetch_factor"] = 2
+    return DataLoader(dataset, **kwargs)
 
 
 class ReplayBuffer:
@@ -796,6 +843,7 @@ def train_epoch(
     value_weight: float = DEFAULT_VALUE_WEIGHT,
     epoch: int = 0,
     model_type: str = "transformer",
+    scaler: torch.amp.GradScaler | None = None,
 ) -> dict:
     """Train for one epoch. Returns average metrics."""
     # Update dataset epoch for augmentation
@@ -807,6 +855,8 @@ def train_epoch(
 
     is_set = model_type == "set"
     is_v2 = model_type == "set_v2"
+    use_amp = scaler is not None
+    amp_device_type = "cuda" if device == "cuda" else "cpu"
 
     for batch in dataloader:
         if is_v2:
@@ -820,11 +870,12 @@ def train_epoch(
             value_targets = value_targets.to(device)
 
             optimizer.zero_grad()
-            loss, metrics = compute_v2_loss(
-                model, fact_ids, goal_ids, fact_mask,
-                constr_ids, constr_mask, constr_weights,
-                value_targets, value_weight,
-            )
+            with torch.amp.autocast(amp_device_type, enabled=use_amp):
+                loss, metrics = compute_v2_loss(
+                    model, fact_ids, goal_ids, fact_mask,
+                    constr_ids, constr_mask, constr_weights,
+                    value_targets, value_weight,
+                )
         elif is_set:
             fact_ids, goal_ids, fact_mask, policy_targets, value_targets = batch
             fact_ids = fact_ids.to(device)
@@ -834,10 +885,11 @@ def train_epoch(
             value_targets = value_targets.to(device)
 
             optimizer.zero_grad()
-            loss, metrics = compute_set_loss(
-                model, fact_ids, goal_ids, fact_mask,
-                policy_targets, value_targets, value_weight,
-            )
+            with torch.amp.autocast(amp_device_type, enabled=use_amp):
+                loss, metrics = compute_set_loss(
+                    model, fact_ids, goal_ids, fact_mask,
+                    policy_targets, value_targets, value_weight,
+                )
         else:
             token_ids, policy_targets, value_targets = batch
             token_ids = token_ids.to(device)
@@ -845,13 +897,21 @@ def train_epoch(
             value_targets = value_targets.to(device)
 
             optimizer.zero_grad()
-            loss, metrics = compute_loss(
-                model, token_ids, policy_targets, value_targets, value_weight
-            )
+            with torch.amp.autocast(amp_device_type, enabled=use_amp):
+                loss, metrics = compute_loss(
+                    model, token_ids, policy_targets, value_targets, value_weight
+                )
 
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        if use_amp:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
 
         for k_name, v in metrics.items():
             total_metrics[k_name] = total_metrics.get(k_name, 0.0) + v
@@ -893,6 +953,41 @@ def load_checkpoint(
     return checkpoint.get("iteration", 0)
 
 
+def _make_typed_loader(
+    samples,
+    model_type: str,
+    batch_size: int,
+    num_workers: int,
+    device: str,
+    augment: bool = True,
+    max_seq_len: int = DEFAULT_MAX_SEQ_LEN,
+    is_synthetic: bool = False,
+) -> DataLoader:
+    """Create a DataLoader for the given model type and sample source."""
+    if model_type == "set_v2":
+        if is_synthetic:
+            dataset = V2SyntheticDataset(samples, augment=augment)
+        else:
+            dataset = V2GeometryDataset(samples, augment=augment)
+        collate_fn = v2_collate_fn
+    elif model_type == "set":
+        if is_synthetic:
+            dataset = SetSyntheticDataset(samples, augment=augment)
+        else:
+            dataset = SetGeometryDataset(samples, augment=augment)
+        collate_fn = set_collate_fn
+    else:
+        if is_synthetic:
+            dataset = SyntheticDataset(samples, max_seq_len=max_seq_len, augment=augment)
+        else:
+            dataset = TextGeometryDataset(samples, max_seq_len=max_seq_len, augment=augment)
+        collate_fn = None
+    return _make_loader(
+        dataset, batch_size, shuffle=True, collate_fn=collate_fn,
+        num_workers=num_workers, device=device,
+    )
+
+
 def expert_iteration(
     model,
     problems_file: str = DEFAULT_PROBLEMS_FILE,
@@ -909,6 +1004,7 @@ def expert_iteration(
     max_seq_len: int = DEFAULT_MAX_SEQ_LEN,
     augment: bool = True,
     model_type: str = "set_v2",
+    num_workers: int = 0,
 ):
     """Run expert iteration training loop.
 
@@ -928,6 +1024,7 @@ def expert_iteration(
     )
     replay = ReplayBuffer()
     start_iter = 0
+    scaler = torch.amp.GradScaler("cuda") if device == "cuda" else None
 
     if resume_from and os.path.exists(resume_from):
         start_iter = load_checkpoint(model, optimizer, resume_from, device)
@@ -955,17 +1052,12 @@ def expert_iteration(
     print(f"  Generated {len(synthetic_data)} examples in {elapsed:.1f}s")
 
     if synthetic_data:
-        if model_type == "set_v2":
-            dataset = V2SyntheticDataset(synthetic_data, augment=augment)
-            loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=v2_collate_fn)
-        elif model_type == "set":
-            dataset = SetSyntheticDataset(synthetic_data, augment=augment)
-            loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=set_collate_fn)
-        else:
-            dataset = SyntheticDataset(synthetic_data, max_seq_len=max_seq_len, augment=augment)
-            loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+        loader = _make_typed_loader(
+            synthetic_data, model_type, batch_size, num_workers, device,
+            augment=augment, max_seq_len=max_seq_len, is_synthetic=True,
+        )
         for epoch in range(epochs_per_iter * 2):  # more epochs for synthetic
-            metrics = train_epoch(model, loader, optimizer, device, value_weight, epoch=epoch, model_type=model_type)
+            metrics = train_epoch(model, loader, optimizer, device, value_weight, epoch=epoch, model_type=model_type, scaler=scaler)
             scheduler.step()
             print(f"  Synthetic epoch {epoch+1}: "
                   f"loss={metrics['loss']:.4f} "
@@ -985,17 +1077,12 @@ def expert_iteration(
     )
     if supervised_samples:
         replay.add(supervised_samples)
-        if model_type == "set_v2":
-            dataset = V2GeometryDataset(supervised_samples, augment=augment)
-            loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=v2_collate_fn)
-        elif model_type == "set":
-            dataset = SetGeometryDataset(supervised_samples, augment=augment)
-            loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=set_collate_fn)
-        else:
-            dataset = TextGeometryDataset(supervised_samples, max_seq_len=max_seq_len, augment=augment)
-            loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+        loader = _make_typed_loader(
+            supervised_samples, model_type, batch_size, num_workers, device,
+            augment=augment, max_seq_len=max_seq_len,
+        )
         for epoch in range(epochs_per_iter):
-            metrics = train_epoch(model, loader, optimizer, device, value_weight, epoch=epoch, model_type=model_type)
+            metrics = train_epoch(model, loader, optimizer, device, value_weight, epoch=epoch, model_type=model_type, scaler=scaler)
             scheduler.step()
             print(f"  Supervised epoch {epoch+1}: "
                   f"loss={metrics['loss']:.4f} "
@@ -1029,17 +1116,12 @@ def expert_iteration(
 
         if len(replay) >= batch_size:
             train_samples = replay.all()
-            if model_type == "set_v2":
-                dataset = V2GeometryDataset(train_samples, augment=augment)
-                loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=v2_collate_fn)
-            elif model_type == "set":
-                dataset = SetGeometryDataset(train_samples, augment=augment)
-                loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=set_collate_fn)
-            else:
-                dataset = TextGeometryDataset(train_samples, max_seq_len=max_seq_len, augment=augment)
-                loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+            loader = _make_typed_loader(
+                train_samples, model_type, batch_size, num_workers, device,
+                augment=augment, max_seq_len=max_seq_len,
+            )
             for epoch in range(epochs_per_iter):
-                metrics = train_epoch(model, loader, optimizer, device, value_weight, epoch=epoch, model_type=model_type)
+                metrics = train_epoch(model, loader, optimizer, device, value_weight, epoch=epoch, model_type=model_type, scaler=scaler)
                 scheduler.step()
             print(f"  Train: loss={metrics['loss']:.4f} "
                   f"policy={metrics['policy_loss']:.4f} "
@@ -1057,14 +1139,69 @@ def expert_iteration(
     return model
 
 
+def _generate_synthetic_background(
+    total_size: int,
+    seed: int,
+    initial_size: int = 10000,
+) -> tuple[list, threading.Thread | None]:
+    """Generate synthetic data, returning initial batch and background thread for the rest.
+
+    Returns (initial_data, bg_thread). If total_size <= initial_size, bg_thread is None.
+    Call bg_thread.join() then access bg_thread.result for remaining data.
+    """
+    batch_gen_size = min(total_size, 2000)
+
+    # Generate initial batch synchronously
+    initial_data = []
+    generated = 0
+    t0 = time.time()
+    while generated < min(total_size, initial_size):
+        batch = min(batch_gen_size, min(total_size, initial_size) - generated)
+        chunk = geoprover.generate_synthetic_data(batch, seed + generated)
+        initial_data.extend(chunk)
+        generated += batch
+        elapsed = time.time() - t0
+        rate = len(initial_data) / elapsed if elapsed > 0 else 0
+        print(f"  {len(initial_data)}/{total_size} ({rate:.0f}/s, {elapsed:.0f}s)")
+
+    if generated >= total_size:
+        return initial_data, None
+
+    # Spawn background thread for the rest (GIL released in Rust)
+    remaining = total_size - generated
+    bg_seed = seed + generated
+
+    class BgThread(threading.Thread):
+        def __init__(self):
+            super().__init__(daemon=True)
+            self.result: list = []
+
+        def run(self):
+            data = []
+            gen = 0
+            while gen < remaining:
+                batch = min(batch_gen_size, remaining - gen)
+                chunk = geoprover.generate_synthetic_data(batch, bg_seed + gen)
+                data.extend(chunk)
+                gen += batch
+            self.result = data
+
+    bg = BgThread()
+    bg.start()
+    print(f"  Background thread generating {remaining} more examples...")
+    return initial_data, bg
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train GeoTransformer")
     parser.add_argument("--problems", default=DEFAULT_PROBLEMS_FILE, help="Problem file path")
     parser.add_argument("--iterations", type=int, default=DEFAULT_NUM_ITERATIONS)
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS_PER_ITER)
-    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
-    parser.add_argument("--lr", type=float, default=DEFAULT_LR)
-    parser.add_argument("--device", default="cpu", choices=["cpu", "cuda", "mps"])
+    parser.add_argument("--batch-size", type=int, default=None,
+                        help="Batch size (default: 256 for CUDA, 128 for CPU)")
+    parser.add_argument("--lr", type=float, default=None,
+                        help="Learning rate (default: auto-scaled with batch size)")
+    parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
     parser.add_argument("--checkpoint-dir", default=DEFAULT_CHECKPOINT_DIR)
     parser.add_argument("--resume", default=None, help="Resume from checkpoint")
     parser.add_argument("--supervised-only", action="store_true",
@@ -1077,63 +1214,112 @@ def main():
     parser.add_argument("--model-type", default="set_v2",
                         choices=["set", "set_v2", "transformer"],
                         help="Model architecture: 'set' for SetGeoTransformerV1, 'set_v2' for V2, 'transformer' for GeoTransformer")
+    parser.add_argument("--num-workers", type=int, default=None,
+                        help="DataLoader workers (default: 4 for CUDA, 0 for CPU)")
+    parser.add_argument("--synthetic-cache", default=None,
+                        help="Path to cache synthetic data (saves/loads .json)")
+    parser.add_argument("--no-compile", action="store_true",
+                        help="Disable torch.compile on CUDA")
     args = parser.parse_args()
 
-    device = args.device
-    if device == "cuda" and not torch.cuda.is_available():
-        print("CUDA not available, falling back to CPU")
-        device = "cpu"
-
+    device = _resolve_device(args.device)
     print(f"Device: {device}")
+
+    # Auto-tune batch size and learning rate
+    batch_size = args.batch_size if args.batch_size is not None else _get_default_batch_size(device)
+    lr = args.lr if args.lr is not None else DEFAULT_LR * (batch_size / DEFAULT_BATCH_SIZE)
+    num_workers = args.num_workers if args.num_workers is not None else (4 if device == "cuda" else 0)
+    print(f"Batch size: {batch_size}, LR: {lr:.6f}, Workers: {num_workers}")
 
     model = create_model(args.model_type).to(device)
     model_name = type(model).__name__
     print(f"{model_name} parameters: {count_parameters(model):,}")
 
+    # torch.compile for CUDA
+    if device == "cuda" and not args.no_compile:
+        try:
+            model = torch.compile(model, mode="reduce-overhead")
+            print("torch.compile enabled (reduce-overhead)")
+        except Exception as e:
+            print(f"torch.compile failed, continuing without: {e}")
+
+    scaler = torch.amp.GradScaler("cuda") if device == "cuda" else None
+    if scaler:
+        print("AMP enabled (float16)")
+
     if args.supervised_only:
         # Generate synthetic + supervised data and train
         print("Generating synthetic data...")
         t0 = time.time()
-        synthetic_data = []
-        generated = 0
-        batch_gen_size = min(args.synthetic_size, 2000)
-        while generated < args.synthetic_size:
-            batch = min(batch_gen_size, args.synthetic_size - generated)
-            chunk = geoprover.generate_synthetic_data(batch, args.synthetic_seed + generated)
-            synthetic_data.extend(chunk)
-            generated += batch
-            elapsed = time.time() - t0
-            rate = len(synthetic_data) / elapsed if elapsed > 0 else 0
-            print(f"  {len(synthetic_data)}/{args.synthetic_size} ({rate:.0f}/s, {elapsed:.0f}s)")
-        print(f"Generated {len(synthetic_data)} synthetic examples in {time.time()-t0:.1f}s")
+
+        # Load from cache or generate
+        if args.synthetic_cache and os.path.exists(args.synthetic_cache):
+            with open(args.synthetic_cache) as f:
+                synthetic_data = json.load(f)
+            # Convert lists back to tuples
+            synthetic_data = [tuple(x) for x in synthetic_data]
+            print(f"Loaded {len(synthetic_data)} cached synthetic examples from {args.synthetic_cache}")
+        else:
+            synthetic_data, bg_thread = _generate_synthetic_background(
+                args.synthetic_size, args.synthetic_seed,
+            )
+            # If background thread exists, collect before Phase B
+            if bg_thread is not None:
+                # Start training on initial batch while background generates more
+                pass  # bg_thread collected below after synthetic training
+
+        gen_elapsed = time.time() - t0
 
         num_synthetic_epochs = args.epochs * 3
         num_supervised_epochs = args.epochs * 5
         total_epochs = num_synthetic_epochs + num_supervised_epochs
-        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=DEFAULT_WEIGHT_DECAY)
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=DEFAULT_WEIGHT_DECAY)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=total_epochs, eta_min=args.lr * 0.01,
+            optimizer, T_max=total_epochs, eta_min=lr * 0.01,
         )
 
         augment = not args.no_augment
         mt = args.model_type
         if synthetic_data:
-            if mt == "set_v2":
-                dataset = V2SyntheticDataset(synthetic_data, augment=augment)
-                loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=0, collate_fn=v2_collate_fn)
-            elif mt == "set":
-                dataset = SetSyntheticDataset(synthetic_data, augment=augment)
-                loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=0, collate_fn=set_collate_fn)
-            else:
-                dataset = SyntheticDataset(synthetic_data, max_seq_len=args.max_seq_len, augment=augment)
-                loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)
+            loader = _make_typed_loader(
+                synthetic_data, mt, batch_size, num_workers, device,
+                augment=augment, max_seq_len=args.max_seq_len, is_synthetic=True,
+            )
             for epoch in range(num_synthetic_epochs):
-                metrics = train_epoch(model, loader, optimizer, device, epoch=epoch, model_type=mt)
+                metrics = train_epoch(model, loader, optimizer, device, epoch=epoch, model_type=mt, scaler=scaler)
                 scheduler.step()
                 print(f"Synthetic epoch {epoch+1}/{num_synthetic_epochs}: "
                       f"loss={metrics['loss']:.4f} "
                       f"policy={metrics['policy_loss']:.4f} "
                       f"value={metrics['value_loss']:.4f}")
+
+            # Collect background data if running
+            if 'bg_thread' in dir() and bg_thread is not None:
+                print("Waiting for background synthetic generation...")
+                bg_thread.join()
+                synthetic_data.extend(bg_thread.result)
+                print(f"Total synthetic examples: {len(synthetic_data)}")
+                # Retrain with full dataset for remaining epochs
+                if bg_thread.result:
+                    loader = _make_typed_loader(
+                        synthetic_data, mt, batch_size, num_workers, device,
+                        augment=augment, max_seq_len=args.max_seq_len, is_synthetic=True,
+                    )
+                    for epoch in range(num_synthetic_epochs // 3):  # extra epochs for new data
+                        metrics = train_epoch(model, loader, optimizer, device, epoch=epoch, model_type=mt, scaler=scaler)
+                        scheduler.step()
+                        print(f"Synthetic+bg epoch {epoch+1}: "
+                              f"loss={metrics['loss']:.4f} "
+                              f"policy={metrics['policy_loss']:.4f} "
+                              f"value={metrics['value_loss']:.4f}")
+
+            # Save cache if requested
+            if args.synthetic_cache and not os.path.exists(args.synthetic_cache):
+                os.makedirs(os.path.dirname(args.synthetic_cache) or ".", exist_ok=True)
+                with open(args.synthetic_cache, "w") as f:
+                    json.dump(synthetic_data, f)
+                print(f"Cached {len(synthetic_data)} synthetic examples to {args.synthetic_cache}")
+
             save_checkpoint(
                 model, optimizer, 0, metrics,
                 os.path.join(args.checkpoint_dir, "synthetic.pt"),
@@ -1143,17 +1329,12 @@ def main():
             args.problems, model=model, max_seq_len=args.max_seq_len, device=device,
         )
         if samples:
-            if mt == "set_v2":
-                dataset = V2GeometryDataset(samples, augment=augment)
-                loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=0, collate_fn=v2_collate_fn)
-            elif mt == "set":
-                dataset = SetGeometryDataset(samples, augment=augment)
-                loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=0, collate_fn=set_collate_fn)
-            else:
-                dataset = TextGeometryDataset(samples, max_seq_len=args.max_seq_len, augment=augment)
-                loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)
+            loader = _make_typed_loader(
+                samples, mt, batch_size, num_workers, device,
+                augment=augment, max_seq_len=args.max_seq_len,
+            )
             for epoch in range(num_supervised_epochs):
-                metrics = train_epoch(model, loader, optimizer, device, epoch=epoch, model_type=mt)
+                metrics = train_epoch(model, loader, optimizer, device, epoch=epoch, model_type=mt, scaler=scaler)
                 scheduler.step()
                 print(f"Supervised epoch {epoch+1}/{num_supervised_epochs}: "
                       f"loss={metrics['loss']:.4f} "
@@ -1170,8 +1351,8 @@ def main():
             problems_file=args.problems,
             num_iterations=args.iterations,
             epochs_per_iter=args.epochs,
-            batch_size=args.batch_size,
-            lr=args.lr,
+            batch_size=batch_size,
+            lr=lr,
             checkpoint_dir=args.checkpoint_dir,
             device=device,
             resume_from=args.resume,
@@ -1180,6 +1361,7 @@ def main():
             max_seq_len=args.max_seq_len,
             augment=not args.no_augment,
             model_type=args.model_type,
+            num_workers=num_workers,
         )
 
 
