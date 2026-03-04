@@ -1,6 +1,6 @@
 # Geoprover
 
-Neurosymbolic geometry theorem prover using a three-tier MCTS architecture adapted from the Caissawary chess engine. `saturate()` (forward-chaining deduction to fixed point) runs as the Tier 1 symbolic gate before every MCTS expansion. A text-based GeoTransformer neural network suggests auxiliary constructions — the creative step deduction can't do. Benchmarks against AlphaGeometry's JGEX-AG-231 (231 problems) and IMO-AG-30 (30 IMO competition problems).
+Geoprover is a geometry theorem prover that combines symbolic reasoning with neural networks to automatically prove Euclidean geometry theorems. The core idea: a Rust engine applies 54 deduction rules exhaustively (like "if AB∥CD and CD∥EF then AB∥EF") to derive everything it can from the given setup. When pure deduction isn't enough, an MCTS tree search (borrowed from game-playing AI like AlphaZero) tries adding auxiliary constructions — extra points like midpoints, circumcenters, or perpendicular feet — that unlock new deduction chains. A ~4M parameter transformer neural network guides which constructions to try, trained via self-play. Benchmarks against AlphaGeometry's JGEX-AG-231 (231 problems) and IMO-AG-30 (30 IMO competition problems).
 
 ## Results
 
