@@ -183,7 +183,7 @@ Key properties:
 2. Supervised fine-tuning on JGEX problems with MCTS-derived policy targets (not zeros) + all-node sample collection
 3. Expert iteration: MCTS self-play -> collect TD-style value targets (`gamma^D` on winning path, NN estimates off-path) from all tree nodes -> train -> repeat
 
-Both SetGeoTransformer variants train fully end-to-end — cross-attention learns fact relevance implicitly from the policy+value loss, eliminating the separate FactSummarizer pre-training step. V2 additionally uses per-construction logits instead of the fixed 2048-slot policy space, and defers saturation during MCTS expansion for efficiency. The GeoTransformer optionally uses a pretrained FactSummarizer (frozen during RL) to filter post-saturation facts.
+Both SetGeoTransformer variants train fully end-to-end — cross-attention learns fact relevance implicitly from the policy+value loss. V2 additionally uses per-construction logits instead of the fixed 2048-slot policy space, and defers saturation during MCTS expansion for efficiency.
 
 ## Visualization
 
@@ -230,10 +230,10 @@ python/
   orchestrate.py    NN-guided MCTS (Python-side tree), TD-style value learning, all-node sample collection
   train.py          3-phase training: synthetic -> supervised -> expert iteration
   evaluate.py       Benchmark suite: deduction vs MCTS+NN, comparison reports
-  summarizer.py     FactSummarizer: cross-attention fact relevance scoring
+  summarizer.py     FactSummarizer: cross-attention fact relevance scoring (standalone, for ablation)
   visualize.py      Coordinate synthesis + static proof diagram rendering
   animate.py        Animated proof walkthroughs + MCTS tree visualization
-  test_nn.py        47 end-to-end tests for NN modules
+  test_nn.py        41 end-to-end tests for NN modules
   test_bridge.py    14 PyO3 bridge smoke tests
 web/
   index.html        Interactive dashboard: problem browser, charts, IMO comparison
