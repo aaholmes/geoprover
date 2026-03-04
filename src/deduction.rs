@@ -1,6 +1,6 @@
 use crate::proof_state::{ProofState, Relation};
 use crate::proof_trace::{ProofTrace, RuleName};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// Configuration for the saturate loop.
 #[derive(Debug, Clone)]
@@ -396,7 +396,7 @@ pub fn saturate_with_trace(state: &mut ProofState) -> (bool, ProofTrace) {
         // which prevents circular dependencies (a derived fact can't be its own premise).
         // Multiple rules may derive the same fact in one iteration — we record all alternatives.
         let pre_iteration_facts = state.facts.clone();
-        let mut added_this_iter: HashSet<crate::proof_state::Relation> = HashSet::new();
+        let mut added_this_iter: BTreeSet<crate::proof_state::Relation> = BTreeSet::new();
         for (fact, rule) in tagged_facts {
             let is_new = if !added_this_iter.contains(&fact) {
                 state.add_fact(fact.clone())
@@ -429,7 +429,7 @@ pub fn saturate_with_trace(state: &mut ProofState) -> (bool, ProofTrace) {
 
 // --- Rule 20: Transitive Parallel ---
 // If AB ∥ CD and CD ∥ EF, then AB ∥ EF
-fn rule_transitive_parallel(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_transitive_parallel(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
     let parallels: Vec<_> = facts
         .iter()
@@ -464,7 +464,7 @@ fn rule_transitive_parallel(facts: &HashSet<Relation>) -> Vec<Relation> {
 
 // --- Rule 21: Perpendicular to Parallel ---
 // If AB ⊥ CD and EF ⊥ CD, then AB ∥ EF
-fn rule_perp_to_parallel(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_perp_to_parallel(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
     let perps: Vec<_> = facts
         .iter()
@@ -500,7 +500,7 @@ fn rule_perp_to_parallel(facts: &HashSet<Relation>) -> Vec<Relation> {
 
 // --- Rule 13: Midpoint Definition ---
 // If M is midpoint of AB, then |AM| = |MB|
-fn rule_midpoint_definition(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_midpoint_definition(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
     for fact in facts {
         if let Relation::Midpoint(m, a, b) = fact {
@@ -513,7 +513,7 @@ fn rule_midpoint_definition(facts: &HashSet<Relation>) -> Vec<Relation> {
 
 // --- Rule 14: Transitive Congruence ---
 // If |AB| = |CD| and |CD| = |EF|, then |AB| = |EF|
-fn rule_transitive_congruent(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_transitive_congruent(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
     let congs: Vec<_> = facts
         .iter()
@@ -548,7 +548,7 @@ fn rule_transitive_congruent(facts: &HashSet<Relation>) -> Vec<Relation> {
 
 // --- Rule 4: Isosceles Base Angles ---
 // If |AB| = |AC| (isosceles at A), then angle(ABC) = angle(ACB)
-fn rule_isosceles_base_angles(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_isosceles_base_angles(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
     for fact in facts {
         if let Relation::Congruent(a, b, c, d) = fact {
@@ -585,7 +585,7 @@ fn rule_isosceles_base_angles(facts: &HashSet<Relation>) -> Vec<Relation> {
 // If AB ∥ CD and they share a transversal point, angles are equal
 // More precisely: if AB ∥ CD, and there's a transversal line through points on both,
 // then alternate interior angles are equal
-fn rule_alternate_interior_angles(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_alternate_interior_angles(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
     let parallels: Vec<_> = facts
         .iter()
@@ -639,7 +639,7 @@ fn rule_alternate_interior_angles(facts: &HashSet<Relation>) -> Vec<Relation> {
 /// perp(A,B,C,D) and perp(E,F,G,H) and ¬para(A,B,E,F) → eqangle(A,B,E,F, C,D,G,H)
 /// In vertex form: if two perp pairs share vertices in their respective lines,
 /// generate the corresponding equal angle facts.
-fn rule_corresponding_angles(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_corresponding_angles(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
     let perps: Vec<_> = facts
         .iter()
@@ -686,7 +686,7 @@ fn rule_corresponding_angles(facts: &HashSet<Relation>) -> Vec<Relation> {
 // --- Transitive Equal Angles ---
 // If angle(A,B,C) = angle(D,E,F) and angle(D,E,F) = angle(G,H,I),
 // then angle(A,B,C) = angle(G,H,I)
-fn rule_transitive_equal_angle(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_transitive_equal_angle(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
     let eqangles: Vec<_> = facts
         .iter()
@@ -723,7 +723,7 @@ fn rule_transitive_equal_angle(facts: &HashSet<Relation>) -> Vec<Relation> {
 // If AB ⊥ BC (sharing point B) and DE ⊥ EF (sharing point E),
 // then angle(A,B,C) = angle(D,E,F) — all right angles are equal.
 // Also handles: Perp(a,d, b,c) + Collinear(b,d,c) → angle at d is right
-fn rule_perpendicular_angles(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_perpendicular_angles(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
     let perps: Vec<_> = facts
         .iter()
@@ -806,7 +806,7 @@ fn rule_perpendicular_angles(facts: &HashSet<Relation>) -> Vec<Relation> {
 
 // --- Rule: Circle-point equidistance ---
 // If OnCircle(p, center) and OnCircle(q, center), then |center-p| = |center-q|
-fn rule_circle_point_equidistance(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_circle_point_equidistance(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
     let oncircles: Vec<_> = facts
         .iter()
@@ -831,7 +831,7 @@ fn rule_circle_point_equidistance(facts: &HashSet<Relation>) -> Vec<Relation> {
 // --- Rule: Midline parallel ---
 // If Midpoint(m, a, b) and Midpoint(n, a, c) (shared endpoint a),
 // then MN ∥ BC (midline theorem)
-fn rule_midline_parallel(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_midline_parallel(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
     let midpoints: Vec<_> = facts
         .iter()
@@ -871,7 +871,7 @@ fn rule_midline_parallel(facts: &HashSet<Relation>) -> Vec<Relation> {
 // --- Rule: Cyclic from OnCircle ---
 // If OnCircle(a, center), OnCircle(b, center), OnCircle(c, center), OnCircle(d, center),
 // then Cyclic(a, b, c, d)
-fn rule_cyclic_from_oncircle(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_cyclic_from_oncircle(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
 
     // Group points by their circle center
@@ -908,7 +908,7 @@ fn rule_cyclic_from_oncircle(facts: &HashSet<Relation>) -> Vec<Relation> {
 // If equal_angle(a1,b1,c1, a2,b2,c2) where one ray from b1 points to b2
 // and one ray from b2 points to b1, and b1,b2 are collinear with some transversal point,
 // then the other rays are parallel.
-fn rule_equal_angles_to_parallel(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_equal_angles_to_parallel(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
     let eqangles: Vec<_> = facts
         .iter()
@@ -952,7 +952,7 @@ fn rule_equal_angles_to_parallel(facts: &HashSet<Relation>) -> Vec<Relation> {
 // If |PA| = |PB| and |QA| = |QB| (two points equidistant from A,B),
 // then PQ ⊥ AB and the intersection of PQ and AB is the midpoint of AB.
 // Specifically: if Collinear(P,Q,E) and Collinear(A,E,B), then Congruent(A,E,E,B)
-fn rule_perpendicular_bisector(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_perpendicular_bisector(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
 
     // Find all equidistant pairs: points P where |PA| = |PB|
@@ -1032,7 +1032,7 @@ fn rule_perpendicular_bisector(facts: &HashSet<Relation>) -> Vec<Relation> {
 
 // --- Rule: Equidistant point on segment is midpoint ---
 // If |EA| = |EB| and Collinear(A, E, B), then E is midpoint of AB
-fn rule_equidistant_midpoint(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_equidistant_midpoint(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
 
     let collinears: Vec<_> = facts
@@ -1077,7 +1077,7 @@ fn rule_equidistant_midpoint(facts: &HashSet<Relation>) -> Vec<Relation> {
 
 // --- Rule: Midpoint converse ---
 // If Collinear(a, m, b) and Congruent(a, m, m, b), then Midpoint(m, a, b)
-fn rule_midpoint_converse(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_midpoint_converse(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
     let collinears: Vec<_> = facts
         .iter()
@@ -1113,7 +1113,7 @@ fn rule_midpoint_converse(facts: &HashSet<Relation>) -> Vec<Relation> {
 
 // --- Rule: Derive OnCircle from Congruent patterns ---
 // If Congruent(center, p, center, q), derive OnCircle(p, center) and OnCircle(q, center)
-fn rule_congruent_oncircle(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_congruent_oncircle(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
     for fact in facts {
         if let Relation::Congruent(a, b, c, d) = fact {
@@ -1143,7 +1143,7 @@ fn rule_congruent_oncircle(facts: &HashSet<Relation>) -> Vec<Relation> {
 // --- Rule: Cyclic → inscribed angle equality ---
 // If Cyclic(a,b,c,d), then for each chord, the inscribed angles from the other two vertices are equal.
 // E.g., chord (a,b): angle(a,c,b) = angle(a,d,b)
-fn rule_cyclic_inscribed_angles(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_cyclic_inscribed_angles(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
     for fact in facts {
         if let Relation::Cyclic(a, b, c, d) = fact {
@@ -1173,7 +1173,7 @@ fn rule_cyclic_inscribed_angles(facts: &HashSet<Relation>) -> Vec<Relation> {
 // --- Rule: Parallel + shared point → Collinear ---
 // If Parallel(a,b, c,d) and the two lines share a point, they are the same line.
 // So all 4 points (or 3 unique) are collinear.
-fn rule_parallel_shared_point_collinear(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_parallel_shared_point_collinear(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
     for fact in facts {
         if let Relation::Parallel(a, b, c, d) = fact {
@@ -1201,7 +1201,7 @@ fn rule_parallel_shared_point_collinear(facts: &HashSet<Relation>) -> Vec<Relati
 // --- Rule: Perpendicular + Parallel → Perpendicular ---
 // If AB ⊥ CD and EF ∥ CD → AB ⊥ EF
 // If AB ⊥ CD and EF ∥ AB → EF ⊥ CD
-fn rule_perp_parallel_transfer(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_perp_parallel_transfer(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
     let perps: Vec<_> = facts
         .iter()
@@ -1243,7 +1243,7 @@ fn rule_perp_parallel_transfer(facts: &HashSet<Relation>) -> Vec<Relation> {
 // --- Rule: Line extension via collinearity ---
 // Perp(a,b, c,d) + Collinear(c,d,e) → Perp(a,b, c,e) and Perp(a,b, d,e)
 // Parallel(a,b, c,d) + Collinear(c,d,e) → Parallel(a,b, c,e) etc.
-fn rule_line_collinear_extension(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_line_collinear_extension(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
 
     let collinears: Vec<_> = facts
@@ -1324,7 +1324,7 @@ fn rule_line_collinear_extension(facts: &HashSet<Relation>) -> Vec<Relation> {
 
 // --- Rule: Collinear transitivity ---
 // If Collinear(a,b,c) and Collinear(a,b,d) → Collinear(a,c,d), Collinear(b,c,d)
-fn rule_collinear_transitivity(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_collinear_transitivity(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
     let collinears: Vec<_> = facts
         .iter()
@@ -1385,7 +1385,7 @@ fn rule_collinear_transitivity(facts: &HashSet<Relation>) -> Vec<Relation> {
 // --- Rule: Thales' Theorem (AG rule 21) ---
 // If center O of circumscribed circle lies on AC (diameter), then angle ABC = 90°
 // circle O A B C, coll O A C => perp A B B C
-fn rule_thales_theorem(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_thales_theorem(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
 
     // Group points by circle center
@@ -1441,7 +1441,7 @@ fn rule_thales_theorem(facts: &HashSet<Relation>) -> Vec<Relation> {
 
 // --- Rule: Cyclic Inscribed Angle Converse (AG rule 5) ---
 // If angle(a,p,b) = angle(a,q,b) and the four points are non-collinear, then cyclic(a,b,p,q)
-fn rule_inscribed_angle_converse(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_inscribed_angle_converse(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
     let eqangles: Vec<_> = facts
         .iter()
@@ -1501,7 +1501,7 @@ fn rule_inscribed_angle_converse(facts: &HashSet<Relation>) -> Vec<Relation> {
 
 // --- Rule: Isosceles Converse (AG rule 15) ---
 // Equal base angles → isosceles: if angle(O,A,B) = angle(O,B,A), then |OA| = |OB|
-fn rule_isosceles_converse(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_isosceles_converse(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
     for fact in facts {
         if let Relation::EqualAngle(a1, v1, c1, a2, v2, c2) = fact {
@@ -1522,7 +1522,7 @@ fn rule_isosceles_converse(facts: &HashSet<Relation>) -> Vec<Relation> {
 // --- Rule: Perpendicular + Midpoint → Congruent (AG rule 20) ---
 // Right triangle: midpoint of hypotenuse is equidistant from all vertices
 // perp A B B C, midp M A C → cong A M B M (and cong B M C M)
-fn rule_perp_midpoint_congruent(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_perp_midpoint_congruent(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
     let perps: Vec<_> = facts
         .iter()
@@ -1568,7 +1568,7 @@ fn rule_perp_midpoint_congruent(facts: &HashSet<Relation>) -> Vec<Relation> {
 
 // --- Rule: Two Equidistant Points → Perpendicular (AG rule 24) ---
 // cong A P B P, cong A Q B Q => perp A B P Q
-fn rule_two_equidistant_perp(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_two_equidistant_perp(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
 
     // Find all equidistant pairs: points P where |PA| = |PB|
@@ -1605,7 +1605,7 @@ fn rule_two_equidistant_perp(facts: &HashSet<Relation>) -> Vec<Relation> {
 
 // --- Rule: Midpoint Diagonal Parallelogram (AG rule 26) ---
 // midp M A B, midp M C D => para A C B D, para A D B C
-fn rule_midpoint_diagonal_parallelogram(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_midpoint_diagonal_parallelogram(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
     let midpoints: Vec<_> = facts
         .iter()
@@ -1637,7 +1637,7 @@ fn rule_midpoint_diagonal_parallelogram(facts: &HashSet<Relation>) -> Vec<Relati
 // --- Rule: Congruent from Cyclic + EqualAngle (AG rule 6) ---
 // cyclic A B P Q, eqangle(A, P, B, A, Q, B) => cong P ... (equal inscribed angles → equal chords)
 // More generally: if points are concyclic and inscribed angles are equal, the subtended chords are equal.
-fn rule_cyclic_equal_angle_congruent(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_cyclic_equal_angle_congruent(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
 
     let cyclics: Vec<_> = facts
@@ -1679,7 +1679,7 @@ fn rule_cyclic_equal_angle_congruent(facts: &HashSet<Relation>) -> Vec<Relation>
 
 // --- AG Rule 22: Cyclic + Parallel → EqualAngle ---
 // cyclic(A,B,C,D) and para(A,B,C,D) → eqangle(A,D,C, D,C,B) (equal base angles of cyclic trapezoid)
-fn rule_cyclic_parallel_eqangle(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_cyclic_parallel_eqangle(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
 
     let cyclics: Vec<_> = facts
@@ -1763,7 +1763,7 @@ fn rule_cyclic_parallel_eqangle(facts: &HashSet<Relation>) -> Vec<Relation> {
 
 // --- AG Rule 25: Equidistant + Cyclic → Perpendicular ---
 // cong(A,P,B,P) and cong(A,Q,B,Q) and cyclic(A,B,P,Q) → perp(P,A,A,Q)
-fn rule_equidistant_cyclic_perp(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_equidistant_cyclic_perp(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
 
     // Collect equidistant triples: (center, pt1, pt2) where |center-pt1| = |center-pt2|
@@ -1808,7 +1808,7 @@ fn rule_equidistant_cyclic_perp(facts: &HashSet<Relation>) -> Vec<Relation> {
 
 // --- AG Rule 27: Midpoint + Parallelogram → Midpoint ---
 // midp(M,A,B) and para(A,C,B,D) and para(A,D,B,C) → midp(M,C,D)
-fn rule_midpoint_parallelogram(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_midpoint_parallelogram(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
 
     let midpoints: Vec<_> = facts
@@ -1869,7 +1869,7 @@ fn rule_midpoint_parallelogram(facts: &HashSet<Relation>) -> Vec<Relation> {
 
 // --- AG Rule 31: EqualAngle + Perpendicular → Perpendicular ---
 // If angle between lines AB and PQ equals angle between CD and UV, and PQ ⊥ UV, then AB ⊥ CD
-fn rule_eqangle_perp_to_perp(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_eqangle_perp_to_perp(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
 
     let eqangles: Vec<_> = facts
@@ -1909,7 +1909,7 @@ fn rule_eqangle_perp_to_perp(facts: &HashSet<Relation>) -> Vec<Relation> {
 // --- Rule: SAS (Side-Angle-Side) Triangle Congruence ---
 // cong(A,B, P,Q) ∧ cong(B,C, Q,R) ∧ eqangle(A,B,C, P,Q,R) ∧ ncoll(A,B,C)
 //   → cong(A,C, P,R) ∧ eqangle(B,C,A, Q,R,P) ∧ eqangle(C,A,B, R,P,Q)
-fn rule_sas_congruence(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_sas_congruence(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
 
     let congs: Vec<_> = facts
@@ -2011,7 +2011,7 @@ fn rule_sas_congruence(facts: &HashSet<Relation>) -> Vec<Relation> {
 // --- Rule: ASA (Angle-Side-Angle) Triangle Congruence ---
 // eqangle(C,A,B, R,P,Q) ∧ cong(A,B, P,Q) ∧ eqangle(A,B,C, P,Q,R) ∧ ncoll(A,B,C)
 //   → cong(B,C, Q,R) ∧ cong(C,A, R,P)
-fn rule_asa_congruence(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_asa_congruence(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
 
     let congs: HashSet<(u16, u16, u16, u16)> = facts
@@ -2117,7 +2117,7 @@ fn rule_asa_congruence(facts: &HashSet<Relation>) -> Vec<Relation> {
 // --- Rule: SSS (Side-Side-Side) Triangle Congruence ---
 // cong(A,B, P,Q) ∧ cong(B,C, Q,R) ∧ cong(C,A, R,P) ∧ ncoll(A,B,C)
 //   → eqangle(A,B,C, P,Q,R) ∧ eqangle(B,C,A, Q,R,P) ∧ eqangle(C,A,B, R,P,Q)
-fn rule_sss_congruence(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_sss_congruence(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
 
     let congs: Vec<_> = facts
@@ -2225,7 +2225,7 @@ fn is_collinear_triple(a: u16, b: u16, c: u16, collinears: &[(u16, u16, u16)]) -
 
 // --- Rule: Transitive Ratio ---
 // eqratio(A,B,C,D, M,N,P,Q) ∧ eqratio(C,D,E,F, P,Q,R,S) → eqratio(A,B,E,F, M,N,R,S)
-fn rule_transitive_ratio(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_transitive_ratio(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
 
     let ratios: Vec<_> = facts
@@ -2275,7 +2275,7 @@ fn rule_transitive_ratio(facts: &HashSet<Relation>) -> Vec<Relation> {
 
 // --- Rule: Ratio Equals 1 → Congruence ---
 // eqratio(A,B,P,Q, C,D,U,V) ∧ cong(P,Q, U,V) → cong(A,B, C,D)
-fn rule_ratio_one_congruence(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_ratio_one_congruence(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
 
     let cong_set: HashSet<(u16, u16)> = facts
@@ -2332,7 +2332,7 @@ fn rule_ratio_one_congruence(facts: &HashSet<Relation>) -> Vec<Relation> {
 
 // --- Rule: Midpoint → Ratio ---
 // midp(M,A,B) ∧ midp(N,C,D) → eqratio(A,M, A,B, C,N, C,D)
-fn rule_midpoint_ratio(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_midpoint_ratio(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
 
     let midpoints: Vec<_> = facts
@@ -2365,7 +2365,7 @@ fn rule_midpoint_ratio(facts: &HashSet<Relation>) -> Vec<Relation> {
 // --- Rule: Parallel + Collinear → Ratio (Thales/Basic Proportionality) ---
 // para(A,B, C,D) ∧ coll(O,A,C) ∧ coll(O,B,D) ∧ ncoll(A,B,C)
 //   → eqratio(O,A, A,C, O,B, B,D)
-fn rule_parallel_collinear_ratio(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_parallel_collinear_ratio(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
 
     let parallels: Vec<_> = facts
@@ -2454,7 +2454,7 @@ fn rule_parallel_collinear_ratio(facts: &HashSet<Relation>) -> Vec<Relation> {
 // --- Rule: Congruent → Ratio (trivial) ---
 // cong(A,B, C,D) → eqratio(A,B, C,D, A,B, C,D)
 // Only fires when there are already ratio facts to bootstrap chains
-fn rule_congruent_ratio(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_congruent_ratio(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
 
     // Gate: only produce ratio facts when there are already ratio facts or midpoints
@@ -2479,7 +2479,7 @@ fn rule_congruent_ratio(facts: &HashSet<Relation>) -> Vec<Relation> {
 // --- Rule: Ratio + Collinear → Parallel (converse of Thales) ---
 // eqratio(O,A, A,C, O,B, B,D) ∧ coll(O,A,C) ∧ coll(O,B,D) ∧ ncoll(A,B,C)
 //   → para(A,B, C,D)
-fn rule_ratio_collinear_parallel(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_ratio_collinear_parallel(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
 
     let collinears: Vec<_> = facts
@@ -2553,7 +2553,7 @@ fn rule_ratio_collinear_parallel(facts: &HashSet<Relation>) -> Vec<Relation> {
 // --- Rule: Parallelogram Opposite Angles ---
 // para(A,B,C,D) ∧ para(A,D,B,C) → eqangle(D,A,B, B,C,D) ∧ eqangle(A,B,C, C,D,A)
 // In parallelogram ABCD (AB∥CD, AD∥BC), opposite angles are equal.
-fn rule_parallelogram_opposite_angles(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_parallelogram_opposite_angles(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
     let parallel_set: HashSet<(u16, u16, u16, u16)> = facts
         .iter()
@@ -2590,7 +2590,7 @@ fn rule_parallelogram_opposite_angles(facts: &HashSet<Relation>) -> Vec<Relation
 // --- Rule: Isosceles Trapezoid Base Angles ---
 // para(A,B,C,D) ∧ cong(A,D, B,C) → eqangle(D,A,B, A,B,C) ∧ eqangle(A,D,C, B,C,D)
 // If AB∥CD and |AD|=|BC|, base angles at AB are equal, base angles at CD are equal.
-fn rule_isosceles_trapezoid_base_angles(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_isosceles_trapezoid_base_angles(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
     let cong_set: HashSet<(u16, u16, u16, u16)> = facts
         .iter()
@@ -2627,7 +2627,7 @@ fn rule_isosceles_trapezoid_base_angles(facts: &HashSet<Relation>) -> Vec<Relati
 // para(A,B,C,D) ∧ midp(E,A,D) ∧ coll(F,B,C) ∧ para(E,F,A,B) → midp(F,B,C)
 // In a trapezoid AB∥CD, if E is midpoint of leg AD and F is on leg BC with EF∥AB,
 // then F is midpoint of BC.
-fn rule_trapezoid_midsegment(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_trapezoid_midsegment(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
     let parallel_set: HashSet<(u16, u16, u16, u16)> = facts
         .iter()
@@ -2695,7 +2695,7 @@ fn rule_trapezoid_midsegment(facts: &HashSet<Relation>) -> Vec<Relation> {
 // para(A,B,C,D) ∧ coll(O,A,C) ∧ coll(O,B,D) ∧ ncoll(A,B,C)
 //   → eqratio(A,B, C,D, O,A, O,C) ∧ eqratio(A,B, C,D, O,B, O,D)
 // Extends existing Thales rule to include ratios involving the parallel base segments.
-fn rule_parallel_base_ratio(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_parallel_base_ratio(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
 
     let parallels: Vec<_> = facts
@@ -2770,7 +2770,7 @@ fn rule_parallel_base_ratio(facts: &HashSet<Relation>) -> Vec<Relation> {
 // If para(E,G, A,B) ∧ para(E,F, A,D) ∧ coll(E,A,...) ∧ coll(G,B,...) ∧ coll(F,D,...)
 // then para(G,F, B,D).
 // In general: two parallels cut by two transversals from the same point → third pair parallel.
-fn rule_parallel_projection(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_parallel_projection(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
 
     let parallels: Vec<_> = facts
@@ -2962,7 +2962,7 @@ fn is_collinear_pair(p1: u16, p2: u16, collinears: &[(u16, u16, u16)]) -> bool {
 // then |PX| = |PY|.
 // Detection: perp(O,X, P,X) ∧ on_circle(X,O) means PX is tangent at X.
 // Group by (O, P), emit congruent(P,X, P,Y) for each pair.
-fn rule_equal_tangent_lengths(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_equal_tangent_lengths(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
 
     // Collect on_circle facts as a set for fast lookup
@@ -3034,7 +3034,7 @@ fn rule_equal_tangent_lengths(facts: &HashSet<Relation>) -> Vec<Relation> {
 // If PX is tangent to circle(O) at X (perp(O,X, P,X) ∧ on_circle(X,O)),
 // and Y is on circle(O), and Z is on circle(O) (Z ≠ X, Z ≠ Y),
 // then angle(P,X,Y) = angle(X,Z,Y).
-fn rule_tangent_chord_angle(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_tangent_chord_angle(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
 
     // Group points by circle center
@@ -3114,7 +3114,7 @@ fn rule_tangent_chord_angle(facts: &HashSet<Relation>) -> Vec<Relation> {
 // If the angle bisector of angle BAC meets BC at D:
 //   equal_angle(B,A,D, D,A,C) ∧ collinear(B,D,C) → equal_ratio(B,D, D,C, A,B, A,C)
 // i.e., |BD|/|DC| = |AB|/|AC|
-fn rule_angle_bisector_ratio(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_angle_bisector_ratio(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
 
     // Gate: only fire when both EqualAngle and Collinear facts exist
@@ -3186,7 +3186,7 @@ fn rule_angle_bisector_ratio(facts: &HashSet<Relation>) -> Vec<Relation> {
 // all sharing vertex I), and there exist perpendicular feet from I to sides,
 // then those feet are equidistant from I.
 // Detection: perp(I,P, A,B) where P is a foot on side AB → congruent(I,P, I,Q) for all such feet.
-fn rule_incenter_equal_inradii(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_incenter_equal_inradii(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
 
     // Gate: need EqualAngle and Perpendicular facts
@@ -3272,7 +3272,7 @@ fn rule_incenter_equal_inradii(facts: &HashSet<Relation>) -> Vec<Relation> {
 // If angle(A,B,C) = angle(D,E,F) AND angle(B,C,A) = angle(E,F,D),
 // then triangles ABC ~ DEF, yielding EqualRatio for corresponding sides:
 // |AB|/|DE| = |BC|/|EF| = |CA|/|FD|
-fn rule_aa_similarity(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_aa_similarity(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
 
     let eqangles: Vec<(u16, u16, u16, u16, u16, u16)> = facts
@@ -3363,7 +3363,7 @@ fn rule_aa_similarity(facts: &HashSet<Relation>) -> Vec<Relation> {
 // --- Rule: Orthocenter Concurrence ---
 // If AH ⊥ BC and BH ⊥ AC, then CH ⊥ AB.
 // Two altitudes of a triangle meeting at H imply the third altitude also passes through H.
-fn rule_orthocenter_concurrence(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_orthocenter_concurrence(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
 
     let perps: Vec<(u16, u16, u16, u16)> = facts
@@ -3456,7 +3456,7 @@ fn rule_orthocenter_concurrence(facts: &HashSet<Relation>) -> Vec<Relation> {
 // If ∠(A,B,C) = ∠(A,D,C) for four distinct points A,B,C,D
 // where B and D are on the same side of AC, then A,B,C,D are concyclic.
 // Guard: skip if any 3 of the 4 points are collinear (degenerate case).
-fn rule_opposite_angles_cyclic(facts: &HashSet<Relation>) -> Vec<Relation> {
+fn rule_opposite_angles_cyclic(facts: &BTreeSet<Relation>) -> Vec<Relation> {
     let mut new = Vec::new();
 
     let eqangles: Vec<(u16, u16, u16, u16, u16, u16)> = facts
@@ -3679,14 +3679,14 @@ mod tests {
 
     #[test]
     fn test_corresponding_angles_stub_returns_empty() {
-        let facts = HashSet::new();
+        let facts = BTreeSet::new();
         let result = rule_corresponding_angles(&facts);
         assert!(result.is_empty());
     }
 
     #[test]
     fn test_perpendicular_angles_stub_returns_empty() {
-        let facts = HashSet::new();
+        let facts = BTreeSet::new();
         let result = rule_perpendicular_angles(&facts);
         assert!(result.is_empty());
     }

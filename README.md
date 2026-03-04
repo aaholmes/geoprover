@@ -14,7 +14,6 @@ Neurosymbolic geometry theorem prover using a three-tier MCTS architecture adapt
 
 The trained NN solves **9 additional problems** that pure deduction cannot, including **Morley's theorem** and the **9-point circle**. The trained model is 25% faster than the random baseline because it prioritizes promising constructions.
 
-Solve counts vary +/-2 between runs due to `HashSet` iteration non-determinism in Rust.
 
 ### IMO-AG-30 (competition problems)
 
@@ -35,6 +34,12 @@ MCTS+NN solves 2 additional IMO problems that deduction cannot: **IMO 2012 P1** 
 | **Geoprover (MCTS + trained NN)** | **~5M params** | **81.8%** | **7/30** |
 
 Geoprover's deduction engine exceeds AlphaGeometry's DD baseline on JGEX-AG-231. The MCTS+NN system achieves this with a **1400x smaller** neural component (~5M vs ~7B parameters). The IMO gap (7/30 vs 25/30) reflects the difficulty of multi-step auxiliary construction chains — IMO problems often require 3-5 constructions, while most JGEX problems need 0-1.
+
+### Known limitations and next steps
+
+- **Search depth**: Branching factor ~30, each node requires ~400ms saturation. Depth 3 = 27K nodes worst case. The 200-iteration MCTS budget barely explores depth 2. Remaining hard problems (especially IMO) need 2-5 auxiliary construction steps.
+- **Model capacity vs. data**: ~4M parameters — scaling is trivial, but ~50K training examples would cause overfitting. Need more synthetic data or problem augmentation before increasing model size.
+- **Training signal**: Expert iteration plateaus because shallow MCTS self-play only generates easy examples. Deeper search or curriculum learning needed to produce training signal for multi-step proofs.
 
 ### Problems solved by MCTS+NN that deduction cannot
 
@@ -244,7 +249,7 @@ web/
 ### ProofState
 
 - **Objects**: points, lines, circles — each with a `u16` ID
-- **Facts**: `HashSet<Relation>` — `Parallel`, `Congruent`, `Collinear`, `EqualAngle`, `Midpoint`, `Perpendicular`, `OnCircle`, `Cyclic`, `EqualRatio`
+- **Facts**: `BTreeSet<Relation>` — `Parallel`, `Congruent`, `Collinear`, `EqualAngle`, `Midpoint`, `Perpendicular`, `OnCircle`, `Cyclic`, `EqualRatio`
 - **Goal**: a single `Relation` to prove
 - **Proved** when `goal in facts`. Any construction sequence that gets the goal into the fact set is a valid proof.
 - **Zobrist hash** on facts for transposition detection

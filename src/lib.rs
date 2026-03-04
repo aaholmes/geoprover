@@ -50,9 +50,8 @@ impl PyProofState {
 
     /// Return each fact as an individual text string, sorted deterministically.
     fn facts_as_text_list(&self) -> Vec<String> {
-        let mut sorted_facts: Vec<&proof_state::Relation> = self.inner.facts.iter().collect();
-        sorted_facts.sort_by(|a, b| format!("{:?}", a).cmp(&format!("{:?}", b)));
-        sorted_facts
+        self.inner
+            .facts
             .iter()
             .map(|f| self.inner.relation_to_text_pub(f))
             .collect()

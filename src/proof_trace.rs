@@ -1,5 +1,5 @@
 use crate::proof_state::{ProofState, Relation};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 /// Names for all deduction rules, used for provenance tracking.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -146,17 +146,17 @@ const MAX_ALTERNATIVES: usize = 16;
 #[derive(Clone, Debug)]
 pub struct ProofTrace {
     derivations: HashMap<Relation, Vec<Derivation>>,
-    axioms: HashSet<Relation>,
+    axioms: BTreeSet<Relation>,
     /// All facts available for premise resolution (populated at end of saturation)
-    all_facts: HashSet<Relation>,
+    all_facts: BTreeSet<Relation>,
 }
 
 impl ProofTrace {
     pub fn new() -> Self {
         ProofTrace {
             derivations: HashMap::new(),
-            axioms: HashSet::new(),
-            all_facts: HashSet::new(),
+            axioms: BTreeSet::new(),
+            all_facts: BTreeSet::new(),
         }
     }
 
@@ -213,7 +213,7 @@ impl ProofTrace {
     }
 
     /// Set the complete fact set for lazy premise resolution.
-    pub fn set_all_facts(&mut self, facts: HashSet<Relation>) {
+    pub fn set_all_facts(&mut self, facts: BTreeSet<Relation>) {
         self.all_facts = facts;
     }
 
@@ -240,7 +240,7 @@ impl ProofTrace {
     /// Discover alternative derivations for facts on the proof path by trying
     /// all rules against the full fact set. Only done for reachable facts (~10-30),
     /// so the cost is manageable.
-    fn discover_alternatives(&mut self, reachable: &HashSet<Relation>) {
+    fn discover_alternatives(&mut self, reachable: &BTreeSet<Relation>) {
         if self.all_facts.is_empty() {
             return;
         }
@@ -284,7 +284,7 @@ impl ProofTrace {
         }
 
         // Step 1: Collect all reachable facts from goal via ALL stored alternatives (BFS)
-        let mut reachable: HashSet<Relation> = HashSet::new();
+        let mut reachable: BTreeSet<Relation> = BTreeSet::new();
         let mut queue: VecDeque<Relation> = VecDeque::new();
         queue.push_back(goal.clone());
         reachable.insert(goal.clone());
@@ -384,7 +384,7 @@ impl ProofTrace {
         }
 
         // Step 5: Reconstruct proof by following chosen derivations
-        let mut proof_facts: HashSet<Relation> = HashSet::new();
+        let mut proof_facts: BTreeSet<Relation> = BTreeSet::new();
         let mut reconstruct_queue: VecDeque<Relation> = VecDeque::new();
         reconstruct_queue.push_back(goal.clone());
         proof_facts.insert(goal.clone());
@@ -421,7 +421,7 @@ impl ProofTrace {
 
         let mut resolved: HashMap<Relation, Derivation> = HashMap::new();
         let mut queue: VecDeque<Relation> = VecDeque::new();
-        let mut visited: HashSet<Relation> = HashSet::new();
+        let mut visited: BTreeSet<Relation> = BTreeSet::new();
         queue.push_back(goal.clone());
         visited.insert(goal.clone());
 
@@ -461,7 +461,7 @@ impl ProofTrace {
 
         // Reuse the cost computation from extract_proof
         // Step 1-2: Collect reachable and discover alternatives
-        let mut reachable: HashSet<Relation> = HashSet::new();
+        let mut reachable: BTreeSet<Relation> = BTreeSet::new();
         let mut queue: VecDeque<Relation> = VecDeque::new();
         queue.push_back(goal.clone());
         reachable.insert(goal.clone());
@@ -580,7 +580,7 @@ impl ProofTrace {
             goal: &Relation,
             all_alts: &HashMap<Relation, Vec<(RuleName, Vec<Relation>)>>,
             tied_best: &HashMap<Relation, Vec<usize>>,
-            axioms: &HashSet<Relation>,
+            axioms: &BTreeSet<Relation>,
             results: &mut Vec<Vec<Derivation>>,
             max_proofs: usize,
         ) {
@@ -601,7 +601,7 @@ impl ProofTrace {
                 // Expand all facts on proof path using first tied choice for non-goal facts
                 let mut expand_queue: VecDeque<Relation> = VecDeque::new();
                 expand_queue.push_back(goal.clone());
-                let mut seen: HashSet<Relation> = HashSet::new();
+                let mut seen: BTreeSet<Relation> = BTreeSet::new();
                 seen.insert(goal.clone());
 
                 while let Some(fact) = expand_queue.pop_front() {
@@ -679,7 +679,7 @@ impl ProofTrace {
 
                 // Simple topological sort (no cycle breaking needed for well-formed proofs)
                 let mut result: Vec<Derivation> = Vec::new();
-                let mut emitted: HashSet<Relation> = HashSet::new();
+                let mut emitted: BTreeSet<Relation> = BTreeSet::new();
                 let mut remaining: Vec<Relation> = resolved.keys().cloned().collect();
                 let mut made_progress = true;
                 while made_progress {
@@ -741,7 +741,7 @@ impl ProofTrace {
         resolved: &mut HashMap<Relation, Derivation>,
     ) -> Option<Vec<Derivation>> {
         let mut result: Vec<Derivation> = Vec::new();
-        let mut emitted: HashSet<Relation> = HashSet::new();
+        let mut emitted: BTreeSet<Relation> = BTreeSet::new();
 
         let mut remaining: Vec<Relation> = resolved.keys().cloned().collect();
         let max_outer_iters = 20;
@@ -781,7 +781,7 @@ impl ProofTrace {
             }
 
             // Cycle detected. Try to break ALL cycle edges at once.
-            let remaining_set: HashSet<Relation> = remaining.iter().cloned().collect();
+            let remaining_set: BTreeSet<Relation> = remaining.iter().cloned().collect();
             let mut broke_any = false;
 
             // Collect facts to update (can't modify resolved while iterating)
@@ -796,7 +796,7 @@ impl ProofTrace {
                     }
 
                     // Strategy 1: re-resolve against non-cycle facts
-                    let non_cycle_facts: HashSet<Relation> = self
+                    let non_cycle_facts: BTreeSet<Relation> = self
                         .all_facts
                         .iter()
                         .filter(|f| !remaining_set.contains(f) || *f == fact)
@@ -904,7 +904,7 @@ impl Default for ProofTrace {
 pub fn identify_premises(
     fact: &Relation,
     rule: &RuleName,
-    facts: &HashSet<Relation>,
+    facts: &BTreeSet<Relation>,
 ) -> Vec<Relation> {
     match rule {
         RuleName::Axiom => vec![],
@@ -2333,7 +2333,7 @@ fn segments_equal_u(a1: u16, b1: u16, a2: u16, b2: u16) -> bool {
 /// Find two facts of the same relation type that share a component pair
 /// and whose other components match the target fact's components.
 fn find_transitive_pair<F, G>(
-    facts: &HashSet<Relation>,
+    facts: &BTreeSet<Relation>,
     a: u16,
     b: u16,
     c: u16,
@@ -2576,7 +2576,7 @@ mod tests {
 
     #[test]
     fn test_premises_transitive_parallel() {
-        let mut facts = HashSet::new();
+        let mut facts = BTreeSet::new();
         let p1 = Relation::parallel(0, 1, 2, 3);
         let p2 = Relation::parallel(2, 3, 4, 5);
         facts.insert(p1.clone());
@@ -2591,7 +2591,7 @@ mod tests {
 
     #[test]
     fn test_premises_midpoint_definition() {
-        let mut facts = HashSet::new();
+        let mut facts = BTreeSet::new();
         let mid = Relation::midpoint(2, 0, 1); // M=2 is midpoint of A=0, B=1
         facts.insert(mid.clone());
 
@@ -2610,7 +2610,7 @@ mod tests {
 
     #[test]
     fn test_premises_alternate_interior_angles() {
-        let mut facts = HashSet::new();
+        let mut facts = BTreeSet::new();
         let para = Relation::parallel(0, 1, 2, 3);
         let coll = Relation::collinear(0, 4, 2);
         facts.insert(para.clone());
@@ -2623,7 +2623,7 @@ mod tests {
 
     #[test]
     fn test_premises_sas() {
-        let mut facts = HashSet::new();
+        let mut facts = BTreeSet::new();
         let c1 = Relation::congruent(0, 1, 3, 4);
         let c2 = Relation::congruent(0, 2, 3, 5);
         let ea = Relation::equal_angle(1, 0, 2, 4, 3, 5);
@@ -2638,7 +2638,7 @@ mod tests {
 
     #[test]
     fn test_premises_isosceles_base_angles() {
-        let mut facts = HashSet::new();
+        let mut facts = BTreeSet::new();
         let cong = Relation::congruent(0, 1, 0, 2); // |AB| = |AC|, isosceles at A
         facts.insert(cong.clone());
 
@@ -2650,7 +2650,7 @@ mod tests {
 
     #[test]
     fn test_premises_circle_equidistance() {
-        let mut facts = HashSet::new();
+        let mut facts = BTreeSet::new();
         let oc1 = Relation::on_circle(1, 0); // point 1 on circle 0
         let oc2 = Relation::on_circle(2, 0); // point 2 on circle 0
         facts.insert(oc1.clone());
@@ -2663,7 +2663,7 @@ mod tests {
 
     #[test]
     fn test_premises_perp_to_parallel() {
-        let mut facts = HashSet::new();
+        let mut facts = BTreeSet::new();
         let perp1 = Relation::perpendicular(0, 1, 2, 3);
         let perp2 = Relation::perpendicular(4, 5, 2, 3);
         facts.insert(perp1.clone());
@@ -2816,7 +2816,7 @@ mod tests {
     #[test]
     fn test_set_all_facts() {
         let mut trace = ProofTrace::new();
-        let mut facts = HashSet::new();
+        let mut facts = BTreeSet::new();
         facts.insert(Relation::parallel(0, 1, 2, 3));
         facts.insert(Relation::congruent(0, 1, 2, 3));
         trace.set_all_facts(facts);

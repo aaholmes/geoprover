@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use rand::Rng;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -17,7 +17,7 @@ pub struct GeoObject {
 
 /// Relations between geometric objects. Each variant stores object IDs (u16).
 /// Relations are stored in canonical form for deduplication.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Relation {
     /// Three collinear points (sorted)
     Collinear(u16, u16, u16),
@@ -150,7 +150,7 @@ impl Relation {
 pub struct ProofState {
     pub objects: Vec<GeoObject>,
     pub name_to_id: HashMap<String, u16>,
-    pub facts: HashSet<Relation>,
+    pub facts: BTreeSet<Relation>,
     pub goal: Option<Relation>,
     pub hash: u64,
     zobrist_table: HashMap<Relation, u64>,
@@ -169,7 +169,7 @@ impl ProofState {
         ProofState {
             objects: Vec::new(),
             name_to_id: HashMap::new(),
-            facts: HashSet::new(),
+            facts: BTreeSet::new(),
             goal: None,
             hash: 0,
             zobrist_table: HashMap::new(),
@@ -247,11 +247,7 @@ impl ProofState {
     pub fn to_text(&self) -> String {
         let mut parts: Vec<String> = Vec::new();
 
-        // Sort facts for deterministic output
-        let mut sorted_facts: Vec<&Relation> = self.facts.iter().collect();
-        sorted_facts.sort_by(|a, b| format!("{:?}", a).cmp(&format!("{:?}", b)));
-
-        for fact in sorted_facts {
+        for fact in &self.facts {
             parts.push(self.relation_to_text(fact));
         }
 
