@@ -35,6 +35,17 @@ MCTS+NN solves 2 additional IMO problems that deduction cannot: **IMO 2012 P1** 
 
 Geoprover's deduction engine exceeds AlphaGeometry's DD baseline on JGEX-AG-231. The MCTS+NN system achieves this with a **1400x smaller** neural component (~5M vs ~7B parameters). The IMO gap (7/30 vs 25/30) reflects the difficulty of multi-step auxiliary construction chains — IMO problems often require 3-5 constructions, while most JGEX problems need 0-1.
 
+**Architectural differences:**
+
+| | AlphaGeometry | Geoprover |
+|---|---|---|
+| **Neural component** | General-purpose LLM (Meliad, ~7B params) generates auxiliary constructions as free-form text | Domain-specialized SetGeoTransformer (~4M params) with dual policy+value heads |
+| **Search strategy** | Linear generate-and-check: LLM proposes a construction, DD runs deduction, repeat | MCTS tree search with UCB/PUCT selection, NN policy priors, and value estimates for exploration-exploitation tradeoffs |
+| **Construction space** | Open-ended — LLM can generate arbitrary constructions, enabling deep creative chains | Fixed 7 types (midpoint, circumcenter, altitude, etc.) with priority heuristics, tractable for MCTS but limited in expressiveness |
+| **Deduction rules** | 21 DD rules | 54 forward-chaining rules (superset of DD) |
+| **Value estimation** | None — no value head, no distance-to-proof signal | Dual-head: value head estimates proof distance, policy head scores constructions; trained with TD-style targets via self-play |
+| **Key strength** | LLM can autoregressively chain deep multi-step constructions (critical for IMO-level problems) | Strong symbolic deduction + efficient tree search with a tiny, cacheable neural component |
+
 ### Known limitations and next steps
 
 - **Search depth**: Branching factor ~30, each node requires ~400ms saturation. Depth 3 = 27K nodes worst case. The 200-iteration MCTS budget barely explores depth 2. Remaining hard problems (especially IMO) need 2-5 auxiliary construction steps.
